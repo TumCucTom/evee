@@ -15,7 +15,7 @@ jobs:
   release:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Select Xcode 16
@@ -66,7 +66,7 @@ jobs:
           EVEE_BUILD_NUMBER: ${{ github.run_number }}
         run: scripts/release_app.sh
       - name: Upload notarized release
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: Evee-${{ inputs.version }}-notarized
           path: |

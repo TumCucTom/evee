@@ -234,7 +234,11 @@ final class AppStore: ObservableObject {
             modelReady = transcriber?.isDownloaded == true
             refreshPermissionState()
             if settings.localAPIEnabled { localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort) }
-            await retryPendingWebhookDeliveries()
+            if settings.webhookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await cancelWebhookOutbox()
+            } else {
+                await retryPendingWebhookDeliveries()
+            }
         } catch {
             didBootstrap = false
             statusMessage = error.localizedDescription
