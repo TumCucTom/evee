@@ -23,6 +23,10 @@ final class AppStore: ObservableObject {
     @Published var statusMessage: String?
     @Published var meetingTitle = ""
     @Published var meetingNotes = ""
+    @Published private(set) var captureKind: WorkspaceRecordKind?
+    @Published private(set) var isSystemAudioActive = false
+    @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
+    @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
 
     let recorder = MicrophoneRecorder()
     private let systemAudioRecorder = SystemAudioRecorder()
@@ -32,11 +36,25 @@ final class AppStore: ObservableObject {
     private var transcriber: (any LocalTranscriber)?
     private var activeAudioURL: URL?
     private var activeSystemAudioURL: URL?
-    private var isCapturingSystemAudio = false
+    private var activeRecoveryID: UUID?
+    private var activeRecoveryDirectory: URL?
     private var activeApplication: FrontmostApplication?
     private var activeKind: WorkspaceRecordKind = .dictation
     private var captureStartedAt: Date?
     private var cancellables = Set<AnyCancellable>()
+    private var pushToTalkHeld = false
+    private var pushToTalkReleasedWhileStarting = false
+    private var stopRequestedDuringStart: UUID?
+
+    private enum CaptureLifecycle: Equatable {
+        case idle
+        case starting(UUID)
+        case recording(UUID)
+        case finishing(UUID)
+        case cancelling(UUID)
+    }
+
+    private var captureLifecycle: CaptureLifecycle = .idle
 
     init() {
         recorder.$level
@@ -48,10 +66,22 @@ final class AppStore: ObservableObject {
             .store(in: &cancellables)
 
         KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
-            Task { @MainActor in await self?.beginDictation() }
+            Task { @MainActor in
+                guard let self, !self.pushToTalkHeld else { return }
+                self.pushToTalkHeld = true
+                self.pushToTalkReleasedWhileStarting = false
+                await self.beginDictation()
+            }
         }
         KeyboardShortcuts.onKeyUp(for: .pushToTalk) { [weak self] in
-            Task { @MainActor in await self?.finishCapture() }
+            Task { @MainActor in
+                guard let self else { return }
+                self.pushToTalkHeld = false
+                if case .idle = self.captureLifecycle {
+                    self.pushToTalkReleasedWhileStarting = true
+                }
+                await self.finishCapture()
+            }
         }
     }
 
@@ -78,6 +108,7 @@ final class AppStore: ObservableObject {
             records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
             transcriber = try TranscriberFactory.make(settings.model)
             modelReady = transcriber?.isDownloaded == true
+            refreshPermissionState()
             if settings.localAPIEnabled { _ = try await api.start(port: settings.localAPIPort) }
         } catch {
             statusMessage = error.localizedDescription
@@ -110,69 +141,185 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func refreshPermissionState() {
+        accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
+        microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
+    }
+
+    func requestAccessibilityPermission() {
+        _ = TextDelivery.requestAccessibility()
+        refreshPermissionState()
+    }
+
+    func requestMicrophonePermission() async {
+        microphonePermissionGranted = await recorder.requestPermission()
+    }
+
     func beginDictation() async {
-        guard case .idle = captureState else { return }
+        guard captureLifecycle == .idle else { return }
+        refreshPermissionState()
+        guard microphonePermissionGranted else {
+            await requestMicrophonePermission()
+            guard microphonePermissionGranted else {
+                statusMessage = AudioCaptureError.microphoneDenied.localizedDescription
+                return
+            }
+        }
+        guard accessibilityPermissionGranted else {
+            requestAccessibilityPermission()
+            statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then hold the shortcut again."
+            return
+        }
         activeApplication = TextDelivery.frontmostApplication()
+        guard activeApplication != nil else {
+            statusMessage = "Evee could not identify the app that should receive this dictation."
+            return
+        }
         activeKind = .dictation
         await beginCapture(prefix: "dictation")
     }
 
     func beginMeeting() async {
-        guard case .idle = captureState else { return }
+        guard captureLifecycle == .idle else { return }
         activeApplication = nil
         activeKind = .meeting
         await beginCapture(prefix: "meeting")
     }
 
     func beginMemo() async {
-        guard case .idle = captureState else { return }
+        guard captureLifecycle == .idle else { return }
         activeApplication = nil
         activeKind = .memo
         await beginCapture(prefix: "memo")
     }
 
     private func beginCapture(prefix: String) async {
+        guard captureLifecycle == .idle else { return }
+        let sessionID = UUID()
+        captureLifecycle = .starting(sessionID)
+        captureKind = activeKind
+        stopRequestedDuringStart = pushToTalkReleasedWhileStarting && activeKind == .dictation ? sessionID : nil
+        pushToTalkReleasedWhileStarting = false
+
         do {
-            let directory = await library.audioURL.appendingPathComponent("Recovery", isDirectory: true)
-            let url = directory.appendingPathComponent("\(prefix)-\(UUID().uuidString).caf")
+            _ = try await library.beginRecoveryCapture(kind: activeKind, id: sessionID)
+            let directory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+            activeRecoveryID = sessionID
+            activeRecoveryDirectory = directory
+            let url = directory.appendingPathComponent("microphone.caf")
+            activeAudioURL = url
             try await recorder.start(at: url)
+
+            guard captureLifecycle == .starting(sessionID) else {
+                await cleanUpCancelledStart(sessionID: sessionID)
+                return
+            }
+
             if activeKind == .meeting {
-                let systemURL = directory.appendingPathComponent("meeting-system-\(UUID().uuidString).m4a")
+                let systemURL = directory.appendingPathComponent("system.m4a")
+                activeSystemAudioURL = systemURL
                 do {
                     try await systemAudioRecorder.start(at: systemURL)
-                    activeSystemAudioURL = systemURL
-                    isCapturingSystemAudio = true
+                    guard captureLifecycle == .starting(sessionID) else {
+                        await cleanUpCancelledStart(sessionID: sessionID)
+                        return
+                    }
+                    isSystemAudioActive = true
                 } catch {
+                    guard captureLifecycle == .starting(sessionID) else {
+                        await cleanUpCancelledStart(sessionID: sessionID)
+                        return
+                    }
                     activeSystemAudioURL = nil
-                    isCapturingSystemAudio = false
+                    isSystemAudioActive = false
                     statusMessage = "Meeting capture is using your microphone only. Enable Screen Recording permission to include everyone else."
                 }
             }
-            activeAudioURL = url
-            captureStartedAt = .now
-            captureState = .recording(startedAt: .now, level: 0)
+
+            let startedAt = Date.now
+            captureStartedAt = startedAt
+            captureLifecycle = .recording(sessionID)
+            captureState = .recording(startedAt: startedAt, level: 0)
+
+            if stopRequestedDuringStart == sessionID {
+                stopRequestedDuringStart = nil
+                await finishCapture()
+            }
         } catch {
-            captureState = .failed(error.localizedDescription)
-            statusMessage = error.localizedDescription
+            guard captureLifecycle == .starting(sessionID) else {
+                await cleanUpCancelledStart(sessionID: sessionID)
+                return
+            }
+            await failSession(sessionID: sessionID, error: error, preserveRecoveryAudio: false)
         }
     }
 
     func finishCapture() async {
-        guard case .recording = captureState else { return }
+        let sessionID: UUID
+        switch captureLifecycle {
+        case .starting(let id):
+            stopRequestedDuringStart = id
+            return
+        case .recording(let id):
+            sessionID = id
+            captureLifecycle = .finishing(id)
+        case .idle, .finishing, .cancelling:
+            return
+        }
+
         do {
-            let audioURL = try recorder.stop()
+            let stoppedMicrophoneURL = try recorder.stop()
+            activeAudioURL = stoppedMicrophoneURL
+            if isSystemAudioActive {
+                do {
+                    try await systemAudioRecorder.stop()
+                } catch {
+                    statusMessage = "System audio ended unexpectedly; Evee will keep processing the microphone track. \(error.localizedDescription)"
+                }
+                isSystemAudioActive = false
+            }
+
+            guard let recoveryID = activeRecoveryID else {
+                throw NSError(domain: "Evee.Recovery", code: 1, userInfo: [NSLocalizedDescriptionKey: "The capture recovery session is unavailable."])
+            }
+            var recovery = try await library.addRecoveryTrack(
+                captureID: recoveryID,
+                kind: activeKind,
+                role: .microphone,
+                sourceURL: stoppedMicrophoneURL
+            )
+            guard let microphoneTrack = recovery.tracks.first(where: { $0.role == .microphone }) else {
+                throw NSError(domain: "Evee.Recovery", code: 2, userInfo: [NSLocalizedDescriptionKey: "The microphone recording could not be recovered."])
+            }
+            let audioURL = try await library.safeURL(forRelativePath: microphoneTrack.relativePath)
             activeAudioURL = audioURL
-            if isCapturingSystemAudio { try await systemAudioRecorder.stop() }
+            if let systemURL = activeSystemAudioURL,
+               FileManager.default.fileExists(atPath: systemURL.path) {
+                recovery = try await library.addRecoveryTrack(
+                    captureID: recoveryID,
+                    kind: activeKind,
+                    role: .system,
+                    sourceURL: systemURL
+                )
+                if let systemTrack = recovery.tracks.first(where: { $0.role == .system }) {
+                    activeSystemAudioURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)
+                }
+            }
+
+            guard captureLifecycle == .finishing(sessionID) else { return }
             captureState = .transcribing
             let engine = try transcriber ?? TranscriberFactory.make(settings.model)
             transcriber = engine
             let micText = try await engine.transcribe(fileURL: audioURL, languageCode: settings.languageCode)
+            guard captureLifecycle == .finishing(sessionID) else { return }
+
             var raw = micText
             var segments = [TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: activeKind == .meeting ? "You" : nil, text: micText)]
             if activeKind == .meeting,
                let systemURL = activeSystemAudioURL,
                FileManager.default.fileExists(atPath: systemURL.path),
                let otherText = try? await engine.transcribe(fileURL: systemURL, languageCode: settings.languageCode) {
+                guard captureLifecycle == .finishing(sessionID) else { return }
                 raw = "You: \(micText)\n\nOthers: \(otherText)"
                 segments.append(TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: "Others", text: otherText))
             }
@@ -184,26 +331,56 @@ final class AppStore: ObservableObject {
                 appendPeriod: style?.appendPeriod ?? true,
                 useParagraphs: style?.useParagraphs ?? true
             )
-            try await completeRecord(raw: raw, polished: polished, audioURL: audioURL, segments: segments)
+            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments)
         } catch {
-            captureState = .failed(error.localizedDescription)
-            statusMessage = error.localizedDescription
+            guard captureLifecycle == .finishing(sessionID) else { return }
+            await failSession(sessionID: sessionID, error: error, preserveRecoveryAudio: true)
         }
     }
 
-    private func completeRecord(raw: String, polished: String, audioURL: URL, segments: [TranscriptSegment]) async throws {
-        let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
-        let keepAudio = activeKind == .meeting ? settings.retainMeetingAudio : settings.retainDictationAudio
-        var relativeAudioPath: String?
-        if keepAudio {
-            let name = "\(activeKind.rawValue)-\(UUID().uuidString).caf"
-            let finalURL = await library.audioURL.appendingPathComponent(name)
-            try FileManager.default.moveItem(at: audioURL, to: finalURL)
-            relativeAudioPath = "Audio/\(name)"
-        } else {
-            try? FileManager.default.removeItem(at: audioURL)
+    func cancelCapture() async {
+        let sessionID: UUID
+        switch captureLifecycle {
+        case .idle:
+            if case .failed = captureState { captureState = .idle }
+            return
+        case .starting(let id), .recording(let id), .finishing(let id), .cancelling(let id):
+            sessionID = id
         }
 
+        let wasStarting: Bool
+        if case .starting = captureLifecycle { wasStarting = true } else { wasStarting = false }
+        captureLifecycle = .cancelling(sessionID)
+        stopRequestedDuringStart = nil
+
+        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+            activeAudioURL = stoppedURL
+        }
+        if isSystemAudioActive {
+            try? await systemAudioRecorder.stop()
+            isSystemAudioActive = false
+        }
+        removeActiveRecoveryFiles()
+
+        // A permission request may still be suspended inside recorder.start(). Keep the
+        // lifecycle closed until that continuation observes cancellation and cleans up.
+        if !wasStarting {
+            resetSession(state: .idle)
+        }
+    }
+
+    /// Clears a terminal capture error after its alert has been acknowledged. This is
+    /// deliberately synchronous so every SwiftUI alert dismissal path can hide the HUD.
+    func dismissCaptureFailure() {
+        guard captureLifecycle == .idle, case .failed = captureState else { return }
+        captureState = .idle
+    }
+
+    private func completeRecord(sessionID: UUID, raw: String, polished: String, segments: [TranscriptSegment]) async throws {
+        guard captureLifecycle == .finishing(sessionID) else { return }
+        let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
+        let keepAudio = activeKind == .meeting ? settings.retainMeetingAudio : settings.retainDictationAudio
+        let recordKind = activeKind
         let title: String = switch activeKind {
         case .dictation: String(polished.prefix(72))
         case .meeting: meetingTitle.isEmpty ? "Meeting · \(Date.now.formatted(date: .abbreviated, time: .shortened))" : meetingTitle
@@ -215,29 +392,111 @@ final class AppStore: ObservableObject {
             text: polished,
             rawText: raw,
             sourceApplication: activeApplication?.name,
-            audioRelativePath: relativeAudioPath,
             duration: duration,
             notes: activeKind == .meeting ? meetingNotes : ""
         )
         if activeKind == .meeting { record.segments = segments }
 
-        captureState = activeKind == .dictation ? .delivering : .idle
-        if activeKind == .dictation { try await TextDelivery.paste(polished) }
-        try await library.upsert(record)
+        if keepAudio, let recoveryID = activeRecoveryID {
+            let tracks = try await library.retainRecoveryCapture(id: recoveryID, for: record.id)
+            record.audioTracks = tracks
+            record.audioRelativePath = tracks.first(where: { $0.role == .microphone })?.relativePath
+        }
+
+        do {
+            try await library.upsert(record)
+        } catch {
+            throw error
+        }
+
+        guard captureLifecycle == .finishing(sessionID) else {
+            try? await library.delete(id: record.id)
+            return
+        }
         records.insert(record, at: 0)
         selectedRecordID = record.id
-        captureState = .idle
+        if !keepAudio { removeActiveRecoveryFiles() }
+
+        if recordKind == .dictation {
+            captureState = .delivering
+            if let target = activeApplication {
+                do {
+                    try await TextDelivery.paste(polished, to: target)
+                } catch {
+                    statusMessage = error.localizedDescription
+                }
+            } else {
+                statusMessage = "Evee saved the dictation but did not paste it because the destination app was unavailable."
+            }
+        }
+
         meetingTitle = ""
         meetingNotes = ""
-        if let systemURL = activeSystemAudioURL { try? FileManager.default.removeItem(at: systemURL) }
-        activeSystemAudioURL = nil
-        isCapturingSystemAudio = false
+        resetSession(state: .idle)
 
-        if activeKind == .meeting,
+        if recordKind == .meeting,
            let destination = URL(string: settings.webhookURL),
            !settings.webhookURL.isEmpty {
-            try await MeetingWebhook().send(record: record, destination: destination, secret: settings.webhookSecret)
+            do {
+                try await MeetingWebhook().send(record: record, destination: destination, secret: settings.webhookSecret)
+            } catch {
+                statusMessage = "The meeting was saved, but its webhook could not be delivered: \(error.localizedDescription)"
+            }
         }
+    }
+
+    private func cleanUpCancelledStart(sessionID: UUID) async {
+        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+            activeAudioURL = stoppedURL
+        }
+        try? await systemAudioRecorder.stop()
+        removeActiveRecoveryFiles()
+        if captureLifecycle == .cancelling(sessionID) || captureLifecycle == .starting(sessionID) {
+            resetSession(state: .idle)
+        }
+    }
+
+    private func failSession(sessionID: UUID, error: Error, preserveRecoveryAudio: Bool) async {
+        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+            activeAudioURL = stoppedURL
+        }
+        try? await systemAudioRecorder.stop()
+        isSystemAudioActive = false
+
+        let recoveryPath = activeAudioURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil }
+        if !preserveRecoveryAudio { removeActiveRecoveryFiles() }
+        let detail: String
+        if preserveRecoveryAudio, let recoveryPath {
+            detail = "\(error.localizedDescription) The original audio was kept for recovery at \(recoveryPath)."
+        } else {
+            detail = error.localizedDescription
+        }
+        guard captureLifecycle == .starting(sessionID) || captureLifecycle == .finishing(sessionID) else { return }
+        resetSession(state: .failed(detail))
+        statusMessage = detail
+    }
+
+    private func removeActiveRecoveryFiles() {
+        if let activeRecoveryDirectory {
+            try? FileManager.default.removeItem(at: activeRecoveryDirectory)
+        } else {
+            if let activeAudioURL { try? FileManager.default.removeItem(at: activeAudioURL) }
+            if let activeSystemAudioURL { try? FileManager.default.removeItem(at: activeSystemAudioURL) }
+        }
+    }
+
+    private func resetSession(state: CaptureState) {
+        captureState = state
+        captureLifecycle = .idle
+        captureKind = nil
+        activeAudioURL = nil
+        activeSystemAudioURL = nil
+        activeRecoveryID = nil
+        activeRecoveryDirectory = nil
+        activeApplication = nil
+        captureStartedAt = nil
+        isSystemAudioActive = false
+        stopRequestedDuringStart = nil
     }
 
     func update(_ record: WorkspaceRecord) async {

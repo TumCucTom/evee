@@ -1,19 +1,54 @@
 import Foundation
 
+public enum LibraryStoreError: LocalizedError, Sendable {
+    case corruptFile(URL)
+    case unsafeRelativePath(String)
+    case missingAudioSource(URL)
+    case unsupportedSchema(found: Int, supported: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .corruptFile(let backup):
+            return "Evee preserved an unreadable library file at \(backup.path)."
+        case .unsafeRelativePath(let path):
+            return "The library rejected an unsafe relative path: \(path)"
+        case .missingAudioSource(let url):
+            return "The audio source no longer exists at \(url.path)."
+        case .unsupportedSchema(let found, let supported):
+            return "This Evee library uses schema \(found), but this version supports up to schema \(supported)."
+        }
+    }
+}
+
+private struct RecordsEnvelope: Codable {
+    var schemaVersion: Int
+    var updatedAt: Date
+    var records: [WorkspaceRecord]
+}
+
+private struct SettingsEnvelope: Codable {
+    var schemaVersion: Int
+    var updatedAt: Date
+    var settings: EveeSettings
+}
+
 public actor LibraryStore {
     public static let shared = LibraryStore()
+    public static let currentSchemaVersion = 2
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     public let rootURL: URL
     public let audioURL: URL
+    public let recoveryURL: URL
     private let recordsURL: URL
     private let settingsURL: URL
 
     public init(rootURL: URL? = nil) {
         let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        self.rootURL = rootURL ?? applicationSupport.appendingPathComponent("Evee", isDirectory: true)
+        self.rootURL = (rootURL ?? applicationSupport.appendingPathComponent("Evee", isDirectory: true)).standardizedFileURL
         self.audioURL = self.rootURL.appendingPathComponent("Audio", isDirectory: true)
+        self.recoveryURL = self.audioURL.appendingPathComponent("Recovery", isDirectory: true)
         self.recordsURL = self.rootURL.appendingPathComponent("records.json")
         self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
         self.encoder = JSONEncoder()
@@ -24,29 +59,68 @@ public actor LibraryStore {
     }
 
     public func prepare() throws {
-        try FileManager.default.createDirectory(at: audioURL, withIntermediateDirectories: true)
+        try createPrivateDirectory(rootURL)
+        try createPrivateDirectory(audioURL)
+        try createPrivateDirectory(recoveryURL)
     }
 
     public func loadRecords() throws -> [WorkspaceRecord] {
         try prepare()
         guard FileManager.default.fileExists(atPath: recordsURL.path) else { return [] }
-        return try decoder.decode([WorkspaceRecord].self, from: Data(contentsOf: recordsURL))
+        let data = try Data(contentsOf: recordsURL)
+        do {
+            if let envelope = try? decoder.decode(RecordsEnvelope.self, from: data) {
+                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
+                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
+                }
+                return envelope.records
+            }
+
+            // Version 1 stored the records array directly. Upgrade it on the first successful read.
+            let legacy = try decoder.decode([WorkspaceRecord].self, from: data)
+            try save(legacy)
+            return legacy
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let backup = try preserveCorruptFile(recordsURL)
+            throw LibraryStoreError.corruptFile(backup)
+        }
     }
 
     public func save(_ records: [WorkspaceRecord]) throws {
         try prepare()
-        try encoder.encode(records).write(to: recordsURL, options: .atomic)
+        let envelope = RecordsEnvelope(schemaVersion: Self.currentSchemaVersion, updatedAt: .now, records: records)
+        try writePrivate(encoder.encode(envelope), to: recordsURL)
     }
 
     public func loadSettings() throws -> EveeSettings {
         try prepare()
         guard FileManager.default.fileExists(atPath: settingsURL.path) else { return EveeSettings() }
-        return try decoder.decode(EveeSettings.self, from: Data(contentsOf: settingsURL))
+        let data = try Data(contentsOf: settingsURL)
+        do {
+            if let envelope = try? decoder.decode(SettingsEnvelope.self, from: data) {
+                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
+                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
+                }
+                return envelope.settings
+            }
+
+            let legacy = try decoder.decode(EveeSettings.self, from: data)
+            try save(legacy)
+            return legacy
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let backup = try preserveCorruptFile(settingsURL)
+            throw LibraryStoreError.corruptFile(backup)
+        }
     }
 
     public func save(_ settings: EveeSettings) throws {
         try prepare()
-        try encoder.encode(settings).write(to: settingsURL, options: .atomic)
+        let envelope = SettingsEnvelope(schemaVersion: Self.currentSchemaVersion, updatedAt: .now, settings: settings)
+        try writePrivate(encoder.encode(envelope), to: settingsURL)
     }
 
     public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
@@ -60,7 +134,19 @@ public actor LibraryStore {
                     .localizedCaseInsensitiveContains(needle))
             }
             .sorted { $0.createdAt > $1.createdAt }
-            .prefix(max(1, limit))
+            .prefix(max(1, min(limit, 500)))
+            .map { $0 }
+    }
+
+    public func recent(kind: WorkspaceRecordKind? = nil, limit: Int = 50, since: Date? = nil) throws -> [WorkspaceRecord] {
+        try loadRecords()
+            .filter { record in
+                guard kind == nil || record.kind == kind else { return false }
+                guard let since else { return true }
+                return record.createdAt >= since
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(max(1, min(limit, 500)))
             .map { $0 }
     }
 
@@ -82,9 +168,180 @@ public actor LibraryStore {
         var records = try loadRecords()
         guard let record = records.first(where: { $0.id == id }) else { return }
         records.removeAll { $0.id == id }
-        if let relative = record.audioRelativePath {
-            try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(relative))
+
+        let paths = [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
+        for relativePath in Set(paths) {
+            let url = try safeURL(forRelativePath: relativePath)
+            try? FileManager.default.removeItem(at: url)
         }
         try save(records)
+    }
+
+    // MARK: - Durable dual-track audio and crash recovery
+
+    @discardableResult
+    public func beginRecoveryCapture(kind: WorkspaceRecordKind, id: UUID = UUID()) throws -> CaptureRecoveryManifest {
+        try prepare()
+        let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
+        try createPrivateDirectory(directory)
+        let manifest = CaptureRecoveryManifest(id: id, kind: kind)
+        try writeRecoveryManifest(manifest, directory: directory)
+        return manifest
+    }
+
+    public func addRecoveryTrack(
+        captureID: UUID,
+        kind: WorkspaceRecordKind,
+        role: AudioTrackRole,
+        sourceURL: URL,
+        moveSource: Bool = true,
+        duration: TimeInterval? = nil
+    ) throws -> CaptureRecoveryManifest {
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            throw LibraryStoreError.missingAudioSource(sourceURL)
+        }
+        try prepare()
+        let directory = recoveryURL.appendingPathComponent(captureID.uuidString, isDirectory: true)
+        try createPrivateDirectory(directory)
+        let destination = directory.appendingPathComponent("\(role.rawValue)-\(UUID().uuidString).\(sourceURL.pathExtension.isEmpty ? "audio" : sourceURL.pathExtension)")
+        if moveSource {
+            try FileManager.default.moveItem(at: sourceURL, to: destination)
+        } else {
+            try FileManager.default.copyItem(at: sourceURL, to: destination)
+        }
+        try makePrivate(destination)
+
+        var manifest = (try? readRecoveryManifest(directory: directory))
+            ?? CaptureRecoveryManifest(id: captureID, kind: kind)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+        let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
+        let relativePath = relativePath(for: destination)
+        manifest.tracks.removeAll { $0.role == role }
+        manifest.tracks.append(WorkspaceAudioTrack(role: role, relativePath: relativePath, duration: duration, byteCount: byteCount))
+        manifest.status = .captured
+        manifest.updatedAt = .now
+        manifest.failureReason = nil
+        try writeRecoveryManifest(manifest, directory: directory)
+        return manifest
+    }
+
+    public func updateRecoveryCapture(id: UUID, status: CaptureRecoveryStatus, failureReason: String? = nil) throws {
+        let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
+        var manifest = try readRecoveryManifest(directory: directory)
+        manifest.status = status
+        manifest.failureReason = failureReason
+        manifest.updatedAt = .now
+        try writeRecoveryManifest(manifest, directory: directory)
+    }
+
+    public func recoverableCaptures() throws -> [CaptureRecoveryManifest] {
+        try prepare()
+        let children = try FileManager.default.contentsOfDirectory(
+            at: recoveryURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        var manifests: [CaptureRecoveryManifest] = []
+        var looseTracks: [UUID: [WorkspaceAudioTrack]] = [:]
+
+        for child in children {
+            let values = try child.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+            if values.isDirectory == true {
+                if let manifest = try? readRecoveryManifest(directory: child) { manifests.append(manifest) }
+                continue
+            }
+
+            // Compatibility with captures written before recovery manifests existed.
+            let stem = child.deletingPathExtension().lastPathComponent
+            let isSystem = stem.hasSuffix("-system")
+            let idText = isSystem ? String(stem.dropLast("-system".count)) : stem
+            guard let id = UUID(uuidString: idText) else { continue }
+            let track = WorkspaceAudioTrack(
+                role: isSystem ? .system : .microphone,
+                relativePath: relativePath(for: child),
+                createdAt: values.contentModificationDate ?? .now,
+                byteCount: values.fileSize.map { Int64($0) }
+            )
+            looseTracks[id, default: []].append(track)
+        }
+
+        manifests.append(contentsOf: looseTracks.map { id, tracks in
+            CaptureRecoveryManifest(id: id, kind: tracks.contains(where: { $0.role == .system }) ? .meeting : .dictation, status: .captured, tracks: tracks)
+        })
+        return manifests.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    public func retainRecoveryCapture(id: UUID, for recordID: UUID) throws -> [WorkspaceAudioTrack] {
+        guard let capture = try recoverableCaptures().first(where: { $0.id == id }) else { return [] }
+        let destinationDirectory = audioURL
+            .appendingPathComponent("Records", isDirectory: true)
+            .appendingPathComponent(recordID.uuidString, isDirectory: true)
+        try createPrivateDirectory(destinationDirectory)
+
+        var retained: [WorkspaceAudioTrack] = []
+        for track in capture.tracks {
+            let source = try safeURL(forRelativePath: track.relativePath)
+            let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
+            if source != destination {
+                if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+                try FileManager.default.moveItem(at: source, to: destination)
+            }
+            try makePrivate(destination)
+            var updated = track
+            updated.relativePath = relativePath(for: destination)
+            retained.append(updated)
+        }
+
+        let manifestDirectory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
+        try? FileManager.default.removeItem(at: manifestDirectory)
+        return retained
+    }
+
+    public func safeURL(forRelativePath relativePath: String) throws -> URL {
+        guard !relativePath.isEmpty, !relativePath.hasPrefix("/") else {
+            throw LibraryStoreError.unsafeRelativePath(relativePath)
+        }
+        let candidate = rootURL.appendingPathComponent(relativePath).standardizedFileURL
+        let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        guard candidate.path.hasPrefix(rootPath) else {
+            throw LibraryStoreError.unsafeRelativePath(relativePath)
+        }
+        return candidate
+    }
+
+    private func readRecoveryManifest(directory: URL) throws -> CaptureRecoveryManifest {
+        try decoder.decode(CaptureRecoveryManifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
+    }
+
+    private func writeRecoveryManifest(_ manifest: CaptureRecoveryManifest, directory: URL) throws {
+        try createPrivateDirectory(directory)
+        try writePrivate(encoder.encode(manifest), to: directory.appendingPathComponent("manifest.json"))
+    }
+
+    private func relativePath(for url: URL) -> String {
+        String(url.standardizedFileURL.path.dropFirst(rootURL.path.count + 1))
+    }
+
+    private func createPrivateDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+    }
+
+    private func writePrivate(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: .atomic)
+        try makePrivate(url)
+    }
+
+    private func makePrivate(_ url: URL) throws {
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func preserveCorruptFile(_ url: URL) throws -> URL {
+        let directory = rootURL.appendingPathComponent("Corrupt", isDirectory: true)
+        try createPrivateDirectory(directory)
+        let backup = directory.appendingPathComponent("\(url.deletingPathExtension().lastPathComponent)-\(UUID().uuidString).json")
+        try FileManager.default.copyItem(at: url, to: backup)
+        try makePrivate(backup)
+        return backup
     }
 }

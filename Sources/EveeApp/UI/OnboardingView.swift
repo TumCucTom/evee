@@ -1,4 +1,5 @@
 import EveeCore
+import AppKit
 import SwiftUI
 
 struct OnboardingView: View {
@@ -21,11 +22,29 @@ struct OnboardingView: View {
                     feature("lock.shield", "Your voice stays yours", "No analytics or cloud processing.")
                 }.animaCard().frame(maxWidth: 480)
                 VStack(spacing: 10) {
+                    permissionRow(
+                        title: "Microphone",
+                        granted: store.microphonePermissionGranted,
+                        actionTitle: "Allow"
+                    ) { Task { await store.requestMicrophonePermission() } }
+                    permissionRow(
+                        title: "Accessibility",
+                        granted: store.accessibilityPermissionGranted,
+                        actionTitle: "Open Settings"
+                    ) { store.requestAccessibilityPermission() }
+                }
+                .animaCard()
+                .frame(maxWidth: 480)
+                VStack(spacing: 10) {
                     Button { Task { await store.downloadSelectedModel() } } label: { Text(store.modelProgress?.status ?? "Download local model") }.buttonStyle(AlphaButtonStyle())
+                        .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
                     if let progress = store.modelProgress { ProgressView(value: progress.fraction).frame(width: 260) }
                     Text("Parakeet v3 · about 735 MB · Apple Silicon").font(.caption).foregroundStyle(.secondary)
                 }
             }.padding(40)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.refreshPermissionState()
         }
     }
 
@@ -33,6 +52,25 @@ struct OnboardingView: View {
         HStack(spacing: 12) {
             Image(systemName: icon).foregroundStyle(AnimaTheme.indigo).frame(width: 28, height: 28).background(AnimaTheme.indigo.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 2) { Text(title).font(.system(size: 13, weight: .semibold)); Text(detail).font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func permissionRow(
+        title: String,
+        granted: Bool,
+        actionTitle: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Image(systemName: granted ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(granted ? .green : AnimaTheme.indigo)
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Spacer()
+            if granted {
+                Text("Ready").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Button(actionTitle, action: action).controlSize(.small)
+            }
         }
     }
 }

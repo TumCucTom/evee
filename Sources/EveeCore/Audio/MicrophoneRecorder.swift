@@ -5,12 +5,14 @@ public enum AudioCaptureError: LocalizedError {
     case microphoneDenied
     case invalidFormat
     case notRecording
+    case alreadyRecording
 
     public var errorDescription: String? {
         switch self {
         case .microphoneDenied: "Microphone access is required."
         case .invalidFormat: "The selected microphone did not provide a usable audio format."
         case .notRecording: "No recording is active."
+        case .alreadyRecording: "A recording is already active."
         }
     }
 }
@@ -26,6 +28,10 @@ public final class MicrophoneRecorder: ObservableObject {
 
     public init() {}
 
+    public static var isPermissionGranted: Bool {
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
+
     public func requestPermission() async -> Bool {
         if #available(macOS 14, *) {
             return await AVAudioApplication.requestRecordPermission()
@@ -34,8 +40,8 @@ public final class MicrophoneRecorder: ObservableObject {
     }
 
     public func start(at url: URL) async throws {
+        guard !isRecording else { throw AudioCaptureError.alreadyRecording }
         guard await requestPermission() else { throw AudioCaptureError.microphoneDenied }
-        guard !isRecording else { return }
 
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let input = engine.inputNode
@@ -54,11 +60,18 @@ public final class MicrophoneRecorder: ObservableObject {
             Task { @MainActor in self?.level = min(1, rms * 14) }
         }
 
-        engine.prepare()
-        try engine.start()
-        file = output
-        outputURL = url
-        isRecording = true
+        do {
+            engine.prepare()
+            try engine.start()
+            file = output
+            outputURL = url
+            isRecording = true
+        } catch {
+            input.removeTap(onBus: 0)
+            engine.stop()
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 
     public func stop() throws -> URL {

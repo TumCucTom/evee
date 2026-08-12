@@ -6,6 +6,109 @@ public enum WorkspaceRecordKind: String, Codable, CaseIterable, Sendable {
     case memo
 }
 
+public enum AudioTrackRole: String, Codable, CaseIterable, Sendable {
+    case microphone
+    case system
+    case mixed
+}
+
+public struct WorkspaceAudioTrack: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var role: AudioTrackRole
+    public var relativePath: String
+    public var createdAt: Date
+    public var duration: TimeInterval?
+    public var byteCount: Int64?
+
+    public init(
+        id: UUID = UUID(),
+        role: AudioTrackRole,
+        relativePath: String,
+        createdAt: Date = .now,
+        duration: TimeInterval? = nil,
+        byteCount: Int64? = nil
+    ) {
+        self.id = id
+        self.role = role
+        self.relativePath = relativePath
+        self.createdAt = createdAt
+        self.duration = duration
+        self.byteCount = byteCount
+    }
+}
+
+public enum CaptureRecoveryStatus: String, Codable, Sendable {
+    case recording
+    case captured
+    case processing
+    case failed
+}
+
+public struct CaptureRecoveryManifest: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var kind: WorkspaceRecordKind
+    public var startedAt: Date
+    public var updatedAt: Date
+    public var status: CaptureRecoveryStatus
+    public var tracks: [WorkspaceAudioTrack]
+    public var failureReason: String?
+
+    public init(
+        id: UUID = UUID(),
+        kind: WorkspaceRecordKind,
+        startedAt: Date = .now,
+        updatedAt: Date = .now,
+        status: CaptureRecoveryStatus = .recording,
+        tracks: [WorkspaceAudioTrack] = [],
+        failureReason: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.status = status
+        self.tracks = tracks
+        self.failureReason = failureReason
+    }
+}
+
+public enum WebhookDeliveryState: String, Codable, Sendable {
+    case pending
+    case delivered
+    case failed
+}
+
+public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var destination: String
+    public var state: WebhookDeliveryState
+    public var attemptCount: Int
+    public var lastAttemptAt: Date?
+    public var deliveredAt: Date?
+    public var responseStatusCode: Int?
+    public var lastError: String?
+
+    public init(
+        id: UUID = UUID(),
+        destination: String,
+        state: WebhookDeliveryState = .pending,
+        attemptCount: Int = 0,
+        lastAttemptAt: Date? = nil,
+        deliveredAt: Date? = nil,
+        responseStatusCode: Int? = nil,
+        lastError: String? = nil
+    ) {
+        self.id = id
+        self.destination = destination
+        self.state = state
+        self.attemptCount = attemptCount
+        self.lastAttemptAt = lastAttemptAt
+        self.deliveredAt = deliveredAt
+        self.responseStatusCode = responseStatusCode
+        self.lastError = lastError
+    }
+}
+
 public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var start: TimeInterval
@@ -32,10 +135,12 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     public var rawText: String?
     public var sourceApplication: String?
     public var audioRelativePath: String?
+    public var audioTracks: [WorkspaceAudioTrack]
     public var duration: TimeInterval?
     public var segments: [TranscriptSegment]
     public var notes: String
     public var tags: [String]
+    public var webhookDeliveries: [WebhookDelivery]
 
     public init(
         id: UUID = UUID(),
@@ -47,10 +152,12 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         rawText: String? = nil,
         sourceApplication: String? = nil,
         audioRelativePath: String? = nil,
+        audioTracks: [WorkspaceAudioTrack] = [],
         duration: TimeInterval? = nil,
         segments: [TranscriptSegment] = [],
         notes: String = "",
-        tags: [String] = []
+        tags: [String] = [],
+        webhookDeliveries: [WebhookDelivery] = []
     ) {
         self.id = id
         self.kind = kind
@@ -61,10 +168,36 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         self.rawText = rawText
         self.sourceApplication = sourceApplication
         self.audioRelativePath = audioRelativePath
+        self.audioTracks = audioTracks
         self.duration = duration
         self.segments = segments
         self.notes = notes
         self.tags = tags
+        self.webhookDeliveries = webhookDeliveries
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, createdAt, updatedAt, title, text, rawText, sourceApplication
+        case audioRelativePath, audioTracks, duration, segments, notes, tags, webhookDeliveries
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        kind = try values.decode(WorkspaceRecordKind.self, forKey: .kind)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        updatedAt = try values.decode(Date.self, forKey: .updatedAt)
+        title = try values.decode(String.self, forKey: .title)
+        text = try values.decode(String.self, forKey: .text)
+        rawText = try values.decodeIfPresent(String.self, forKey: .rawText)
+        sourceApplication = try values.decodeIfPresent(String.self, forKey: .sourceApplication)
+        audioRelativePath = try values.decodeIfPresent(String.self, forKey: .audioRelativePath)
+        audioTracks = try values.decodeIfPresent([WorkspaceAudioTrack].self, forKey: .audioTracks) ?? []
+        duration = try values.decodeIfPresent(TimeInterval.self, forKey: .duration)
+        segments = try values.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
+        notes = try values.decodeIfPresent(String.self, forKey: .notes) ?? ""
+        tags = try values.decodeIfPresent([String].self, forKey: .tags) ?? []
+        webhookDeliveries = try values.decodeIfPresent([WebhookDelivery].self, forKey: .webhookDeliveries) ?? []
     }
 }
 
@@ -115,7 +248,7 @@ public enum SpeechModel: String, Codable, CaseIterable, Sendable {
     public var detail: String { self == .parakeet ? "Fast · multilingual · ~735 MB" : "30 languages · macOS 15+ · ~1.75 GB" }
 }
 
-public struct EveeSettings: Codable, Sendable {
+public struct EveeSettings: Codable, Equatable, Sendable {
     public var model: SpeechModel = .parakeet
     public var languageCode = "auto"
     public var retainDictationAudio = false
@@ -130,6 +263,27 @@ public struct EveeSettings: Codable, Sendable {
     public var appStyles: [AppWritingStyle] = []
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case model, languageCode, retainDictationAudio, retainMeetingAudio, meetingCaptureEnabled
+        case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        model = try values.decodeIfPresent(SpeechModel.self, forKey: .model) ?? .parakeet
+        languageCode = try values.decodeIfPresent(String.self, forKey: .languageCode) ?? "auto"
+        retainDictationAudio = try values.decodeIfPresent(Bool.self, forKey: .retainDictationAudio) ?? false
+        retainMeetingAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMeetingAudio) ?? false
+        meetingCaptureEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingCaptureEnabled) ?? false
+        localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
+        localAPIPort = try values.decodeIfPresent(UInt16.self, forKey: .localAPIPort) ?? 4_739
+        webhookURL = try values.decodeIfPresent(String.self, forKey: .webhookURL) ?? ""
+        webhookSecret = try values.decodeIfPresent(String.self, forKey: .webhookSecret) ?? ""
+        defaultTone = try values.decodeIfPresent(WritingTone.self, forKey: .defaultTone) ?? .natural
+        dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
+        appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
+    }
 }
 
 public enum CaptureState: Equatable, Sendable {

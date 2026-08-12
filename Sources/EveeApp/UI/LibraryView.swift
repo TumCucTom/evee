@@ -5,6 +5,13 @@ struct LibraryView: View {
     @EnvironmentObject private var store: AppStore
     let title: String
     let kind: WorkspaceRecordKind?
+    let showsHeader: Bool
+
+    init(title: String, kind: WorkspaceRecordKind?, showsHeader: Bool = true) {
+        self.title = title
+        self.kind = kind
+        self.showsHeader = showsHeader
+    }
 
     private var rows: [WorkspaceRecord] {
         let records = store.filteredRecords
@@ -13,18 +20,32 @@ struct LibraryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.system(size: 22, weight: .bold)).foregroundStyle(AnimaTheme.ink)
-                    Text("Your local voice archive").font(.caption).foregroundStyle(.secondary)
+            if showsHeader {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title).font(.system(size: 22, weight: .bold)).foregroundStyle(AnimaTheme.ink)
+                        Text("Your local voice archive").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if kind == .memo {
+                        if isRecordingMemo {
+                            Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                                .buttonStyle(.bordered)
+                                .help("Stop and permanently discard this memo")
+                            Button("Stop and save") { Task { await store.finishCapture() } }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                                .keyboardShortcut(.return, modifiers: [])
+                        } else {
+                            Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
+                                .buttonStyle(AlphaButtonStyle())
+                                .disabled(store.captureState != .idle)
+                                .help(store.captureState == .idle ? "Record a private voice memo" : "Finish the current capture first")
+                        }
+                    }
                 }
-                Spacer()
-                if kind == .memo {
-                    Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
-                        .buttonStyle(AlphaButtonStyle())
-                }
+                .padding(20)
             }
-            .padding(20)
 
             HStack {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -35,7 +56,7 @@ struct LibraryView: View {
                 }
             }
             .padding(.horizontal, 12).frame(height: 38)
-            .background(.white).clipShape(RoundedRectangle(cornerRadius: 9))
+            .background(AnimaTheme.surface).clipShape(RoundedRectangle(cornerRadius: 9))
             .overlay(RoundedRectangle(cornerRadius: 9).stroke(AnimaTheme.border))
             .padding(.horizontal, 20).padding(.bottom, 12)
 
@@ -54,6 +75,11 @@ struct LibraryView: View {
             }
         }
         .background(AnimaTheme.paper)
+    }
+
+    private var isRecordingMemo: Bool {
+        guard store.captureKind == .memo, case .recording = store.captureState else { return false }
+        return true
     }
 }
 
@@ -76,9 +102,11 @@ private struct RecordRow: View {
             }
             Spacer()
         }
-        .padding(12).background(.white.opacity(0.76)).clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(12).background(AnimaTheme.surface.opacity(0.88)).clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(AnimaTheme.border.opacity(0.8)))
         .padding(.vertical, 3)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(record.kind.rawValue.capitalized), \(record.title), \(record.createdAt.formatted(date: .abbreviated, time: .shortened))")
     }
 
     private var icon: String { switch record.kind { case .dictation: "text.cursor"; case .meeting: "person.2.wave.2"; case .memo: "waveform" } }

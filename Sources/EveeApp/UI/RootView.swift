@@ -5,7 +5,7 @@ struct RootView: View {
     @EnvironmentObject private var store: AppStore
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             AnimaTheme.paper.ignoresSafeArea()
 
             if !store.modelReady {
@@ -21,21 +21,29 @@ struct RootView: View {
                 .navigationSplitViewStyle(.balanced)
             }
 
-            if store.captureState != .idle { RecordingPill(state: store.captureState) }
         }
         .tint(AnimaTheme.indigo)
-        .alert("Evee", isPresented: Binding(
+        .alert(alertTitle, isPresented: Binding(
             get: { store.statusMessage != nil },
-            set: { if !$0 { store.statusMessage = nil; if case .failed = store.captureState { store.captureState = .idle } } }
+            set: {
+                if !$0 {
+                    store.statusMessage = nil
+                    store.dismissCaptureFailure()
+                }
+            }
         )) {
-            Button("OK", role: .cancel) {}
+            Button("Open Settings") {
+                store.route = .settings
+                clearFailedCaptureIfNeeded()
+            }
+            Button("Dismiss", role: .cancel) { clearFailedCaptureIfNeeded() }
         } message: { Text(store.statusMessage ?? "") }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                AlphaMark(size: 28)
+                EveeMark(size: 28)
                 VStack(alignment: .leading, spacing: 0) {
                     Text("Evee").font(.system(size: 17, weight: .bold))
                     Text("by Anima").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
@@ -66,7 +74,7 @@ struct RootView: View {
             }
             .padding(16)
         }
-        .background(AnimaTheme.cloud.opacity(0.42))
+        .background(AnimaTheme.cloud.opacity(0.48))
     }
 
     @ViewBuilder private var routeContent: some View {
@@ -80,7 +88,10 @@ struct RootView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let record = store.selectedRecord { RecordDetailView(record: record) }
+        if let record = store.selectedRecord {
+            RecordDetailView(record: record)
+                .id(record.id)
+        }
         else {
             ContentUnavailableView("Choose a recording", systemImage: "waveform.badge.magnifyingglass", description: Text("Dictations, meetings and memos stay searchable on this Mac."))
         }
@@ -89,7 +100,17 @@ struct RootView: View {
     private func key(_ value: String, wide: Bool = false) -> some View {
         Text(value).font(.system(size: 11, weight: .semibold, design: .rounded))
             .frame(minWidth: wide ? 46 : 24, minHeight: 24)
-            .background(.white.opacity(0.8)).clipShape(RoundedRectangle(cornerRadius: 6))
+            .background(AnimaTheme.surface).clipShape(RoundedRectangle(cornerRadius: 6))
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(AnimaTheme.border))
+    }
+
+    private var alertTitle: String {
+        if case .failed = store.captureState { return "Capture stopped" }
+        return "Evee needs attention"
+    }
+
+    private func clearFailedCaptureIfNeeded() {
+        guard case .failed = store.captureState else { return }
+        store.dismissCaptureFailure()
     }
 }
