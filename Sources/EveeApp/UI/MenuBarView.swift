@@ -18,6 +18,12 @@ struct MenuBarView: View {
             Divider()
 
             switch store.captureState {
+            case .starting:
+                HStack(spacing: 9) {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing \(captureName)…").font(.caption)
+                }
+                Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
             case .recording:
                 Text("Recording \(captureName)")
                     .font(.caption)
@@ -71,6 +77,7 @@ struct MenuBarView: View {
     private var status: String {
         switch store.captureState {
         case .idle: "Ready"
+        case .starting: "Starting"
         case .recording: "Recording"
         case .transcribing: "Transcribing"
         case .delivering: "Inserting"
@@ -81,6 +88,7 @@ struct MenuBarView: View {
     private var statusIcon: String {
         switch store.captureState {
         case .idle: "checkmark.circle.fill"
+        case .starting: "waveform.circle"
         case .recording: "record.circle"
         case .transcribing, .delivering: "ellipsis.circle"
         case .failed: "exclamationmark.triangle.fill"
@@ -90,6 +98,7 @@ struct MenuBarView: View {
     private var statusColour: Color {
         switch store.captureState {
         case .idle: .green
+        case .starting: .secondary
         case .recording: .red
         case .failed: .orange
         default: .secondary

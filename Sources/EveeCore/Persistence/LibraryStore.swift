@@ -43,6 +43,7 @@ public actor LibraryStore {
     public let recoveryURL: URL
     private let recordsURL: URL
     private let settingsURL: URL
+    private let meetingDraftURL: URL
 
     public init(rootURL: URL? = nil) {
         let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -51,6 +52,7 @@ public actor LibraryStore {
         self.recoveryURL = self.audioURL.appendingPathComponent("Recovery", isDirectory: true)
         self.recordsURL = self.rootURL.appendingPathComponent("records.json")
         self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
+        self.meetingDraftURL = self.rootURL.appendingPathComponent("meeting-draft.json")
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
         self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -123,6 +125,23 @@ public actor LibraryStore {
         try writePrivate(encoder.encode(envelope), to: settingsURL)
     }
 
+    public func loadMeetingDraft() throws -> MeetingDraft? {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: meetingDraftURL.path) else { return nil }
+        return try decoder.decode(MeetingDraft.self, from: Data(contentsOf: meetingDraftURL))
+    }
+
+    public func saveMeetingDraft(_ draft: MeetingDraft?) throws {
+        try prepare()
+        guard let draft else {
+            if FileManager.default.fileExists(atPath: meetingDraftURL.path) {
+                try FileManager.default.removeItem(at: meetingDraftURL)
+            }
+            return
+        }
+        try writePrivate(encoder.encode(draft), to: meetingDraftURL)
+    }
+
     public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
         let records = try loadRecords()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -169,12 +188,17 @@ public actor LibraryStore {
         guard let record = records.first(where: { $0.id == id }) else { return }
         records.removeAll { $0.id == id }
 
+        // Metadata is the source of ownership. Commit its removal before deleting
+        // audio so a failed save cannot leave a record pointing at missing files.
+        try save(records)
+
         let paths = [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
         for relativePath in Set(paths) {
-            let url = try safeURL(forRelativePath: relativePath)
-            try? FileManager.default.removeItem(at: url)
+            if let url = try? safeURL(forRelativePath: relativePath) {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
-        try save(records)
+        try? reconcileRecordAudio(using: records)
     }
 
     // MARK: - Durable dual-track audio and crash recovery
@@ -247,7 +271,28 @@ public actor LibraryStore {
         for child in children {
             let values = try child.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
             if values.isDirectory == true {
-                if let manifest = try? readRecoveryManifest(directory: child) { manifests.append(manifest) }
+                guard let id = UUID(uuidString: child.lastPathComponent) else { continue }
+                var manifest = (try? readRecoveryManifest(directory: child))
+                    ?? CaptureRecoveryManifest(id: id, kind: .dictation, startedAt: values.contentModificationDate ?? .now)
+                let files = (try? FileManager.default.contentsOfDirectory(
+                    at: child,
+                    includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )) ?? []
+                for file in files where file.lastPathComponent != "manifest.json" {
+                    let relative = relativePath(for: file)
+                    guard !manifest.tracks.contains(where: { $0.relativePath == relative }) else { continue }
+                    let fileValues = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                    manifest.tracks.append(WorkspaceAudioTrack(
+                        role: inferredTrackRole(for: file),
+                        relativePath: relative,
+                        createdAt: fileValues?.contentModificationDate ?? manifest.startedAt,
+                        byteCount: fileValues?.fileSize.map(Int64.init)
+                    ))
+                }
+                if manifest.tracks.contains(where: { $0.role == .system }) { manifest.kind = .meeting }
+                if !manifest.tracks.isEmpty, manifest.status == .recording { manifest.status = .captured }
+                manifests.append(manifest)
                 continue
             }
 
@@ -271,30 +316,75 @@ public actor LibraryStore {
         return manifests.sorted { $0.startedAt > $1.startedAt }
     }
 
-    public func retainRecoveryCapture(id: UUID, for recordID: UUID) throws -> [WorkspaceAudioTrack] {
-        guard let capture = try recoverableCaptures().first(where: { $0.id == id }) else { return [] }
-        let destinationDirectory = audioURL
-            .appendingPathComponent("Records", isDirectory: true)
-            .appendingPathComponent(recordID.uuidString, isDirectory: true)
-        try createPrivateDirectory(destinationDirectory)
-
-        var retained: [WorkspaceAudioTrack] = []
-        for track in capture.tracks {
-            let source = try safeURL(forRelativePath: track.relativePath)
-            let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
-            if source != destination {
-                if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-                try FileManager.default.moveItem(at: source, to: destination)
-            }
-            try makePrivate(destination)
-            var updated = track
-            updated.relativePath = relativePath(for: destination)
-            retained.append(updated)
+    /// Establishes durable record metadata before removing its recovery copy.
+    /// Retained-file moves are rolled back if the metadata write fails.
+    public func commitRecoveredRecord(
+        _ proposedRecord: WorkspaceRecord,
+        recoveryID: UUID?,
+        keepAudio: Bool
+    ) throws -> WorkspaceRecord {
+        var record = proposedRecord
+        guard let recoveryID else {
+            try upsert(record)
+            return record
         }
 
-        let manifestDirectory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
-        try? FileManager.default.removeItem(at: manifestDirectory)
-        return retained
+        let capture = try recoverableCaptures().first { $0.id == recoveryID }
+        let recoveryDirectory = recoveryURL.appendingPathComponent(recoveryID.uuidString, isDirectory: true)
+        var moves: [(source: URL, destination: URL)] = []
+
+        if keepAudio, let capture {
+            let destinationDirectory = audioURL
+                .appendingPathComponent("Records", isDirectory: true)
+                .appendingPathComponent(record.id.uuidString, isDirectory: true)
+            try createPrivateDirectory(destinationDirectory)
+            var retained: [WorkspaceAudioTrack] = []
+
+            do {
+                for track in capture.tracks {
+                    let source = try safeURL(forRelativePath: track.relativePath)
+                    guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                    let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
+                    if source != destination {
+                        if FileManager.default.fileExists(atPath: destination.path) {
+                            try FileManager.default.removeItem(at: destination)
+                        }
+                        try FileManager.default.moveItem(at: source, to: destination)
+                        moves.append((source, destination))
+                    }
+                    try makePrivate(destination)
+                    var updated = track
+                    updated.relativePath = relativePath(for: destination)
+                    retained.append(updated)
+                }
+                record.audioTracks = retained
+                record.audioRelativePath = retained.first(where: { $0.role == .microphone })?.relativePath
+                try upsert(record)
+            } catch {
+                for move in moves.reversed() where FileManager.default.fileExists(atPath: move.destination.path) {
+                    try? FileManager.default.moveItem(at: move.destination, to: move.source)
+                }
+                throw error
+            }
+        } else {
+            try upsert(record)
+        }
+
+        // Metadata now owns the result (or intentionally owns no audio), so the
+        // recovery copy is safe to remove. Failed cleanup is reconciled on launch.
+        try? FileManager.default.removeItem(at: recoveryDirectory)
+        return record
+    }
+
+    public func discardRecoveryCapture(id: UUID) throws {
+        let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    public func reconcileAudioStorage() throws {
+        try reconcileRecordAudio(using: loadRecords())
     }
 
     public func safeURL(forRelativePath relativePath: String) throws -> URL {
@@ -320,6 +410,32 @@ public actor LibraryStore {
 
     private func relativePath(for url: URL) -> String {
         String(url.standardizedFileURL.path.dropFirst(rootURL.path.count + 1))
+    }
+
+    private func inferredTrackRole(for url: URL) -> AudioTrackRole {
+        let name = url.deletingPathExtension().lastPathComponent.lowercased()
+        if name.contains("system") { return .system }
+        if name.contains("mixed") { return .mixed }
+        return .microphone
+    }
+
+    private func reconcileRecordAudio(using records: [WorkspaceRecord]) throws {
+        let recordsDirectory = audioURL.appendingPathComponent("Records", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: recordsDirectory.path) else { return }
+        let ownedIDs = Set(records.map { $0.id.uuidString })
+        let children = try FileManager.default.contentsOfDirectory(
+            at: recordsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        for child in children {
+            let isDirectory = try child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
+            if isDirectory,
+               UUID(uuidString: child.lastPathComponent) != nil,
+               !ownedIDs.contains(child.lastPathComponent) {
+                try? FileManager.default.removeItem(at: child)
+            }
+        }
     }
 
     private func createPrivateDirectory(_ url: URL) throws {

@@ -9,12 +9,17 @@ struct MeetingWorkspaceView: View {
         VStack(spacing: 0) {
             header
 
-            if isRecordingMeeting {
+            if isStartingMeeting {
+                startingCard
+            } else if isRecordingMeeting {
                 recordingWorkspace
             } else if isProcessingMeeting {
                 processingCard
             } else {
-                LibraryView(title: "Past meetings", kind: .meeting, showsHeader: false)
+                VStack(spacing: 0) {
+                    if store.hasMeetingDraft { restoredDraftCard }
+                    LibraryView(title: "Past meetings", kind: .meeting, showsHeader: false)
+                }
             }
         }
         .background(AnimaTheme.paper)
@@ -109,6 +114,51 @@ struct MeetingWorkspaceView: View {
         }
     }
 
+    private var startingCard: some View {
+        HStack(spacing: 12) {
+            ProgressView().controlSize(.small)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Preparing meeting audio").font(.system(size: 13, weight: .semibold))
+                Text("Microphone or system-audio permission may be waiting. You can cancel safely.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
+        }
+        .animaCard()
+        .padding(20)
+    }
+
+    private var restoredDraftCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Recovered meeting notes", systemImage: "doc.badge.clock")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(AnimaTheme.indigo)
+                Spacer()
+                Button("Discard notes", role: .destructive) {
+                    Task { await store.discardMeetingDraft() }
+                }
+                .controlSize(.small)
+            }
+            Text("These notes were restored from your last interrupted meeting and continue to save automatically.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("Meeting title", text: $store.meetingTitle)
+                .textFieldStyle(.roundedBorder)
+            TextEditor(text: $store.meetingNotes)
+                .font(.system(size: 13))
+                .frame(minHeight: 80, maxHeight: 130)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(AnimaTheme.raisedSurface)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .animaCard()
+        .padding(.horizontal, 20)
+        .padding(.bottom, 12)
+    }
+
     private var processingCard: some View {
         VStack(spacing: 14) {
             ProgressView().controlSize(.large)
@@ -124,6 +174,11 @@ struct MeetingWorkspaceView: View {
 
     private var isRecordingMeeting: Bool {
         guard store.captureKind == .meeting, case .recording = store.captureState else { return false }
+        return true
+    }
+
+    private var isStartingMeeting: Bool {
+        guard store.captureKind == .meeting, case .starting = store.captureState else { return false }
         return true
     }
 

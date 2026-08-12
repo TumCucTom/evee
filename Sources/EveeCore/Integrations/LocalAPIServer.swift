@@ -4,12 +4,10 @@ import Network
 public struct LocalAPICredentials: Codable, Equatable, Sendable {
     public var baseURL: URL
     public var token: String
-    public var tokenFileURL: URL
 
-    public init(baseURL: URL, token: String, tokenFileURL: URL) {
+    public init(baseURL: URL, token: String) {
         self.baseURL = baseURL
         self.token = token
-        self.tokenFileURL = tokenFileURL
     }
 }
 
@@ -27,13 +25,17 @@ public enum LocalAPIServerError: LocalizedError, Sendable {
 
 public final class LocalAPIServer: @unchecked Sendable {
     private let store: LibraryStore
+    private let secretStore: KeychainSecretStore
     private let queue = DispatchQueue(label: "com.tumcuctom.evee.api")
     private let stateLock = NSLock()
     private var listener: NWListener?
     private var token = ""
     private var currentCredentials: LocalAPICredentials?
 
-    public init(store: LibraryStore = .shared) { self.store = store }
+    public init(store: LibraryStore = .shared, secretStore: KeychainSecretStore = KeychainSecretStore()) {
+        self.store = store
+        self.secretStore = secretStore
+    }
 
     /// Backwards-compatible entry point used by the app.
     public func start(port: UInt16) async throws -> String {
@@ -44,8 +46,8 @@ public final class LocalAPIServer: @unchecked Sendable {
     public func startWithCredentials(port: UInt16) async throws -> LocalAPICredentials {
         stop()
         guard port > 0, let endpointPort = NWEndpoint.Port(rawValue: port) else { throw LocalAPIServerError.invalidPort(port) }
-        let tokenDetails = try await loadOrCreateToken()
-        token = tokenDetails.token
+        let tokenValue = try await loadOrCreateToken()
+        stateLock.withLock { token = tokenValue }
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
@@ -86,8 +88,7 @@ public final class LocalAPIServer: @unchecked Sendable {
         let activePort = listener.port?.rawValue ?? port
         let credentials = LocalAPICredentials(
             baseURL: URL(string: "http://127.0.0.1:\(activePort)")!,
-            token: tokenDetails.token,
-            tokenFileURL: tokenDetails.url
+            token: tokenValue
         )
         stateLock.withLock { currentCredentials = credentials }
         return credentials
@@ -103,6 +104,29 @@ public final class LocalAPIServer: @unchecked Sendable {
             listener = nil
             currentCredentials = nil
         }
+    }
+
+    /// Replaces the bearer token without exposing a stale-token window. The
+    /// listener keeps running and all subsequent requests use the new value.
+    @discardableResult
+    public func rotateToken() throws -> LocalAPICredentials? {
+        let value = try KeychainSecretStore.randomToken()
+        try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+        return stateLock.withLock {
+            token = value
+            guard var credentials = currentCredentials else { return nil }
+            credentials.token = value
+            currentCredentials = credentials
+            return credentials
+        }
+    }
+
+    /// Revokes the credential and closes the listener. Enabling the API again
+    /// creates a fresh token; a revoked token is never silently reused.
+    public func revokeToken() throws {
+        stop()
+        stateLock.withLock { token = "" }
+        try secretStore.delete(KeychainSecretStore.localAPITokenAccount)
     }
 
     private func accept(_ connection: NWConnection) {
@@ -157,8 +181,12 @@ public final class LocalAPIServer: @unchecked Sendable {
             let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
             headers[name] = value
         }
-        let suppliedToken = headers["authorization"]?.dropPrefix("Bearer ") ?? ""
-        guard constantTimeEqual(String(suppliedToken), token) else {
+        let authorization = headers["authorization"]?.split(separator: " ", maxSplits: 1).map(String.init) ?? []
+        let suppliedToken = authorization.count == 2 && authorization[0].caseInsensitiveCompare("Bearer") == .orderedSame
+            ? authorization[1]
+            : ""
+        let expectedToken = stateLock.withLock { token }
+        guard constantTimeEqual(suppliedToken, expectedToken) else {
             send(status: 401, json: ["error": "Unauthorised"], on: connection)
             return
         }
@@ -216,17 +244,22 @@ public final class LocalAPIServer: @unchecked Sendable {
         connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { _ in connection.cancel() })
     }
 
-    private func loadOrCreateToken() async throws -> (token: String, url: URL) {
+    private func loadOrCreateToken() async throws -> String {
+        if let value = try secretStore.string(for: KeychainSecretStore.localAPITokenAccount), !value.isEmpty {
+            return value
+        }
+
+        // One-time migration from the private token file used by early builds.
         try await store.prepare()
         let url = store.rootURL.appendingPathComponent("api.token")
         if let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            return (value, url)
+            try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+            try FileManager.default.removeItem(at: url)
+            return value
         }
-        let value = UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        try value.write(to: url, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        return (value, url)
+        let value = try KeychainSecretStore.randomToken()
+        try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+        return value
     }
 
     private func constantTimeEqual(_ lhs: String, _ rhs: String) -> Bool {
@@ -236,13 +269,6 @@ public final class LocalAPIServer: @unchecked Sendable {
         var difference: UInt8 = 0
         for index in left.indices { difference |= left[index] ^ right[index] }
         return difference == 0
-    }
-}
-
-private extension String {
-    func dropPrefix(_ prefix: String) -> Substring? {
-        guard hasPrefix(prefix) else { return nil }
-        return dropFirst(prefix.count)
     }
 }
 

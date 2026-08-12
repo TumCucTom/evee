@@ -56,6 +56,24 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertTrue(settings.dictionary.isEmpty)
     }
 
+    func testSettingsNeverEncodeLegacyWebhookSecret() throws {
+        var settings = EveeSettings()
+        settings.webhookURL = "https://example.com/webhook"
+        settings.webhookSecret = "must-not-reach-disk"
+        let data = try JSONEncoder().encode(settings)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(json.contains("must-not-reach-disk"))
+        XCTAssertFalse(json.contains("webhookSecret"))
+    }
+
+    func testWebhookEndpointRequiresHTTPSExceptExactLoopback() throws {
+        XCTAssertNoThrow(try WebhookEndpointPolicy.validate(URL(string: "https://example.com/hooks/evee")!))
+        XCTAssertNoThrow(try WebhookEndpointPolicy.validate(URL(string: "http://127.0.0.1:9000/hook")!))
+        XCTAssertNoThrow(try WebhookEndpointPolicy.validate(URL(string: "http://localhost:9000/hook")!))
+        XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "http://example.com/hook")!))
+        XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "https://user:password@example.com/hook")!))
+    }
+
     func testDualTrackRecoveryCanBeRetained() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let input = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -71,9 +89,10 @@ final class EveeCoreTests: XCTestCase {
         let completed = try await store.addRecoveryTrack(captureID: capture.id, kind: .meeting, role: .system, sourceURL: system)
         XCTAssertEqual(Set(completed.tracks.map(\.role)), Set([.microphone, .system]))
 
-        let retained = try await store.retainRecoveryCapture(id: capture.id, for: UUID())
-        XCTAssertEqual(Set(retained.map(\.role)), Set([.microphone, .system]))
-        for track in retained {
+        let proposed = WorkspaceRecord(kind: .meeting, title: "Recovered", text: "Transcript")
+        let committed = try await store.commitRecoveredRecord(proposed, recoveryID: capture.id, keepAudio: true)
+        XCTAssertEqual(Set(committed.audioTracks.map(\.role)), Set([.microphone, .system]))
+        for track in committed.audioTracks {
             let url = try await store.safeURL(forRelativePath: track.relativePath)
             XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         }
@@ -119,5 +138,64 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(signature.count, 64)
         XCTAssertEqual(signature, MeetingWebhook.signature(for: Data("payload".utf8), secret: "secret"))
         XCTAssertNotEqual(signature, MeetingWebhook.signature(for: Data("different".utf8), secret: "secret"))
+    }
+
+    func testMeetingDraftRoundTripsAndCanBeCleared() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = LibraryStore(rootURL: root)
+        let captureID = UUID()
+        let draft = MeetingDraft(captureID: captureID, title: "Weekly review", notes: "Follow up with Sam")
+
+        try await store.saveMeetingDraft(draft)
+        let restored = try await store.loadMeetingDraft()
+        XCTAssertEqual(restored?.captureID, captureID)
+        XCTAssertEqual(restored?.title, "Weekly review")
+        XCTAssertEqual(restored?.notes, "Follow up with Sam")
+
+        try await store.saveMeetingDraft(nil)
+        let cleared = try await store.loadMeetingDraft()
+        XCTAssertNil(cleared)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRecoveryReconcilesAudioWrittenBeforeManifestUpdate() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = LibraryStore(rootURL: root)
+        let capture = try await store.beginRecoveryCapture(kind: .meeting)
+        let recoveryRoot = await store.recoveryURL
+        let directory = recoveryRoot.appendingPathComponent(capture.id.uuidString, isDirectory: true)
+        try Data("microphone".utf8).write(to: directory.appendingPathComponent("microphone.caf"))
+        try Data("system".utf8).write(to: directory.appendingPathComponent("system.m4a"))
+
+        let reconciled = try await store.recoverableCaptures().first { $0.id == capture.id }
+        XCTAssertEqual(Set(reconciled?.tracks.map(\.role) ?? []), Set([.microphone, .system]))
+        XCTAssertEqual(reconciled?.status, .captured)
+        XCTAssertEqual(reconciled?.kind, .meeting)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRecoveredRecordCommitOwnsAudioBeforeRecoveryIsRemoved() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
+        try Data("audio".utf8).write(to: input)
+        let store = LibraryStore(rootURL: root)
+        let capture = try await store.beginRecoveryCapture(kind: .memo)
+        _ = try await store.addRecoveryTrack(captureID: capture.id, kind: .memo, role: .microphone, sourceURL: input)
+        let proposed = WorkspaceRecord(kind: .memo, title: "Recovered memo", text: "Recovered")
+
+        let committed = try await store.commitRecoveredRecord(proposed, recoveryID: capture.id, keepAudio: true)
+        let storedRecord = try await store.record(id: proposed.id)
+        XCTAssertEqual(storedRecord?.id, proposed.id)
+        let track = try XCTUnwrap(committed.audioTracks.first)
+        let retainedURL = try await store.safeURL(forRelativePath: track.relativePath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retainedURL.path))
+        let recoveriesAfterCommit = try await store.recoverableCaptures()
+        XCTAssertFalse(recoveriesAfterCommit.contains { $0.id == capture.id })
+
+        try await store.delete(id: proposed.id)
+        let deletedRecord = try await store.record(id: proposed.id)
+        XCTAssertNil(deletedRecord)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: retainedURL.path))
+        try? FileManager.default.removeItem(at: root)
     }
 }

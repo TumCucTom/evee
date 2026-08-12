@@ -32,6 +32,10 @@ struct RootView: View {
                 }
             }
         )) {
+            if store.pendingDelivery != nil {
+                Button("Retry Paste") { Task { await store.retryPendingTextDelivery() } }
+                Button("Copy Text") { store.copyPendingTextDelivery() }
+            }
             Button("Open Settings") {
                 store.route = .settings
                 clearFailedCaptureIfNeeded()

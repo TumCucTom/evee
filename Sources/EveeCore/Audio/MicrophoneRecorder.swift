@@ -6,6 +6,7 @@ public enum AudioCaptureError: LocalizedError {
     case invalidFormat
     case notRecording
     case alreadyRecording
+    case writeFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -13,6 +14,7 @@ public enum AudioCaptureError: LocalizedError {
         case .invalidFormat: "The selected microphone did not provide a usable audio format."
         case .notRecording: "No recording is active."
         case .alreadyRecording: "A recording is already active."
+        case .writeFailed(let message): "The microphone recording could not be written: \(message)"
         }
     }
 }
@@ -23,6 +25,7 @@ public final class MicrophoneRecorder: ObservableObject {
     @Published public private(set) var isRecording = false
 
     private let engine = AVAudioEngine()
+    private let writeErrors = AudioWriteErrorState()
     private var file: AVAudioFile?
     private var outputURL: URL?
 
@@ -49,8 +52,14 @@ public final class MicrophoneRecorder: ObservableObject {
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioCaptureError.invalidFormat }
 
         let output = try AVAudioFile(forWriting: url, settings: format.settings)
+        writeErrors.reset()
+        let writeErrors = self.writeErrors
         input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-            try? output.write(from: buffer)
+            do {
+                try output.write(from: buffer)
+            } catch {
+                writeErrors.record(error)
+            }
             let channel = buffer.floatChannelData?[0]
             let count = Int(buffer.frameLength)
             guard let channel, count > 0 else { return }
@@ -82,6 +91,30 @@ public final class MicrophoneRecorder: ObservableObject {
         self.outputURL = nil
         level = 0
         isRecording = false
+        if let writeError = writeErrors.take() {
+            throw AudioCaptureError.writeFailed(writeError.localizedDescription)
+        }
         return outputURL
+    }
+}
+
+private final class AudioWriteErrorState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var error: Error?
+
+    func record(_ error: Error) {
+        lock.lock(); defer { lock.unlock() }
+        if self.error == nil { self.error = error }
+    }
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        error = nil
+    }
+
+    func take() -> Error? {
+        lock.lock(); defer { lock.unlock() }
+        defer { error = nil }
+        return error
     }
 }

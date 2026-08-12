@@ -10,7 +10,6 @@ struct SettingsView: View {
     @State private var newBundleIdentifier = ""
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
-    @State private var apiToken = ""
     @State private var integrationMessage: String?
 
     var body: some View {
@@ -105,20 +104,27 @@ struct SettingsView: View {
                 Toggle("Enable loopback API", isOn: $store.settings.localAPIEnabled)
                 if store.settings.localAPIEnabled {
                     TextField("Port", value: $store.settings.localAPIPort, format: .number)
-                    LabeledContent("Endpoint", value: "http://127.0.0.1:\(store.settings.localAPIPort)")
+                    LabeledContent("Endpoint", value: store.localAPICredentials?.baseURL.absoluteString ?? "Available after Save")
                     HStack {
-                        SecureField("API token", text: $apiToken)
+                        SecureField("API token", text: .constant(store.localAPICredentials?.token ?? ""))
                             .textFieldStyle(.roundedBorder)
                             .disabled(true)
-                        Button("Copy") { copy(apiToken) }
-                            .disabled(apiToken.isEmpty)
+                        Button("Copy") { copy(store.localAPICredentials?.token ?? "") }
+                            .disabled(store.localAPICredentials == nil)
+                        Button("Rotate", action: store.rotateLocalAPIToken)
+                            .disabled(store.localAPICredentials == nil)
+                        Button("Revoke", role: .destructive) { Task { await store.revokeLocalAPIAccess() } }
+                            .disabled(store.localAPICredentials == nil)
                     }
-                    Text("The API is read-only and accepts connections from this Mac only.")
+                    Text("Save to publish a token. The API is read-only, accepts connections from this Mac only, and stores its token in Keychain.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 TextField("Meeting webhook URL", text: $store.settings.webhookURL)
-                SecureField("Webhook signing secret", text: $store.settings.webhookSecret)
+                SecureField("Webhook signing secret", text: $store.webhookSecret)
+                Text("Webhook secrets are stored in Keychain. HTTPS is required except for localhost development.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("MCP") {
@@ -150,12 +156,9 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .background(AnimaTheme.paper)
-        .task { await refreshLocalState() }
+        .task { refreshModelState() }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
-        .onChange(of: store.settings.localAPIEnabled) { _, enabled in
-            if enabled { Task { await loadAPIToken() } }
-        }
     }
 
     private var trimmedBundleIdentifier: String {
@@ -183,19 +186,8 @@ struct SettingsView: View {
         store.settings.appStyles.removeAll { $0.id == id }
     }
 
-    private func refreshLocalState() async {
-        refreshModelState()
-        if store.settings.localAPIEnabled { await loadAPIToken() }
-    }
-
     private func refreshModelState() {
         selectedModelReady = (try? TranscriberFactory.make(store.settings.model).isDownloaded) == true
-    }
-
-    private func loadAPIToken() async {
-        let rootURL = await LibraryStore.shared.rootURL
-        let tokenURL = rootURL.appendingPathComponent("api.token")
-        apiToken = (try? String(contentsOf: tokenURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
     }
 
     private func registerMCP() {

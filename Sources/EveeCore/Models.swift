@@ -72,6 +72,22 @@ public struct CaptureRecoveryManifest: Identifiable, Codable, Hashable, Sendable
     }
 }
 
+/// Notes entered while a meeting is being captured are kept separately from the
+/// eventual transcript so they survive an application crash or relaunch.
+public struct MeetingDraft: Codable, Equatable, Sendable {
+    public var captureID: UUID?
+    public var title: String
+    public var notes: String
+    public var updatedAt: Date
+
+    public init(captureID: UUID? = nil, title: String = "", notes: String = "", updatedAt: Date = .now) {
+        self.captureID = captureID
+        self.title = title
+        self.notes = notes
+        self.updatedAt = updatedAt
+    }
+}
+
 public enum WebhookDeliveryState: String, Codable, Sendable {
     case pending
     case delivered
@@ -257,6 +273,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var localAPIEnabled = false
     public var localAPIPort: UInt16 = 4739
     public var webhookURL = ""
+    /// Only populated while decoding settings written by older Evee builds. New
+    /// settings files never encode this value; the app migrates it to Keychain.
     public var webhookSecret = ""
     public var defaultTone: WritingTone = .natural
     public var dictionary: [DictionaryTerm] = []
@@ -284,10 +302,28 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
     }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(model, forKey: .model)
+        try values.encode(languageCode, forKey: .languageCode)
+        try values.encode(retainDictationAudio, forKey: .retainDictationAudio)
+        try values.encode(retainMeetingAudio, forKey: .retainMeetingAudio)
+        try values.encode(meetingCaptureEnabled, forKey: .meetingCaptureEnabled)
+        try values.encode(localAPIEnabled, forKey: .localAPIEnabled)
+        try values.encode(localAPIPort, forKey: .localAPIPort)
+        try values.encode(webhookURL, forKey: .webhookURL)
+        try values.encode(defaultTone, forKey: .defaultTone)
+        try values.encode(dictionary, forKey: .dictionary)
+        try values.encode(appStyles, forKey: .appStyles)
+        // webhookSecret is deliberately omitted. It exists in CodingKeys only so
+        // a one-time migration can read settings produced by older versions.
+    }
 }
 
 public enum CaptureState: Equatable, Sendable {
     case idle
+    case starting(kind: WorkspaceRecordKind)
     case recording(startedAt: Date, level: Float)
     case transcribing
     case delivering

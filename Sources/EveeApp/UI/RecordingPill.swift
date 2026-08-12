@@ -30,14 +30,14 @@ struct RecordingPill: View {
 
             Spacer(minLength: 10)
 
-            if case .recording = state {
+            if canCancel {
                 if let onCancel {
                     Button("Discard", role: .destructive, action: onCancel)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Stop recording and permanently discard this capture")
                 }
-                if let onStop {
+                if let onStop, case .recording = state {
                     Button("Stop", action: onStop)
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
@@ -86,6 +86,7 @@ struct RecordingPill: View {
     private var title: String {
         switch state {
         case .idle: "Ready"
+        case .starting: "Starting capture"
         case .recording: "Recording"
         case .transcribing: "Transcribing locally"
         case .delivering: "Inserting text"
@@ -96,6 +97,7 @@ struct RecordingPill: View {
     private var detail: String {
         switch state {
         case .idle: "Hold your shortcut to dictate"
+        case .starting(let kind): "Preparing \(kind.rawValue) audio · you can discard at any time"
         case .recording(let startedAt, _): "Started \(startedAt.formatted(date: .omitted, time: .standard)) · audio stays on this Mac"
         case .transcribing: "You can keep working while Evee processes the audio"
         case .delivering: "Sending the finished text to your active app"
@@ -105,11 +107,19 @@ struct RecordingPill: View {
 
     private var accessibilityLabel: String {
         switch state {
+        case .starting: "Evee is preparing audio capture. Use Discard to cancel."
         case .recording: "Evee is recording. Use Stop to transcribe or Discard to delete the recording."
         case .transcribing: "Evee is transcribing locally."
         case .delivering: "Evee is inserting the finished text."
         case .failed(let message): "Evee capture failed. \(message)"
         case .idle: "Evee is ready."
+        }
+    }
+
+    private var canCancel: Bool {
+        switch state {
+        case .starting, .recording: true
+        default: false
         }
     }
 

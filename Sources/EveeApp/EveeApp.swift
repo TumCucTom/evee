@@ -29,6 +29,7 @@ struct EveeApp: App {
 
     private var menuIcon: String {
         switch store.captureState {
+        case .starting: "waveform.circle"
         case .recording: "waveform.circle.fill"
         case .transcribing, .delivering: "ellipsis.circle"
         default: "waveform.circle"

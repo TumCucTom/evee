@@ -25,6 +25,32 @@ public struct WebhookDeliveryFailure: LocalizedError, Sendable {
     }
 }
 
+public enum WebhookEndpointError: LocalizedError, Sendable {
+    case invalidURL
+    case insecureTransport
+    case embeddedCredentials
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL: "Enter a valid webhook URL with a host."
+        case .insecureTransport: "Meeting webhooks require HTTPS. HTTP is allowed only for localhost development."
+        case .embeddedCredentials: "Webhook URLs cannot contain usernames or passwords. Use the signing secret instead."
+        }
+    }
+}
+
+public enum WebhookEndpointPolicy {
+    public static func validate(_ destination: URL) throws {
+        guard let scheme = destination.scheme?.lowercased(), let host = destination.host?.lowercased(), !host.isEmpty else {
+            throw WebhookEndpointError.invalidURL
+        }
+        guard destination.user == nil, destination.password == nil else { throw WebhookEndpointError.embeddedCredentials }
+        if scheme == "https" { return }
+        let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard scheme == "http", loopback else { throw WebhookEndpointError.insecureTransport }
+    }
+}
+
 public struct MeetingWebhook: Sendable {
     private let session: URLSession
 
@@ -46,6 +72,7 @@ public struct MeetingWebhook: Sendable {
         deliveryID: UUID = UUID(),
         maxAttempts: Int = 3
     ) async throws -> WebhookDeliveryReceipt {
+        try WebhookEndpointPolicy.validate(destination)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let body = try encoder.encode(record)
@@ -71,7 +98,7 @@ public struct MeetingWebhook: Sendable {
                     request.setValue(Self.signature(for: body, secret: secret), forHTTPHeaderField: "X-Evee-Signature-256")
                 }
 
-                let (_, response) = try await session.data(for: request)
+                let (_, response) = try await session.data(for: request, delegate: SafeWebhookRedirectDelegate())
                 guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
                 delivery.responseStatusCode = http.statusCode
                 guard (200..<300).contains(http.statusCode) else {
@@ -123,5 +150,22 @@ public struct MeetingWebhook: Sendable {
     private func backoff(after attempt: Int) async throws {
         let milliseconds = UInt64(min(250 * (1 << (attempt - 1)), 2_000))
         try await Task.sleep(nanoseconds: milliseconds * 1_000_000)
+    }
+}
+
+private final class SafeWebhookRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        do {
+            try WebhookEndpointPolicy.validate(request.url ?? URL(fileURLWithPath: "/"))
+            completionHandler(request)
+        } catch {
+            completionHandler(nil)
+        }
     }
 }

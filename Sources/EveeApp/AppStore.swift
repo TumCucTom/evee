@@ -11,6 +11,10 @@ extension KeyboardShortcuts.Name {
 @MainActor
 final class AppStore: ObservableObject {
     enum Route: Hashable { case library, meetings, memos, dictionary, settings }
+    struct PendingTextDelivery {
+        var text: String
+        var target: FrontmostApplication?
+    }
 
     @Published var route: Route = .library
     @Published var records: [WorkspaceRecord] = []
@@ -23,6 +27,10 @@ final class AppStore: ObservableObject {
     @Published var statusMessage: String?
     @Published var meetingTitle = ""
     @Published var meetingNotes = ""
+    @Published var webhookSecret = ""
+    @Published private(set) var localAPICredentials: LocalAPICredentials?
+    @Published private(set) var pendingDelivery: PendingTextDelivery?
+    @Published private(set) var recoverableCaptures: [CaptureRecoveryManifest] = []
     @Published private(set) var captureKind: WorkspaceRecordKind?
     @Published private(set) var isSystemAudioActive = false
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
@@ -33,6 +41,7 @@ final class AppStore: ObservableObject {
     private let library = LibraryStore.shared
     private let cleanup = TextCleanupPipeline()
     private let api = LocalAPIServer()
+    private let secretStore = KeychainSecretStore()
     private var transcriber: (any LocalTranscriber)?
     private var activeAudioURL: URL?
     private var activeSystemAudioURL: URL?
@@ -43,8 +52,15 @@ final class AppStore: ObservableObject {
     private var captureStartedAt: Date?
     private var cancellables = Set<AnyCancellable>()
     private var pushToTalkHeld = false
-    private var pushToTalkReleasedWhileStarting = false
     private var stopRequestedDuringStart: UUID?
+    private var shortcutTask: Task<Void, Never>?
+    private var meetingDraftCaptureID: UUID?
+    private var didBootstrap = false
+    private var suppressDraftAutosave = false
+
+    private enum PushToTalkEvent: Sendable { case down, up }
+    private let shortcutEvents: AsyncStream<PushToTalkEvent>
+    private let shortcutContinuation: AsyncStream<PushToTalkEvent>.Continuation
 
     private enum CaptureLifecycle: Equatable {
         case idle
@@ -57,6 +73,10 @@ final class AppStore: ObservableObject {
     private var captureLifecycle: CaptureLifecycle = .idle
 
     init() {
+        let eventPair = AsyncStream<PushToTalkEvent>.makeStream()
+        shortcutEvents = eventPair.stream
+        shortcutContinuation = eventPair.continuation
+
         recorder.$level
             .receive(on: RunLoop.main)
             .sink { [weak self] level in
@@ -65,22 +85,34 @@ final class AppStore: ObservableObject {
             }
             .store(in: &cancellables)
 
-        KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
-            Task { @MainActor in
-                guard let self, !self.pushToTalkHeld else { return }
-                self.pushToTalkHeld = true
-                self.pushToTalkReleasedWhileStarting = false
-                await self.beginDictation()
+        Publishers.CombineLatest($meetingTitle, $meetingNotes)
+            .dropFirst()
+            .debounce(for: .milliseconds(350), scheduler: RunLoop.main)
+            .sink { [weak self] title, notes in
+                Task { @MainActor in
+                    await self?.autosaveMeetingDraft(title: title, notes: notes)
+                }
             }
+            .store(in: &cancellables)
+
+        KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
+            self?.shortcutContinuation.yield(.down)
         }
         KeyboardShortcuts.onKeyUp(for: .pushToTalk) { [weak self] in
-            Task { @MainActor in
-                guard let self else { return }
-                self.pushToTalkHeld = false
-                if case .idle = self.captureLifecycle {
-                    self.pushToTalkReleasedWhileStarting = true
+            self?.shortcutContinuation.yield(.up)
+        }
+        shortcutTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for await event in self.shortcutEvents {
+                switch event {
+                case .down:
+                    guard !self.pushToTalkHeld else { continue }
+                    self.pushToTalkHeld = true
+                    await self.beginDictation()
+                case .up:
+                    self.pushToTalkHeld = false
+                    await self.finishCapture()
                 }
-                await self.finishCapture()
             }
         }
     }
@@ -105,11 +137,23 @@ final class AppStore: ObservableObject {
         do {
             try await library.prepare()
             settings = try await library.loadSettings()
+            try await loadAndMigrateSecrets()
             records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
+            try await library.reconcileAudioStorage()
+            if let draft = try await library.loadMeetingDraft() {
+                suppressDraftAutosave = true
+                meetingDraftCaptureID = draft.captureID
+                meetingTitle = draft.title
+                meetingNotes = draft.notes
+                suppressDraftAutosave = false
+            }
+            recoverableCaptures = try await library.recoverableCaptures()
             transcriber = try TranscriberFactory.make(settings.model)
             modelReady = transcriber?.isDownloaded == true
             refreshPermissionState()
-            if settings.localAPIEnabled { _ = try await api.start(port: settings.localAPIPort) }
+            if settings.localAPIEnabled { localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort) }
+            didBootstrap = true
+            await retryPendingWebhookDeliveries()
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -117,11 +161,44 @@ final class AppStore: ObservableObject {
 
     func saveSettings() async {
         do {
+            if !settings.webhookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                guard let destination = URL(string: settings.webhookURL) else { throw WebhookEndpointError.invalidURL }
+                try WebhookEndpointPolicy.validate(destination)
+            }
+            if webhookSecret.isEmpty {
+                try secretStore.delete(KeychainSecretStore.webhookSigningSecretAccount)
+            } else {
+                try secretStore.set(webhookSecret, for: KeychainSecretStore.webhookSigningSecretAccount)
+            }
+            settings.webhookSecret = ""
             try await library.save(settings)
             transcriber?.unload()
             transcriber = try TranscriberFactory.make(settings.model)
             modelReady = transcriber?.isDownloaded == true
-            if settings.localAPIEnabled { _ = try await api.start(port: settings.localAPIPort) } else { api.stop() }
+            if settings.localAPIEnabled {
+                localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort)
+            } else {
+                api.stop()
+                localAPICredentials = nil
+            }
+            statusMessage = "Settings saved."
+        } catch { statusMessage = error.localizedDescription }
+    }
+
+    func rotateLocalAPIToken() {
+        do {
+            localAPICredentials = try api.rotateToken()
+            statusMessage = "The local API token was rotated. Existing clients have been revoked."
+        } catch { statusMessage = error.localizedDescription }
+    }
+
+    func revokeLocalAPIAccess() async {
+        do {
+            try api.revokeToken()
+            localAPICredentials = nil
+            settings.localAPIEnabled = false
+            try await library.save(settings)
+            statusMessage = "Local API access was revoked and the listener was stopped."
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -198,14 +275,20 @@ final class AppStore: ObservableObject {
         let sessionID = UUID()
         captureLifecycle = .starting(sessionID)
         captureKind = activeKind
-        stopRequestedDuringStart = pushToTalkReleasedWhileStarting && activeKind == .dictation ? sessionID : nil
-        pushToTalkReleasedWhileStarting = false
+        captureState = .starting(kind: activeKind)
+        stopRequestedDuringStart = nil
+
+        if activeKind == .meeting {
+            meetingDraftCaptureID = sessionID
+            await persistMeetingDraft()
+        }
 
         do {
             _ = try await library.beginRecoveryCapture(kind: activeKind, id: sessionID)
             let directory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
             activeRecoveryID = sessionID
             activeRecoveryDirectory = directory
+            await refreshRecoverableCaptures()
             let url = directory.appendingPathComponent("microphone.caf")
             activeAudioURL = url
             try await recorder.start(at: url)
@@ -361,6 +444,8 @@ final class AppStore: ObservableObject {
             isSystemAudioActive = false
         }
         removeActiveRecoveryFiles()
+        if activeKind == .meeting { await clearMeetingDraft() }
+        await refreshRecoverableCaptures()
 
         // A permission request may still be suspended inside recorder.start(). Keep the
         // lifecycle closed until that continuation observes cancellation and cleans up.
@@ -397,17 +482,11 @@ final class AppStore: ObservableObject {
         )
         if activeKind == .meeting { record.segments = segments }
 
-        if keepAudio, let recoveryID = activeRecoveryID {
-            let tracks = try await library.retainRecoveryCapture(id: recoveryID, for: record.id)
-            record.audioTracks = tracks
-            record.audioRelativePath = tracks.first(where: { $0.role == .microphone })?.relativePath
-        }
-
-        do {
-            try await library.upsert(record)
-        } catch {
-            throw error
-        }
+        record = try await library.commitRecoveredRecord(
+            record,
+            recoveryID: activeRecoveryID,
+            keepAudio: keepAudio
+        )
 
         guard captureLifecycle == .finishing(sessionID) else {
             try? await library.delete(id: record.id)
@@ -415,13 +494,15 @@ final class AppStore: ObservableObject {
         }
         records.insert(record, at: 0)
         selectedRecordID = record.id
-        if !keepAudio { removeActiveRecoveryFiles() }
+        await refreshRecoverableCaptures()
 
         if recordKind == .dictation {
             captureState = .delivering
+            pendingDelivery = PendingTextDelivery(text: polished, target: activeApplication)
             if let target = activeApplication {
                 do {
                     try await TextDelivery.paste(polished, to: target)
+                    pendingDelivery = nil
                 } catch {
                     statusMessage = error.localizedDescription
                 }
@@ -430,19 +511,35 @@ final class AppStore: ObservableObject {
             }
         }
 
-        meetingTitle = ""
-        meetingNotes = ""
+        if recordKind == .meeting { await clearMeetingDraft() }
         resetSession(state: .idle)
 
         if recordKind == .meeting,
            let destination = URL(string: settings.webhookURL),
            !settings.webhookURL.isEmpty {
-            do {
-                try await MeetingWebhook().send(record: record, destination: destination, secret: settings.webhookSecret)
-            } catch {
-                statusMessage = "The meeting was saved, but its webhook could not be delivered: \(error.localizedDescription)"
-            }
+            await enqueueAndDeliverWebhook(record: record, destination: destination)
         }
+    }
+
+    func retryPendingTextDelivery() async {
+        guard let pendingDelivery, let target = pendingDelivery.target else {
+            statusMessage = "The original destination is unavailable. Copy the text and paste it manually."
+            return
+        }
+        do {
+            try await TextDelivery.paste(pendingDelivery.text, to: target)
+            self.pendingDelivery = nil
+            statusMessage = nil
+        } catch { statusMessage = error.localizedDescription }
+    }
+
+    func copyPendingTextDelivery() {
+        guard let pendingDelivery else { return }
+        do {
+            try TextDelivery.copyToClipboard(pendingDelivery.text)
+            self.pendingDelivery = nil
+            statusMessage = "Dictation copied. Paste it wherever you choose."
+        } catch { statusMessage = error.localizedDescription }
     }
 
     private func cleanUpCancelledStart(sessionID: UUID) async {
@@ -451,6 +548,8 @@ final class AppStore: ObservableObject {
         }
         try? await systemAudioRecorder.stop()
         removeActiveRecoveryFiles()
+        if activeKind == .meeting { await clearMeetingDraft() }
+        await refreshRecoverableCaptures()
         if captureLifecycle == .cancelling(sessionID) || captureLifecycle == .starting(sessionID) {
             resetSession(state: .idle)
         }
@@ -465,6 +564,7 @@ final class AppStore: ObservableObject {
 
         let recoveryPath = activeAudioURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil }
         if !preserveRecoveryAudio { removeActiveRecoveryFiles() }
+        await refreshRecoverableCaptures()
         let detail: String
         if preserveRecoveryAudio, let recoveryPath {
             detail = "\(error.localizedDescription) The original audio was kept for recovery at \(recoveryPath)."
@@ -499,6 +599,126 @@ final class AppStore: ObservableObject {
         stopRequestedDuringStart = nil
     }
 
+    var hasMeetingDraft: Bool {
+        !meetingTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+        !meetingNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func recover(_ capture: CaptureRecoveryManifest) async {
+        guard captureLifecycle == .idle else { return }
+        guard let microphoneTrack = capture.tracks.first(where: { $0.role == .microphone }) else {
+            statusMessage = "This recovery does not contain a microphone recording. You can discard it if the source audio is no longer available."
+            return
+        }
+
+        let sessionID = capture.id
+        do {
+            activeKind = capture.kind
+            captureKind = capture.kind
+            activeRecoveryID = sessionID
+            activeRecoveryDirectory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
+            captureStartedAt = capture.startedAt
+            captureLifecycle = .finishing(sessionID)
+            captureState = .transcribing
+            try? await library.updateRecoveryCapture(id: sessionID, status: .processing)
+
+            let microphoneURL = try await library.safeURL(forRelativePath: microphoneTrack.relativePath)
+            activeAudioURL = microphoneURL
+            if let systemTrack = capture.tracks.first(where: { $0.role == .system }) {
+                activeSystemAudioURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)
+            }
+
+            let engine = try transcriber ?? TranscriberFactory.make(settings.model)
+            transcriber = engine
+            let microphoneText = try await engine.transcribe(fileURL: microphoneURL, languageCode: settings.languageCode)
+            guard captureLifecycle == .finishing(sessionID) else { return }
+
+            let duration = max(0, Date.now.timeIntervalSince(capture.startedAt))
+            var raw = microphoneText
+            var segments = [TranscriptSegment(
+                start: 0,
+                end: duration,
+                speaker: capture.kind == .meeting ? "You" : nil,
+                text: microphoneText
+            )]
+            if capture.kind == .meeting,
+               let systemURL = activeSystemAudioURL,
+               FileManager.default.fileExists(atPath: systemURL.path),
+               let systemText = try? await engine.transcribe(fileURL: systemURL, languageCode: settings.languageCode) {
+                guard captureLifecycle == .finishing(sessionID) else { return }
+                raw = "You: \(microphoneText)\n\nOthers: \(systemText)"
+                segments.append(TranscriptSegment(start: 0, end: duration, speaker: "Others", text: systemText))
+            }
+
+            let polished = cleanup.clean(
+                raw,
+                terms: settings.dictionary,
+                tone: settings.defaultTone,
+                appendPeriod: true,
+                useParagraphs: true
+            )
+            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments)
+        } catch {
+            guard captureLifecycle == .finishing(sessionID) else { return }
+            try? await library.updateRecoveryCapture(id: sessionID, status: .failed, failureReason: error.localizedDescription)
+            await failSession(sessionID: sessionID, error: error, preserveRecoveryAudio: true)
+        }
+    }
+
+    func discardRecovery(_ capture: CaptureRecoveryManifest) async {
+        guard captureLifecycle == .idle else { return }
+        do {
+            try await library.discardRecoveryCapture(id: capture.id)
+            if meetingDraftCaptureID == capture.id { await clearMeetingDraft() }
+            await refreshRecoverableCaptures()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func discardMeetingDraft() async {
+        await clearMeetingDraft()
+    }
+
+    private func autosaveMeetingDraft(title: String, notes: String) async {
+        guard didBootstrap, !suppressDraftAutosave else { return }
+        do {
+            let hasContent = !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                !notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let draft = hasContent || meetingDraftCaptureID != nil
+                ? MeetingDraft(captureID: meetingDraftCaptureID, title: title, notes: notes)
+                : nil
+            try await library.saveMeetingDraft(draft)
+        } catch {
+            statusMessage = "Meeting notes could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func persistMeetingDraft() async {
+        await autosaveMeetingDraft(title: meetingTitle, notes: meetingNotes)
+    }
+
+    private func clearMeetingDraft() async {
+        suppressDraftAutosave = true
+        meetingDraftCaptureID = nil
+        meetingTitle = ""
+        meetingNotes = ""
+        suppressDraftAutosave = false
+        do {
+            try await library.saveMeetingDraft(nil)
+        } catch {
+            statusMessage = "The meeting draft was cleared in Evee but could not be removed from disk: \(error.localizedDescription)"
+        }
+    }
+
+    private func refreshRecoverableCaptures() async {
+        do {
+            recoverableCaptures = try await library.recoverableCaptures()
+        } catch {
+            statusMessage = "Recovery recordings could not be loaded: \(error.localizedDescription)"
+        }
+    }
+
     func update(_ record: WorkspaceRecord) async {
         do {
             var changed = record
@@ -514,6 +734,93 @@ final class AppStore: ObservableObject {
             records.removeAll { $0.id == record.id }
             if selectedRecordID == record.id { selectedRecordID = nil }
         } catch { statusMessage = error.localizedDescription }
+    }
+
+    private func loadAndMigrateSecrets() async throws {
+        let legacySecret = settings.webhookSecret
+        if let stored = try secretStore.string(for: KeychainSecretStore.webhookSigningSecretAccount) {
+            webhookSecret = stored
+        } else if !legacySecret.isEmpty {
+            try secretStore.set(legacySecret, for: KeychainSecretStore.webhookSigningSecretAccount)
+            webhookSecret = legacySecret
+        }
+        if !legacySecret.isEmpty {
+            settings.webhookSecret = ""
+            try await library.save(settings)
+        }
+    }
+
+    private func enqueueAndDeliverWebhook(record: WorkspaceRecord, destination: URL) async {
+        var queued = record
+        let delivery = WebhookDelivery(destination: destination.absoluteString)
+        queued.webhookDeliveries.append(delivery)
+        do {
+            try await library.upsert(queued)
+            replaceRecord(queued)
+            await deliverWebhook(recordID: queued.id, deliveryID: delivery.id)
+        } catch {
+            statusMessage = "The meeting was saved, but its webhook could not be queued: \(error.localizedDescription)"
+        }
+    }
+
+    private func deliverWebhook(recordID: UUID, deliveryID: UUID) async {
+        do {
+            guard var record = try await library.record(id: recordID),
+                  let index = record.webhookDeliveries.firstIndex(where: { $0.id == deliveryID }),
+                  let destination = URL(string: record.webhookDeliveries[index].destination) else { return }
+            let receipt = try await MeetingWebhook().sendWithStatus(
+                record: record,
+                destination: destination,
+                secret: webhookSecret,
+                deliveryID: deliveryID
+            )
+            record.webhookDeliveries[index].state = .delivered
+            record.webhookDeliveries[index].attemptCount = receipt.attemptCount
+            record.webhookDeliveries[index].lastAttemptAt = receipt.deliveredAt
+            record.webhookDeliveries[index].deliveredAt = receipt.deliveredAt
+            record.webhookDeliveries[index].responseStatusCode = receipt.statusCode
+            record.webhookDeliveries[index].lastError = nil
+            record.updatedAt = .now
+            try await library.upsert(record)
+            replaceRecord(record)
+        } catch let failure as WebhookDeliveryFailure {
+            await persistWebhookFailure(recordID: recordID, delivery: failure.delivery)
+            statusMessage = "The meeting was saved. Its webhook remains in the delivery outbox: \(failure.localizedDescription)"
+        } catch {
+            var failure = WebhookDelivery(id: deliveryID, destination: "", state: .failed, attemptCount: 1, lastAttemptAt: .now, lastError: error.localizedDescription)
+            if let record = try? await library.record(id: recordID),
+               let existing = record.webhookDeliveries.first(where: { $0.id == deliveryID }) {
+                failure.destination = existing.destination
+            }
+            await persistWebhookFailure(recordID: recordID, delivery: failure)
+            statusMessage = "The meeting was saved. Its webhook remains in the delivery outbox: \(error.localizedDescription)"
+        }
+    }
+
+    private func persistWebhookFailure(recordID: UUID, delivery: WebhookDelivery) async {
+        do {
+            guard var record = try await library.record(id: recordID),
+                  let index = record.webhookDeliveries.firstIndex(where: { $0.id == delivery.id }) else { return }
+            record.webhookDeliveries[index] = delivery
+            record.updatedAt = .now
+            try await library.upsert(record)
+            replaceRecord(record)
+        } catch {
+            statusMessage = "Webhook delivery failed and its outbox state could not be saved: \(error.localizedDescription)"
+        }
+    }
+
+    private func retryPendingWebhookDeliveries() async {
+        let queued = records.flatMap { record in
+            record.webhookDeliveries.filter { $0.state == .pending }.map { (record.id, $0.id) }
+        }
+        for (recordID, deliveryID) in queued {
+            await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
+        }
+    }
+
+    private func replaceRecord(_ record: WorkspaceRecord) {
+        if let index = records.firstIndex(where: { $0.id == record.id }) { records[index] = record }
     }
 
     private func styleForActiveApplication() -> AppWritingStyle? {

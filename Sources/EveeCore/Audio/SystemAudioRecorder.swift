@@ -9,6 +9,8 @@ public enum SystemAudioRecorderError: LocalizedError, Sendable {
     case cannotEncode
     case captureStopped(String)
     case appendFailed(String)
+    case droppedSamples(Int)
+    case invalidOutput
 
     public var errorDescription: String? {
         switch self {
@@ -17,6 +19,8 @@ public enum SystemAudioRecorderError: LocalizedError, Sendable {
         case .cannotEncode: return "System audio could not be encoded."
         case .captureStopped(let message): return "System-audio capture stopped unexpectedly: \(message)"
         case .appendFailed(let message): return "System audio could not be written: \(message)"
+        case .droppedSamples(let count): return "System audio could not keep up and dropped \(count) audio sample buffer\(count == 1 ? "" : "s")."
+        case .invalidOutput: return "System audio finished, but the resulting recording was not playable."
         }
     }
 }
@@ -24,11 +28,24 @@ public enum SystemAudioRecorderError: LocalizedError, Sendable {
 public struct SystemAudioCaptureSummary: Equatable, Sendable {
     public var outputURL: URL
     public var sampleCount: Int
+    public var droppedSampleCount: Int
+    public var byteCount: Int64
+    public var duration: TimeInterval
     public var wroteAudio: Bool
 
-    public init(outputURL: URL, sampleCount: Int, wroteAudio: Bool) {
+    public init(
+        outputURL: URL,
+        sampleCount: Int,
+        droppedSampleCount: Int = 0,
+        byteCount: Int64 = 0,
+        duration: TimeInterval = 0,
+        wroteAudio: Bool
+    ) {
         self.outputURL = outputURL
         self.sampleCount = sampleCount
+        self.droppedSampleCount = droppedSampleCount
+        self.byteCount = byteCount
+        self.duration = duration
         self.wroteAudio = wroteAudio
     }
 }
@@ -50,6 +67,7 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
     private var outputURL: URL?
     private var startedSession = false
     private var sampleCount = 0
+    private var droppedSampleCount = 0
     private var terminalError: Error?
     private var state: State = .idle
 
@@ -61,6 +79,7 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
             state = .starting
             terminalError = nil
             sampleCount = 0
+            droppedSampleCount = 0
             return true
         }
         guard canStart else { throw SystemAudioRecorderError.alreadyRecording }
@@ -133,7 +152,7 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
         var stopError: Error?
         do { try await active.stopCapture() } catch { stopError = error }
 
-        let values = lock.withLock { () -> (AVAssetWriter?, AVAssetWriterInput?, URL?, Int, Error?) in
+        let values = lock.withLock { () -> (AVAssetWriter?, AVAssetWriterInput?, URL?, Int, Int, Error?) in
             defer {
                 stream = nil
                 writer = nil
@@ -141,30 +160,63 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
                 outputURL = nil
                 startedSession = false
                 sampleCount = 0
+                droppedSampleCount = 0
                 terminalError = nil
                 state = .idle
             }
-            return (writer, input, outputURL, sampleCount, terminalError)
+            return (writer, input, outputURL, sampleCount, droppedSampleCount, terminalError)
         }
 
-        if let error = values.4 { throw error }
-        if let error = stopError { throw error }
         guard let writer = values.0, let url = values.2 else { return nil }
 
         guard values.3 > 0, writer.status == .writing else {
+            let writerError = writer.error
             writer.cancelWriting()
             try? FileManager.default.removeItem(at: url)
-            return SystemAudioCaptureSummary(outputURL: url, sampleCount: 0, wroteAudio: false)
+            if let error = values.5 { throw error }
+            if let error = stopError { throw error }
+            if let writerError { throw writerError }
+            return SystemAudioCaptureSummary(
+                outputURL: url,
+                sampleCount: 0,
+                droppedSampleCount: values.4,
+                wroteAudio: false
+            )
         }
 
         values.1?.markAsFinished()
         await writer.finishWriting()
-        if let error = writer.error { throw error }
-        return SystemAudioCaptureSummary(outputURL: url, sampleCount: values.3, wroteAudio: true)
+        if let error = writer.error {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+
+        let validation: (byteCount: Int64, duration: TimeInterval)
+        do {
+            validation = try await validateOutput(at: url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
+
+        // A capture/stream failure may still leave a useful, valid prefix. Keep that file
+        // available to the caller, but report the degradation rather than claiming success.
+        if let error = values.5 { throw error }
+        if let error = stopError { throw error }
+        return SystemAudioCaptureSummary(
+            outputURL: url,
+            sampleCount: values.3,
+            droppedSampleCount: values.4,
+            byteCount: validation.byteCount,
+            duration: validation.duration,
+            wroteAudio: true
+        )
     }
 
     public func stop() async throws {
-        _ = try await stopWithSummary()
+        if let summary = try await stopWithSummary(), summary.droppedSampleCount > 0 {
+            throw SystemAudioRecorderError.droppedSamples(summary.droppedSampleCount)
+        }
     }
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -179,7 +231,10 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
                 writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
                 startedSession = true
             }
-            guard input.isReadyForMoreMediaData else { return }
+            guard input.isReadyForMoreMediaData else {
+                droppedSampleCount += 1
+                return
+            }
             if input.append(sampleBuffer) {
                 sampleCount += 1
             } else {
@@ -193,6 +248,21 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
             if case .stopping = state { return }
             terminalError = SystemAudioRecorderError.captureStopped(error.localizedDescription)
         }
+    }
+
+    private func validateOutput(at url: URL) async throws -> (byteCount: Int64, duration: TimeInterval) {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard byteCount > 0 else { throw SystemAudioRecorderError.invalidOutput }
+
+        let asset = AVURLAsset(url: url)
+        let playable = try await asset.load(.isPlayable)
+        let duration = try await asset.load(.duration)
+        let seconds = CMTimeGetSeconds(duration)
+        guard playable, seconds.isFinite, seconds > 0 else {
+            throw SystemAudioRecorderError.invalidOutput
+        }
+        return (byteCount, seconds)
     }
 }
 

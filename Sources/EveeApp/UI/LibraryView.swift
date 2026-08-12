@@ -18,6 +18,12 @@ struct LibraryView: View {
         return kind.map { value in records.filter { $0.kind == value } } ?? records
     }
 
+    private var recoveryRows: [CaptureRecoveryManifest] {
+        kind.map { selectedKind in
+            store.recoverableCaptures.filter { $0.kind == selectedKind }
+        } ?? store.recoverableCaptures
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if showsHeader {
@@ -45,6 +51,48 @@ struct LibraryView: View {
                     }
                 }
                 .padding(20)
+            }
+
+            if !recoveryRows.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Recover interrupted captures", systemImage: "arrow.counterclockwise.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(AnimaTheme.indigo)
+                    Text("Evee found local audio that was not yet saved to your workspace.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    ForEach(recoveryRows) { capture in
+                        HStack(spacing: 10) {
+                            Image(systemName: capture.kind == .meeting ? "person.2.wave.2" : capture.kind == .memo ? "waveform" : "text.cursor")
+                                .frame(width: 24)
+                                .foregroundStyle(AnimaTheme.violet)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Interrupted \(capture.kind.rawValue)")
+                                    .font(.system(size: 12, weight: .semibold))
+                                Text("\(capture.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(capture.tracks.count) audio \(capture.tracks.count == 1 ? "track" : "tracks")")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Discard", role: .destructive) {
+                                Task { await store.discardRecovery(capture) }
+                            }
+                            .controlSize(.small)
+                            .disabled(store.captureState != .idle)
+                            Button("Transcribe") {
+                                Task { await store.recover(capture) }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(store.captureState != .idle || !capture.tracks.contains(where: { $0.role == .microphone }))
+                        }
+                        .accessibilityElement(children: .contain)
+                    }
+                }
+                .animaCard()
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
             }
 
             HStack {

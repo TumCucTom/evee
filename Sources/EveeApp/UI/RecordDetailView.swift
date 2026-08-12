@@ -4,8 +4,11 @@ import SwiftUI
 
 struct RecordDetailView: View {
     @EnvironmentObject private var store: AppStore
+    @StateObject private var audioPlayer = RetainedAudioPlayer()
     @State private var draft: WorkspaceRecord
     @State private var confirmDelete = false
+    @State private var selectedAudioPath = ""
+    @State private var audioStatusMessage: String?
 
     init(record: WorkspaceRecord) { _draft = State(initialValue: record) }
 
@@ -34,6 +37,10 @@ struct RecordDetailView: View {
                 }
 
                 metadata
+
+                if !retainedAudioTracks.isEmpty {
+                    retainedAudioSection
+                }
 
                 if draft.kind == .meeting {
                     section("Notes", subtitle: "Your notes stay distinct from the transcript") {
@@ -88,6 +95,8 @@ struct RecordDetailView: View {
         }
         .background(AnimaTheme.paper)
         .id(draft.id)
+        .onAppear(perform: selectInitialAudioTrack)
+        .onDisappear { audioPlayer.stop() }
         .confirmationDialog("Delete this \(draft.kind.rawValue)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete permanently", role: .destructive) { Task { await store.delete(draft) } }
         } message: { Text("The local record and retained audio will be removed. This cannot be undone in Evee.") }
@@ -102,13 +111,86 @@ struct RecordDetailView: View {
             if let app = draft.sourceApplication, !app.isEmpty {
                 Label(app, systemImage: "app")
             }
-            if draft.audioRelativePath != nil {
+            if !retainedAudioTracks.isEmpty {
                 Label("Audio retained", systemImage: "internaldrive")
             }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
         .accessibilityElement(children: .combine)
+    }
+
+    private var retainedAudioTracks: [WorkspaceAudioTrack] {
+        if !draft.audioTracks.isEmpty { return draft.audioTracks }
+        guard let legacyPath = draft.audioRelativePath else { return [] }
+        return [WorkspaceAudioTrack(role: .microphone, relativePath: legacyPath, duration: draft.duration)]
+    }
+
+    private var selectedAudioTrack: WorkspaceAudioTrack? {
+        retainedAudioTracks.first { $0.relativePath == selectedAudioPath }
+    }
+
+    private var retainedAudioSection: some View {
+        section("Retained audio", subtitle: "Play or export the local recording without uploading it") {
+            VStack(alignment: .leading, spacing: 12) {
+                if retainedAudioTracks.count > 1 {
+                    Picker("Audio track", selection: $selectedAudioPath) {
+                        ForEach(retainedAudioTracks) { track in
+                            Text(audioTrackTitle(track.role)).tag(track.relativePath)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityLabel("Retained audio track")
+                    .onChange(of: selectedAudioPath) { _, _ in loadSelectedAudioTrack() }
+                } else if let track = retainedAudioTracks.first {
+                    Label(audioTrackTitle(track.role), systemImage: track.role == .system ? "speaker.wave.2" : "mic")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 12) {
+                    Button(action: audioPlayer.togglePlayback) {
+                        Label(audioPlayer.isPlaying ? "Pause" : "Play", systemImage: audioPlayer.isPlaying ? "pause.fill" : "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(audioPlayer.loadedURL == nil)
+                    .accessibilityHint(audioPlayer.isPlaying ? "Pauses retained audio" : "Plays retained audio")
+
+                    Text(timestamp(audioPlayer.currentTime))
+                        .font(.caption.monospacedDigit())
+                        .frame(minWidth: 42, alignment: .trailing)
+
+                    Slider(
+                        value: Binding(
+                            get: { audioPlayer.currentTime },
+                            set: { audioPlayer.seek(to: $0) }
+                        ),
+                        in: 0...max(audioPlayer.duration, 0.01)
+                    )
+                    .disabled(audioPlayer.loadedURL == nil)
+                    .accessibilityLabel("Playback position")
+                    .accessibilityValue("\(timestamp(audioPlayer.currentTime)) of \(timestamp(audioPlayer.duration))")
+
+                    Text(timestamp(audioPlayer.duration))
+                        .font(.caption.monospacedDigit())
+                        .frame(minWidth: 42, alignment: .leading)
+
+                    Button(action: exportSelectedAudioTrack) {
+                        Label("Export", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(selectedAudioTrack == nil)
+                    .help("Export the selected retained audio track")
+                }
+
+                if let message = audioPlayer.errorMessage ?? audioStatusMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(audioPlayer.errorMessage == nil ? AnimaTheme.ink.opacity(0.62) : Color.red)
+                        .accessibilityLabel("Audio status: \(message)")
+                }
+            }
+        }
     }
 
     private var kindIcon: String {
@@ -122,6 +204,77 @@ struct RecordDetailView: View {
     private func timestamp(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func selectInitialAudioTrack() {
+        guard let first = retainedAudioTracks.first else { return }
+        if !retainedAudioTracks.contains(where: { $0.relativePath == selectedAudioPath }) {
+            selectedAudioPath = first.relativePath
+        }
+        loadSelectedAudioTrack()
+    }
+
+    private func loadSelectedAudioTrack() {
+        let path = selectedAudioPath
+        guard !path.isEmpty else { return }
+        audioPlayer.stop()
+        audioStatusMessage = "Loading audio…"
+        Task { @MainActor in
+            do {
+                let url = try await LibraryStore.shared.safeURL(forRelativePath: path)
+                guard selectedAudioPath == path else { return }
+                try audioPlayer.load(url)
+                audioStatusMessage = nil
+            } catch {
+                guard selectedAudioPath == path else { return }
+                audioStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func exportSelectedAudioTrack() {
+        guard let track = selectedAudioTrack else { return }
+        let recordTitle = draft.title
+        Task { @MainActor in
+            do {
+                let source = try await LibraryStore.shared.safeURL(forRelativePath: track.relativePath)
+                let panel = NSSavePanel()
+                panel.canCreateDirectories = true
+                panel.nameFieldStringValue = exportFileName(title: recordTitle, role: track.role, fileExtension: source.pathExtension)
+                panel.title = "Export retained audio"
+                panel.prompt = "Export"
+                guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+                try await Task.detached(priority: .utility) {
+                    let manager = FileManager.default
+                    if manager.fileExists(atPath: destination.path) {
+                        try manager.removeItem(at: destination)
+                    }
+                    try manager.copyItem(at: source, to: destination)
+                }.value
+                audioStatusMessage = "Exported \(audioTrackTitle(track.role).lowercased()) audio."
+            } catch {
+                audioStatusMessage = "Export failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func audioTrackTitle(_ role: AudioTrackRole) -> String {
+        switch role {
+        case .microphone: "Microphone"
+        case .system: "Other participants"
+        case .mixed: "Mixed"
+        }
+    }
+
+    private func exportFileName(title: String, role: AudioTrackRole, fileExtension pathExtension: String) -> String {
+        let safeTitle = title
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = safeTitle.isEmpty ? "Evee audio" : String(safeTitle.prefix(64))
+        let suffix = pathExtension.isEmpty ? "audio" : pathExtension
+        return "\(base) - \(audioTrackTitle(role)).\(suffix)"
     }
 
     private func section<Content: View>(_ title: String, subtitle: String? = nil, @ViewBuilder content: () -> Content) -> some View {
