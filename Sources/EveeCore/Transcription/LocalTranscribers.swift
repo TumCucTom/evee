@@ -130,11 +130,18 @@ public final class QwenTranscriber: LocalTranscriber, @unchecked Sendable {
     public func transcribe(fileURL: URL, languageCode: String?) async throws -> String {
         try await load()
         guard let manager = lock.withLock({ manager }) else { throw TranscriptionError.modelUnavailable }
-        let samples = try AudioSamples.mono16k(from: fileURL)
-        let text = try await manager.transcribe(audioSamples: samples, language: normalizedLanguage(languageCode))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { throw TranscriptionError.emptyResult }
-        return text
+        let reader = try AudioSampleChunkReader(url: fileURL)
+        let language = normalizedLanguage(languageCode)
+        var transcripts: [String] = []
+        while let samples = try reader.next() {
+            try Task.checkCancellation()
+            let text = try await manager.transcribe(audioSamples: samples, language: language)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { transcripts.append(text) }
+        }
+        let combined = transcripts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !combined.isEmpty else { throw TranscriptionError.emptyResult }
+        return combined
     }
 
     public func unload() { lock.withLock { manager = nil } }
@@ -145,27 +152,80 @@ private func normalizedLanguage(_ value: String?) -> String? {
     return value.lowercased()
 }
 
-private enum AudioSamples {
-    static func mono16k(from url: URL) throws -> [Float] {
-        let file = try AVAudioFile(forReading: url)
-        guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
-              let converter = AVAudioConverter(from: file.processingFormat, to: target)
-        else { throw AudioCaptureError.invalidFormat }
+/// Incrementally converts source audio to bounded mono 16 kHz chunks. Qwen's public
+/// transcription API accepts an in-memory sample array, so bounding each call prevents a
+/// long meeting from allocating the entire recording (and a second full-size copy) at once.
+final class AudioSampleChunkReader {
+    static let defaultChunkDuration: TimeInterval = 25
 
-        let ratio = 16_000 / file.processingFormat.sampleRate
-        let capacity = AVAudioFrameCount(max(16_000, Double(file.length) * ratio + 1))
-        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { throw AudioCaptureError.invalidFormat }
-        var read = false
+    private let file: AVAudioFile
+    private let sourceFormat: AVAudioFormat
+    private let targetFormat: AVAudioFormat
+    private let sourceFramesPerChunk: AVAudioFrameCount
+
+    init(url: URL, chunkDuration: TimeInterval = defaultChunkDuration) throws {
+        guard chunkDuration.isFinite, chunkDuration > 0,
+              let target = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 16_000,
+                channels: 1,
+                interleaved: false
+              ) else {
+            throw AudioCaptureError.invalidFormat
+        }
+        let file = try AVAudioFile(forReading: url)
+        let source = file.processingFormat
+        guard source.sampleRate > 0, source.channelCount > 0 else {
+            throw AudioCaptureError.invalidFormat
+        }
+        let requestedFrames = ceil(source.sampleRate * chunkDuration)
+        guard requestedFrames > 0, requestedFrames <= Double(UInt32.max) else {
+            throw AudioCaptureError.invalidFormat
+        }
+        self.file = file
+        self.sourceFormat = source
+        self.targetFormat = target
+        self.sourceFramesPerChunk = AVAudioFrameCount(requestedFrames)
+    }
+
+    func next() throws -> [Float]? {
+        guard file.framePosition < file.length else { return nil }
+        let remaining = file.length - file.framePosition
+        let inputCapacity = AVAudioFrameCount(min(Int64(sourceFramesPerChunk), remaining))
+        guard inputCapacity > 0,
+              let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: inputCapacity) else {
+            throw AudioCaptureError.invalidFormat
+        }
+        try file.read(into: input, frameCount: inputCapacity)
+        guard input.frameLength > 0 else { return nil }
+
+        let outputFrames = ceil(Double(input.frameLength) * targetFormat.sampleRate / sourceFormat.sampleRate) + 32
+        guard outputFrames > 0, outputFrames <= Double(UInt32.max),
+              let output = AVAudioPCMBuffer(
+                pcmFormat: targetFormat,
+                frameCapacity: AVAudioFrameCount(outputFrames)
+              ),
+              let converter = AVAudioConverter(from: sourceFormat, to: targetFormat) else {
+            throw AudioCaptureError.invalidFormat
+        }
+
+        var suppliedInput = false
         var conversionError: NSError?
-        converter.convert(to: output, error: &conversionError) { _, status in
-            if read { status.pointee = .endOfStream; return nil }
-            read = true
-            let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
-            do { try file.read(into: input); status.pointee = .haveData; return input }
-            catch { status.pointee = .noDataNow; return nil }
+        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
+            if suppliedInput {
+                inputStatus.pointee = .endOfStream
+                return nil
+            }
+            suppliedInput = true
+            inputStatus.pointee = .haveData
+            return input
         }
         if let conversionError { throw conversionError }
-        guard let channel = output.floatChannelData?[0] else { throw AudioCaptureError.invalidFormat }
+        guard status != .error,
+              output.frameLength > 0,
+              let channel = output.floatChannelData?[0] else {
+            throw AudioCaptureError.invalidFormat
+        }
         return Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
     }
 }

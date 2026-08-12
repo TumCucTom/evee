@@ -17,7 +17,8 @@ let package = Package(
     targets: [
         .target(
             name: "EveeCore",
-            dependencies: [.product(name: "FluidAudio", package: "FluidAudio")]
+            dependencies: [.product(name: "FluidAudio", package: "FluidAudio")],
+            linkerSettings: [.linkedLibrary("sqlite3")]
         ),
         .executableTarget(
             name: "EveeApp",

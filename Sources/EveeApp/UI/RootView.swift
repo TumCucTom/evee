@@ -5,7 +5,7 @@ struct RootView: View {
     @EnvironmentObject private var store: AppStore
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             AnimaTheme.paper.ignoresSafeArea()
 
             if !store.modelReady {
@@ -21,21 +21,33 @@ struct RootView: View {
                 .navigationSplitViewStyle(.balanced)
             }
 
-            if store.captureState != .idle { RecordingPill(state: store.captureState) }
         }
         .tint(AnimaTheme.indigo)
-        .alert("Evee", isPresented: Binding(
+        .alert(alertTitle, isPresented: Binding(
             get: { store.statusMessage != nil },
-            set: { if !$0 { store.statusMessage = nil; if case .failed = store.captureState { store.captureState = .idle } } }
+            set: {
+                if !$0 {
+                    store.statusMessage = nil
+                    store.dismissCaptureFailure()
+                }
+            }
         )) {
-            Button("OK", role: .cancel) {}
+            if store.pendingDelivery != nil {
+                Button("Retry Paste") { Task { await store.retryPendingTextDelivery() } }
+                Button("Copy Text") { store.copyPendingTextDelivery() }
+            }
+            Button("Open Settings") {
+                store.route = .settings
+                clearFailedCaptureIfNeeded()
+            }
+            Button("Dismiss", role: .cancel) { clearFailedCaptureIfNeeded() }
         } message: { Text(store.statusMessage ?? "") }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                AlphaMark(size: 28)
+                EveeMark(size: 28)
                 VStack(alignment: .leading, spacing: 0) {
                     Text("Evee").font(.system(size: 17, weight: .bold))
                     Text("by Anima").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
@@ -56,17 +68,14 @@ struct RootView: View {
             .listStyle(.sidebar)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("HOLD TO DICTATE").font(.system(size: 9, weight: .bold)).tracking(1.1).foregroundStyle(.secondary)
-                HStack(spacing: 6) {
-                    key("⌥")
-                    key("⌘")
-                    key("Space", wide: true)
-                }
-                Text("Works in every app").font(.caption).foregroundStyle(.secondary)
+                Text("GLOBAL SHORTCUTS").font(.system(size: 9, weight: .bold)).tracking(1.1).foregroundStyle(.secondary)
+                Label("Dictate or transform a selection", systemImage: "keyboard")
+                    .font(.caption.weight(.medium))
+                Text("Configure both in Settings").font(.caption).foregroundStyle(.secondary)
             }
             .padding(16)
         }
-        .background(AnimaTheme.cloud.opacity(0.42))
+        .background(AnimaTheme.cloud.opacity(0.48))
     }
 
     @ViewBuilder private var routeContent: some View {
@@ -80,16 +89,22 @@ struct RootView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let record = store.selectedRecord { RecordDetailView(record: record) }
+        if let record = store.selectedRecord {
+            RecordDetailView(record: record)
+                .id(record.id)
+        }
         else {
             ContentUnavailableView("Choose a recording", systemImage: "waveform.badge.magnifyingglass", description: Text("Dictations, meetings and memos stay searchable on this Mac."))
         }
     }
 
-    private func key(_ value: String, wide: Bool = false) -> some View {
-        Text(value).font(.system(size: 11, weight: .semibold, design: .rounded))
-            .frame(minWidth: wide ? 46 : 24, minHeight: 24)
-            .background(.white.opacity(0.8)).clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(AnimaTheme.border))
+    private var alertTitle: String {
+        if case .failed = store.captureState { return "Capture stopped" }
+        return "Evee needs attention"
+    }
+
+    private func clearFailedCaptureIfNeeded() {
+        guard case .failed = store.captureState else { return }
+        store.dismissCaptureFailure()
     }
 }
