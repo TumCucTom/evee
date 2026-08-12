@@ -106,6 +106,28 @@ final class EveeCoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: input)
     }
 
+    func testRecoveryTrackPreservesCaptureClock() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
+        try Data("audio".utf8).write(to: input)
+        let store = LibraryStore(rootURL: root)
+        let capture = try await store.beginRecoveryCapture(kind: .meeting)
+        let trackStart = capture.startedAt.addingTimeInterval(0.75)
+
+        let updated = try await store.addRecoveryTrack(
+            captureID: capture.id,
+            kind: .meeting,
+            role: .microphone,
+            sourceURL: input,
+            startedAt: trackStart
+        )
+
+        let storedStart = try XCTUnwrap(updated.tracks.first?.createdAt)
+        XCTAssertEqual(storedStart.timeIntervalSince(capture.startedAt), 0.75, accuracy: 0.001)
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: input)
+    }
+
     func testUnsafeAudioPathIsRejected() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = LibraryStore(rootURL: root)

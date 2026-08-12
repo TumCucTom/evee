@@ -497,7 +497,8 @@ final class AppStore: ObservableObject {
                 captureID: recoveryID,
                 kind: activeKind,
                 role: .microphone,
-                sourceURL: stoppedMicrophoneURL
+                sourceURL: stoppedMicrophoneURL,
+                startedAt: microphoneTrackStartedAt
             )
             guard let microphoneTrack = recovery.tracks.first(where: { $0.role == .microphone }) else {
                 throw NSError(domain: "Evee.Recovery", code: 2, userInfo: [NSLocalizedDescriptionKey: "The microphone recording could not be recovered."])
@@ -510,7 +511,8 @@ final class AppStore: ObservableObject {
                     captureID: recoveryID,
                     kind: activeKind,
                     role: .system,
-                    sourceURL: systemURL
+                    sourceURL: systemURL,
+                    startedAt: systemTrackStartedAt
                 )
                 if let systemTrack = recovery.tracks.first(where: { $0.role == .system }) {
                     activeSystemAudioURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)

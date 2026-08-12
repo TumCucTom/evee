@@ -268,7 +268,8 @@ public actor LibraryStore {
         role: AudioTrackRole,
         sourceURL: URL,
         moveSource: Bool = true,
-        duration: TimeInterval? = nil
+        duration: TimeInterval? = nil,
+        startedAt: Date? = nil
     ) throws -> CaptureRecoveryManifest {
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             throw LibraryStoreError.missingAudioSource(sourceURL)
@@ -290,7 +291,13 @@ public actor LibraryStore {
         let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
         let relativePath = relativePath(for: destination)
         manifest.tracks.removeAll { $0.role == role }
-        manifest.tracks.append(WorkspaceAudioTrack(role: role, relativePath: relativePath, duration: duration, byteCount: byteCount))
+        manifest.tracks.append(WorkspaceAudioTrack(
+            role: role,
+            relativePath: relativePath,
+            createdAt: startedAt ?? .now,
+            duration: duration,
+            byteCount: byteCount
+        ))
         manifest.status = .captured
         manifest.updatedAt = .now
         manifest.failureReason = nil
