@@ -466,16 +466,30 @@ public actor LibraryStore {
         guard !relativePath.isEmpty, !relativePath.hasPrefix("/") else {
             throw LibraryStoreError.unsafeRelativePath(relativePath)
         }
-        let candidate = rootURL
-            .appendingPathComponent(relativePath)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
         let resolvedRoot = rootURL.resolvingSymlinksInPath()
         let rootPath = resolvedRoot.path.hasSuffix("/") ? resolvedRoot.path : resolvedRoot.path + "/"
-        guard candidate.path.hasPrefix(rootPath) else {
+        let lexicalCandidate = rootURL.appendingPathComponent(relativePath).standardizedFileURL
+        let lexicalRootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        guard lexicalCandidate.path.hasPrefix(lexicalRootPath) else {
             throw LibraryStoreError.unsafeRelativePath(relativePath)
         }
-        return candidate
+
+        let suffix = lexicalCandidate.path.dropFirst(lexicalRootPath.count)
+        var resolvedCandidate = resolvedRoot
+        for component in suffix.split(separator: "/") {
+            let next = resolvedCandidate.appendingPathComponent(String(component))
+            let attributes = try? FileManager.default.attributesOfItem(atPath: next.path)
+            if attributes?[.type] as? FileAttributeType == .typeSymbolicLink {
+                resolvedCandidate = next.resolvingSymlinksInPath()
+            } else {
+                resolvedCandidate = next
+            }
+            let path = resolvedCandidate.standardizedFileURL.path
+            guard path == resolvedRoot.path || path.hasPrefix(rootPath) else {
+                throw LibraryStoreError.unsafeRelativePath(relativePath)
+            }
+        }
+        return resolvedCandidate.standardizedFileURL
     }
 
     private func readRecoveryManifest(directory: URL) throws -> CaptureRecoveryManifest {
