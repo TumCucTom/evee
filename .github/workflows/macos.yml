@@ -20,6 +20,8 @@ jobs:
         run: swift build
       - name: Test
         run: swift test --enable-code-coverage
+      - name: Smoke test MCP protocol and tools
+        run: bash scripts/smoke_mcp.sh
       - name: Package app
         run: scripts/package_app.sh release
       - name: Verify packaged app

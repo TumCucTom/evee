@@ -50,10 +50,17 @@ final class WorkspaceIntelligenceRuntime {
             let title = preferences.includeWindowTitles
                 ? frontmostWindowTitle(processIdentifier: processIdentifier)
                 : nil
+            let accessibilityContext = preferences.includeWebAddresses == true || preferences.includeFocusedText == true
+                ? TextDelivery.frontmostApplication(includeVisibleText: preferences.includeFocusedText == true)?.focusedTarget
+                : nil
+            let webAddress = preferences.includeWebAddresses == true ? accessibilityContext?.url : nil
             let observation = WorkspaceApplicationObservation(
                 bundleIdentifier: bundleIdentifier,
                 applicationName: name,
-                windowTitle: title
+                windowTitle: title,
+                webAddress: webAddress,
+                selectedText: preferences.includeFocusedText == true ? accessibilityContext?.selectedText : nil,
+                visibleText: preferences.includeFocusedText == true ? accessibilityContext?.visibleText : nil
             )
             try? await store.record(observation)
         }
@@ -84,6 +91,24 @@ struct WorkspaceIntelligencePrivacyView: View {
             Toggle("Include window titles", isOn: $preferences.includeWindowTitles)
                 .disabled(!preferences.isEnabled)
             Text("Window titles can contain document names or private details. Turning this off removes previously stored titles.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle("Include current web address", isOn: Binding(
+                get: { preferences.includeWebAddresses == true },
+                set: { preferences.includeWebAddresses = $0 }
+            ))
+            .disabled(!preferences.isEnabled)
+            Text("Web addresses require Accessibility permission. Query strings, fragments and credentials are removed before storage; turning this off removes the current stored address.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle("Include selected and visible accessibility text", isOn: Binding(
+                get: { preferences.includeFocusedText == true },
+                set: { preferences.includeFocusedText = $0 }
+            ))
+            .disabled(!preferences.isEnabled)
+            Text("Highly sensitive and off by default. When enabled, Evee stores bounded text exposed by the focused window for local context tools. Secure and protected fields are excluded. Turning this off removes the current stored text snapshot.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

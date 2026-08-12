@@ -26,6 +26,17 @@ private struct SearchHit: Codable {
     var snippet: String
 }
 
+private struct JournalReportEntry: Codable {
+    var activity: WorkspaceJournalEntry
+    var voiceRecordCount: Int
+    var dictationCount: Int
+    var meetingCount: Int
+    var memoCount: Int
+    var meetingDecisions: [MeetingInsight]
+    var meetingActionItems: [MeetingInsight]
+    var memoActionItems: [String]
+}
+
 private struct PublicConfiguration: Codable {
     var model: SpeechModel
     var languageCode: String
@@ -41,6 +52,8 @@ private struct PublicConfiguration: Codable {
     var appStyleCount: Int
     var activityTrackingEnabled: Bool
     var activityWindowTitlesEnabled: Bool
+    var activityWebAddressesEnabled: Bool
+    var activityFocusedTextEnabled: Bool
     var activityJournalEnabled: Bool
     var activityRetentionDays: Int
     var textDeliveryMode: TextDeliveryMode
@@ -140,7 +153,22 @@ enum EveeMCP {
 
         case "get_journal":
             let journal = try await WorkspaceIntelligenceStore.shared.journal(limit: limit)
-            return try encode(journal)
+            let records = try await store.loadRecords()
+            let calendar = Calendar.current
+            let enriched = journal.value.map { entry in
+                let matching = records.filter { calendar.isDate($0.createdAt, inSameDayAs: entry.day) }
+                return JournalReportEntry(
+                    activity: entry,
+                    voiceRecordCount: matching.count,
+                    dictationCount: matching.filter { $0.kind == .dictation }.count,
+                    meetingCount: matching.filter { $0.kind == .meeting }.count,
+                    memoCount: matching.filter { $0.kind == .memo }.count,
+                    meetingDecisions: matching.compactMap(\.meetingIntelligence).flatMap(\.decisions),
+                    meetingActionItems: matching.compactMap(\.meetingIntelligence).flatMap(\.actionItems),
+                    memoActionItems: matching.compactMap(\.memoIntelligence).flatMap(\.actionItems)
+                )
+            }
+            return try encode(WorkspaceIntelligenceStatus(enabled: journal.enabled, collectedAt: journal.collectedAt, value: enriched))
 
         case "get_dictation":
             return try await encodeRecord(kind: .dictation, arguments: arguments, store: store)
@@ -185,6 +213,8 @@ enum EveeMCP {
                 appStyleCount: settings.appStyles.count,
                 activityTrackingEnabled: intelligence.isEnabled,
                 activityWindowTitlesEnabled: intelligence.includeWindowTitles,
+                activityWebAddressesEnabled: intelligence.includeWebAddresses == true,
+                activityFocusedTextEnabled: intelligence.includeFocusedText == true,
                 activityJournalEnabled: intelligence.journalEnabled,
                 activityRetentionDays: intelligence.retentionDays,
                 textDeliveryMode: settings.textDeliveryMode,

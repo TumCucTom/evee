@@ -238,11 +238,11 @@ struct SettingsView: View {
             }
 
             Section("MCP") {
-                Text("Register Evee with Claude Desktop so local agents can search your voice workspace. Registration only changes Claude's local MCP configuration.")
+                Text("Register Evee with detected local MCP clients so local agents can search your voice workspace. Existing server entries are preserved.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Register with Claude Desktop", action: registerMCP)
+                    Button("Register detected clients", action: registerMCP)
                     if let integrationMessage {
                         Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                     }
@@ -342,8 +342,8 @@ struct SettingsView: View {
             return
         }
         do {
-            try MCPRegistration.writeClaudeDesktopConfiguration(executablePath: mcpURL.path)
-            integrationMessage = "Registered. Restart Claude Desktop to connect."
+            let results = try MCPRegistration.writeDetectedClientConfigurations()
+            integrationMessage = "Registered \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
         } catch {
             integrationMessage = "Registration failed: \(error.localizedDescription)"
         }

@@ -76,6 +76,36 @@ public struct DiagnosticsReport: Sendable {
     public var webhookConfigured: Bool
     public var inputDeviceSelected: Bool
 
+    public init(
+        appVersion: String,
+        operatingSystem: String,
+        model: String,
+        language: String,
+        recordCount: Int,
+        recoveryCount: Int,
+        microphonePermission: Bool,
+        accessibilityPermission: Bool,
+        systemAudioEnabled: Bool,
+        liveMeetingEnabled: Bool,
+        localAPIEnabled: Bool,
+        webhookConfigured: Bool,
+        inputDeviceSelected: Bool
+    ) {
+        self.appVersion = appVersion
+        self.operatingSystem = operatingSystem
+        self.model = model
+        self.language = language
+        self.recordCount = recordCount
+        self.recoveryCount = recoveryCount
+        self.microphonePermission = microphonePermission
+        self.accessibilityPermission = accessibilityPermission
+        self.systemAudioEnabled = systemAudioEnabled
+        self.liveMeetingEnabled = liveMeetingEnabled
+        self.localAPIEnabled = localAPIEnabled
+        self.webhookConfigured = webhookConfigured
+        self.inputDeviceSelected = inputDeviceSelected
+    }
+
     public func rendered() -> String {
         [
             "Evee diagnostics",

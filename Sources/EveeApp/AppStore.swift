@@ -3,6 +3,7 @@ import Combine
 import EveeCore
 import Foundation
 import KeyboardShortcuts
+import UniformTypeIdentifiers
 
 extension KeyboardShortcuts.Name {
     static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
@@ -1145,7 +1146,7 @@ final class AppStore: ObservableObject {
         let panel = NSSavePanel()
         panel.title = "Export Evee workspace"
         panel.nameFieldStringValue = "Evee Workspace.\(format.fileExtension)"
-        panel.allowedFileTypes = [format.fileExtension]
+        panel.allowedContentTypes = format == .json ? [.json] : [.plainText]
         panel.canCreateDirectories = true
         guard await panel.begin() == .OK, let destination = panel.url else { return }
         do {
@@ -1161,7 +1162,7 @@ final class AppStore: ObservableObject {
         let panel = NSSavePanel()
         panel.title = "Export Evee diagnostics"
         panel.nameFieldStringValue = "Evee Diagnostics.txt"
-        panel.allowedFileTypes = ["txt"]
+        panel.allowedContentTypes = [.plainText]
         guard await panel.begin() == .OK, let destination = panel.url else { return }
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
         let report = DiagnosticsReport(
