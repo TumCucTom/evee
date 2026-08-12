@@ -109,6 +109,11 @@ public struct TextCleanupPipeline: Sendable {
             " comma": ",", " full stop": ".", " period": ".", " question mark": "?",
             " exclamation mark": "!", " colon": ":", " semicolon": ";", " new line ": "\n",
             " open bracket ": " (", " close bracket": ")",
+            " coma": ",", " punto": ".", " signo de interrogación": "?", " nueva línea ": "\n",
+            " virgule": ",", " point final": ".", " point d'interrogation": "?", " nouvelle ligne ": "\n",
+            " komma": ",", " punkt": ".", " fragezeichen": "?", " neue zeile ": "\n",
+            " vírgula": ",", " ponto final": ".", " ponto de interrogação": "?", " nova linha ": "\n",
+            " virgola": ",", " punto fermo": ".", " punto interrogativo": "?", " nuova riga ": "\n",
         ]
         return replacements.reduce(input) { $0.replacingOccurrences(of: $1.key, with: $1.value, options: .caseInsensitive) }
     }

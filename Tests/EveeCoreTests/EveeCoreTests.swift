@@ -37,6 +37,13 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(pipeline.clean("I would like to confirm we are ready", tone: .casual), "I'd like to confirm we're ready.")
     }
 
+    func testSpokenPunctuationSupportsMultipleLanguages() {
+        let pipeline = TextCleanupPipeline()
+        XCTAssertEqual(pipeline.clean("hola coma equipo punto", appendPeriod: false), "Hola, equipo.")
+        XCTAssertEqual(pipeline.clean("bonjour virgule équipe point final", appendPeriod: false), "Bonjour, équipe.")
+        XCTAssertEqual(pipeline.clean("hallo komma team punkt", appendPeriod: false), "Hallo, team.")
+    }
+
     func testLegacyLibraryMigratesWithoutLosingRecords() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

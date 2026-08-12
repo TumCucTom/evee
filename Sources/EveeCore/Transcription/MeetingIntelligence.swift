@@ -571,7 +571,12 @@ public struct MeetingIntelligencePipeline: Sendable {
     private func decision(_ segment: TranscriptSegment) -> MeetingInsight? {
         let text = normalized(segment.text)
         let lower = text.lowercased()
-        let markers = ["we decided", "we agreed", "the decision is", "decision:", "agreed to", "we committed to"]
+        let markers = [
+            "we decided", "we agreed", "the decision is", "decision:", "agreed to", "we committed to",
+            "decidimos", "acordamos", "la decisión es", "décidé", "nous avons convenu", "la décision est",
+            "wir haben entschieden", "wir haben vereinbart", "die entscheidung ist",
+            "decidimos", "a decisão é", "abbiamo deciso", "la decisione è"
+        ]
         guard !isQuestion(text), markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
             kind: .decision,
@@ -584,8 +589,15 @@ public struct MeetingIntelligencePipeline: Sendable {
     private func actionItem(_ segment: TranscriptSegment) -> MeetingInsight? {
         let text = normalized(segment.text)
         let lower = text.lowercased()
-        let markers = ["action item", "todo", "to-do", "follow up", "i will", "i'll", "you will", "you'll", "needs to", "need to"]
-        let negations = ["will not", "won't", "do not need to", "don't need to", "does not need to", "doesn't need to", "no action item"]
+        let markers = [
+            "action item", "todo", "to-do", "follow up", "i will", "i'll", "you will", "you'll", "needs to", "need to",
+            "acción", "tengo que", "necesita", "suivi", "je vais", "doit", "aufgabe", "ich werde", "muss",
+            "ação", "precisa", "vou ", "azione", "devo", "bisogna"
+        ]
+        let negations = [
+            "will not", "won't", "do not need to", "don't need to", "does not need to", "doesn't need to", "no action item",
+            "no necesito", "no necesita", "ne dois pas", "ne doit pas", "muss nicht", "não precisa", "non devo"
+        ]
         guard !isQuestion(text),
               !negations.contains(where: lower.contains),
               markers.contains(where: lower.contains) else { return nil }

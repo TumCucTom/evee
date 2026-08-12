@@ -101,6 +101,10 @@ struct MeetingWorkspaceView: View {
                         Text("Live transcript").font(.system(size: 12, weight: .semibold))
                         ForEach(store.liveMeetingTranscript.suffix(12)) { update in
                             HStack(alignment: .top, spacing: 8) {
+                                Text(liveTimestamp(update.timestamp))
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 36, alignment: .leading)
                                 Text(update.channel == .microphone ? "You" : "Others")
                                     .font(.caption.weight(.semibold))
                                     .foregroundStyle(update.channel == .microphone ? AnimaTheme.indigo : AnimaTheme.violet)
@@ -231,5 +235,11 @@ struct MeetingWorkspaceView: View {
     private func openScreenRecordingSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private func liveTimestamp(_ date: Date) -> String {
+        guard case .recording(let startedAt, _) = store.captureState else { return "00:00" }
+        let seconds = max(0, Int(date.timeIntervalSince(startedAt)))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }

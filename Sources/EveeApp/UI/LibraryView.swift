@@ -115,14 +115,45 @@ struct LibraryView: View {
                     description: Text(store.search.isEmpty ? "Hold ⌥⌘Space in any app to create your first dictation." : "Try a person, project, phrase or app name.")
                 )
             } else {
-                List(rows, selection: $store.selectedRecordID) { record in
-                    RecordRow(record: record).tag(record.id).listRowSeparator(.hidden).listRowBackground(Color.clear)
+                List(selection: $store.selectedRecordID) {
+                    if store.search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        ForEach(rows) { record in recordRow(record) }
+                    } else {
+                        ForEach(WorkspaceRecordKind.allCases, id: \.self) { resultKind in
+                            let matches = rows.filter { $0.kind == resultKind }
+                            if !matches.isEmpty {
+                                Section("\(resultKind.rawValue.capitalized)s · \(matches.count)") {
+                                    ForEach(matches) { record in recordRow(record) }
+                                }
+                            }
+                        }
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
             }
         }
         .background(AnimaTheme.paper)
+    }
+
+    @ViewBuilder
+    private func recordRow(_ record: WorkspaceRecord) -> some View {
+        RecordRow(record: record, snippet: searchSnippet(record))
+            .tag(record.id)
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+    }
+
+    private func searchSnippet(_ record: WorkspaceRecord) -> String? {
+        let query = store.search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return nil }
+        let source = [record.text, record.notes, record.tags.joined(separator: " ")].joined(separator: "\n")
+        guard let match = source.range(of: query, options: .caseInsensitive) else { return String(source.prefix(180)) }
+        let start = source.index(match.lowerBound, offsetBy: -70, limitedBy: source.startIndex) ?? source.startIndex
+        let end = source.index(match.upperBound, offsetBy: 110, limitedBy: source.endIndex) ?? source.endIndex
+        let prefix = start == source.startIndex ? "" : "…"
+        let suffix = end == source.endIndex ? "" : "…"
+        return prefix + source[start..<end].trimmingCharacters(in: .whitespacesAndNewlines) + suffix
     }
 
     private var isRecordingMemo: Bool {
@@ -133,6 +164,7 @@ struct LibraryView: View {
 
 private struct RecordRow: View {
     let record: WorkspaceRecord
+    var snippet: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -141,7 +173,7 @@ private struct RecordRow: View {
                 .frame(width: 30, height: 30).background(colour.opacity(0.1)).clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 5) {
                 Text(record.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                Text(record.text).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
+                Text(snippet ?? record.text).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
                 HStack(spacing: 5) {
                     Text(record.operation == .selectionTransform ? "Transform" : record.kind.rawValue.capitalized)
                     if let app = record.sourceApplication { Text("·"); Text(app) }
