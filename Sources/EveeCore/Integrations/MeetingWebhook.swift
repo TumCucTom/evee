@@ -193,15 +193,9 @@ private final class SafeWebhookRedirectDelegate: NSObject, URLSessionTaskDelegat
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        guard let source = task.currentRequest?.url,
-              let destination = request.url,
-              source.scheme?.lowercased() == "https",
-              destination.scheme?.lowercased() == "https",
-              source.host?.lowercased() == destination.host?.lowercased(),
-              source.port == destination.port else {
-            completionHandler(nil)
-            return
-        }
-        completionHandler(request)
+        // Never follow redirects for signed POSTs. Some redirect status codes
+        // rewrite the request as GET and could otherwise produce a false 2xx
+        // delivery receipt without transmitting the signed body.
+        completionHandler(nil)
     }
 }

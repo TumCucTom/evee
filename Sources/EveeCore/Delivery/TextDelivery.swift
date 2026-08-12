@@ -119,12 +119,13 @@ public enum TextDelivery {
     }
 
     public static func frontmostApplication() -> FrontmostApplication? {
-        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier) else { return nil }
         return FrontmostApplication(
             bundleIdentifier: app.bundleIdentifier ?? "unknown",
             name: app.localizedName ?? "App",
             processIdentifier: app.processIdentifier,
-            focusedTarget: focusedTarget(processIdentifier: app.processIdentifier)
+            focusedTarget: focusedTarget
         )
     }
 
@@ -258,11 +259,7 @@ public enum TextDelivery {
         }
 
 
-        guard let expected = target.focusedTarget else {
-            // Dictations captured by a legacy build have no focused-recipient
-            // snapshot. Keep the process-level check for backwards compatibility.
-            return
-        }
+        guard let expected = target.focusedTarget else { throw DeliveryError.targetContextChanged(target.name) }
         guard let actual = focusedTarget(processIdentifier: target.processIdentifier),
               actual.elementFingerprint == expected.elementFingerprint,
               actual.windowFingerprint == expected.windowFingerprint,

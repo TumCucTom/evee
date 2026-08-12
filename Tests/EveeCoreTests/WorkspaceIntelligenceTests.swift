@@ -88,6 +88,23 @@ final class WorkspaceIntelligenceTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testPeriodicCheckpointsRemainOneVisit() async throws {
+        let (store, root) = makeStore()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.savePreferences(.init(isEnabled: true, journalEnabled: true, minimumDwellSeconds: 5), at: start)
+        let editor = WorkspaceApplicationObservation(bundleIdentifier: "test.editor", applicationName: "Editor")
+        try await store.record(editor, at: start)
+        try await store.record(editor, at: start.addingTimeInterval(10))
+        try await store.record(editor, at: start.addingTimeInterval(20))
+        try await store.stop(at: start.addingTimeInterval(30))
+
+        let usage = try await store.applicationUsage()
+        let journal = try await store.journal()
+        XCTAssertEqual(usage.value.first?.visitCount, 1)
+        XCTAssertEqual(journal.value.first?.applications.first?.visitCount, 1)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     private func makeStore() -> (WorkspaceIntelligenceStore, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         return (WorkspaceIntelligenceStore(rootURL: root), root)

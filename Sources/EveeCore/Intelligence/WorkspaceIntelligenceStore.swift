@@ -123,7 +123,7 @@ public actor WorkspaceIntelligenceStore {
                 bundleIdentifier: first.bundleIdentifier,
                 applicationName: first.applicationName,
                 totalDuration: values.reduce(0) { $0 + $1.duration },
-                visitCount: values.count,
+                visitCount: visitCount(in: values),
                 firstSeenAt: values.map(\.startedAt).min() ?? first.startedAt,
                 lastSeenAt: values.map(\.endedAt).max() ?? first.endedAt
             )
@@ -201,7 +201,7 @@ public actor WorkspaceIntelligenceStore {
                 applications.append(WorkspaceJournalApplication(
                     applicationName: name,
                     duration: duration,
-                    visitCount: appEvents.count
+                    visitCount: visitCount(in: appEvents)
                 ))
             }
             applications.sort {
@@ -241,6 +241,17 @@ public actor WorkspaceIntelligenceStore {
                 windowTitle: nil
             ), to: contextURL)
         }
+    }
+
+    private func visitCount(in events: [WorkspaceDwellEvent]) -> Int {
+        let ordered = events.sorted { $0.startedAt < $1.startedAt }
+        guard var previous = ordered.first else { return 0 }
+        var count = 1
+        for event in ordered.dropFirst() {
+            if event.startedAt.timeIntervalSince(previous.endedAt) > 1 { count += 1 }
+            if event.endedAt > previous.endedAt { previous = event }
+        }
+        return count
     }
 
     private func storedEvents() throws -> [WorkspaceDwellEvent] {

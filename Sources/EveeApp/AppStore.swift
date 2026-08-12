@@ -43,7 +43,7 @@ final class AppStore: ObservableObject {
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
-            count += record.webhookDeliveries.filter { $0.state == .pending || ($0.state == .failed && $0.retryable) }.count
+            count += record.webhookDeliveries.filter { $0.state != .delivered }.count
         }
     }
 
@@ -1040,7 +1040,9 @@ final class AppStore: ObservableObject {
         do {
             guard var record = try await library.record(id: recordID),
                   let index = record.webhookDeliveries.firstIndex(where: { $0.id == delivery.id }) else { return }
-            record.webhookDeliveries[index] = delivery
+            var storedDelivery = delivery
+            if !storedDelivery.retryable { storedDelivery.payloadBody = nil }
+            record.webhookDeliveries[index] = storedDelivery
             record.updatedAt = .now
             try await library.upsert(record)
             replaceRecord(record)
