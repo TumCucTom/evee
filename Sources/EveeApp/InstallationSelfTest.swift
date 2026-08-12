@@ -13,11 +13,11 @@ enum InstallationSelfTest {
             throw failure("The packaged MCP helper is missing or not executable.")
         }
         let resourceBundles = ((try? FileManager.default.contentsOfDirectory(
-            at: Bundle.main.bundleURL,
+            at: Bundle.main.resourceURL ?? Bundle.main.bundleURL,
             includingPropertiesForKeys: nil
         )) ?? []).filter { $0.pathExtension == "bundle" }
         guard !resourceBundles.isEmpty else {
-            throw failure("Packaged dependency resource bundles are unavailable to Bundle.module accessors.")
+            throw failure("Packaged dependency resource bundles are unavailable.")
         }
 
         let root = FileManager.default.temporaryDirectory

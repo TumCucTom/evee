@@ -51,10 +51,6 @@ shopt -s nullglob
 resource_bundles=("$bin_dir"/*.bundle)
 for bundle in "${resource_bundles[@]}"; do
   ditto "$bundle" "$contents/Resources/$(basename "$bundle")"
-  # SwiftPM-generated Bundle.module accessors vary by dependency and may look
-  # beside Bundle.main.bundleURL in a packaged executable. Keep a root copy as
-  # well as the conventional Resources copy so both generated accessors work.
-  ditto "$bundle" "$app_dir/$(basename "$bundle")"
 done
 shopt -u nullglob
 
