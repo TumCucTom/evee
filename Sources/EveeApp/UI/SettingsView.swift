@@ -113,7 +113,7 @@ struct SettingsView: View {
                 Text("Context is captured in memory to guard delivery. Long-term app/window metadata and original selected text are off by default and controlled separately. Password and protected fields are never read.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("System-audio meeting capture is off by default and requires Screen & System Audio Recording permission. Audio retention is controlled separately.")
+                Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Anonymous speaker separation is off by default. Enabling it downloads and runs an additional local model when a meeting is processed; speaker names are never inferred.")
@@ -247,7 +247,13 @@ struct SettingsView: View {
 
     private func copy(_ value: String) {
         guard !value.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(value, forType: .string)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(value, forType: .string) else { return }
+        let changeCount = pasteboard.changeCount
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(60))
+            if pasteboard.changeCount == changeCount { pasteboard.clearContents() }
+        }
     }
 }

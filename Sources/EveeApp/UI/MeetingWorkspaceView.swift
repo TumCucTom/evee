@@ -66,7 +66,7 @@ struct MeetingWorkspaceView: View {
                         Text(store.isSystemAudioActive ? "Microphone and system audio are recording" : "Microphone-only recording")
                             .font(.system(size: 13, weight: .semibold))
                         Text(store.isSystemAudioActive
-                             ? "Evee is capturing both sides locally. No participant or bot joins your call."
+                             ? "Evee is capturing microphone audio and all Mac system audio locally. Pause unrelated media and notifications; no participant or bot joins your call."
                              : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
