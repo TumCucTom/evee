@@ -207,13 +207,13 @@ public final class LocalAPIServer: @unchecked Sendable {
                     send(status: 404, json: ["error": "Record not found"], on: connection)
                     return
                 }
-                send(status: 200, encodable: record, on: connection)
+                send(status: 200, encodable: publicRecord(record), on: connection)
             } else if target.hasPrefix("/v1/records") {
                 let components = URLComponents(string: "http://localhost\(target)")
                 let query = components?.queryItems?.first(where: { $0.name == "q" })?.value ?? ""
                 let kind = components?.queryItems?.first(where: { $0.name == "kind" })?.value.flatMap(WorkspaceRecordKind.init(rawValue:))
                 let limit = components?.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
-                send(status: 200, encodable: try await store.search(query, kind: kind, limit: limit), on: connection)
+                send(status: 200, encodable: try await store.search(query, kind: kind, limit: limit).map(publicRecord), on: connection)
             } else if target == "/v1/recovery" {
                 send(status: 200, encodable: try await store.recoverableCaptures(), on: connection)
             } else {
@@ -222,6 +222,12 @@ public final class LocalAPIServer: @unchecked Sendable {
         } catch {
             send(status: 500, json: ["error": error.localizedDescription], on: connection)
         }
+    }
+
+    private func publicRecord(_ record: WorkspaceRecord) -> WorkspaceRecord {
+        var copy = record
+        for index in copy.webhookDeliveries.indices { copy.webhookDeliveries[index].payloadBody = nil }
+        return copy
     }
 
     private func send(status: Int, json: [String: String], on connection: NWConnection) {

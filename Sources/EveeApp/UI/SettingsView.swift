@@ -156,6 +156,7 @@ struct SettingsView: View {
                             .foregroundStyle(.orange)
                         Spacer()
                         Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
+                        Button("Cancel outbox", role: .destructive) { Task { await store.cancelWebhookOutbox() } }
                     }
                 }
                 Text("Webhook secrets are stored in Keychain. HTTPS is required except for localhost development.")

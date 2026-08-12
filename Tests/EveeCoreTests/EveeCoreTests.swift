@@ -128,6 +128,21 @@ final class EveeCoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: input)
     }
 
+    func testLegacyLooseRecoveryFilesAreDeletedWhenDiscarded() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = LibraryStore(rootURL: root)
+        try await store.prepare()
+        let recoveryRoot = await store.recoveryURL
+        let captureID = UUID()
+        let loose = recoveryRoot.appendingPathComponent("\(captureID.uuidString).caf")
+        try Data("legacy audio".utf8).write(to: loose)
+
+        try await store.discardRecoveryCapture(id: captureID)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: loose.path))
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func testUnsafeAudioPathIsRejected() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = LibraryStore(rootURL: root)

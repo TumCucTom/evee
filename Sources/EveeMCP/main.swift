@@ -99,13 +99,13 @@ enum EveeMCP {
             let query = arguments["query"] as? String ?? ""
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
             let records = try await store.search(query, kind: kind, limit: limit)
-            return try encode(records)
+            return try encode(records.map(publicRecord))
 
         case "recent_activity":
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
             let since = parseDate(arguments["since"] as? String)
             let records = try await store.recent(kind: kind, limit: limit, since: since)
-            return try encode(records)
+            return try encode(records.map(publicRecord))
 
         case "ambient_timeline":
             let since = parseDate(arguments["since"] as? String)
@@ -178,10 +178,16 @@ enum EveeMCP {
             guard let id = UUID(uuidString: rawID), let record = try await store.record(id: id), record.kind == kind else {
                 throw MCPFailure(code: -32602, message: "No \(kind.rawValue) exists with that id.")
             }
-            return try encode(record)
+            return try encode(publicRecord(record))
         }
         let latest = try await store.recent(kind: kind, limit: 1).first
-        return try encode(latest)
+        return try encode(latest.map(publicRecord))
+    }
+
+    static func publicRecord(_ record: WorkspaceRecord) -> WorkspaceRecord {
+        var copy = record
+        for index in copy.webhookDeliveries.indices { copy.webhookDeliveries[index].payloadBody = nil }
+        return copy
     }
 
     static func encode<T: Encodable>(_ value: T) throws -> String {

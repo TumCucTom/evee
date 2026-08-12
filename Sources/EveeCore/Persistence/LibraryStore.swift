@@ -389,7 +389,6 @@ public actor LibraryStore {
 
         let capture = try recoverableCaptures().first { $0.id == recoveryID }
         record.recoverySourceID = recoveryID
-        let recoveryDirectory = recoveryURL.appendingPathComponent(recoveryID.uuidString, isDirectory: true)
         var moves: [(source: URL, destination: URL)] = []
 
         if keepAudio {
@@ -448,15 +447,13 @@ public actor LibraryStore {
 
         // Metadata now owns the result (or intentionally owns no audio), so the
         // recovery copy is safe to remove. Failed cleanup is reconciled on launch.
-        try? FileManager.default.removeItem(at: recoveryDirectory)
+        try? removeRecoveryArtifacts(id: recoveryID, tracks: capture?.tracks ?? [])
         return record
     }
 
     public func discardRecoveryCapture(id: UUID) throws {
-        let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
-        if FileManager.default.fileExists(atPath: directory.path) {
-            try FileManager.default.removeItem(at: directory)
-        }
+        let capture = try recoverableCaptures().first { $0.id == id }
+        try removeRecoveryArtifacts(id: id, tracks: capture?.tracks ?? [])
     }
 
     public func reconcileAudioStorage() throws {
@@ -529,6 +526,21 @@ public actor LibraryStore {
                 try FileManager.default.removeItem(at: directory)
             }
         }
+        let ownedRecoveryIDs = Set(records.compactMap(\.recoverySourceID))
+        for capture in try recoverableCaptures() where ownedRecoveryIDs.contains(capture.id) {
+            try? removeRecoveryArtifacts(id: capture.id, tracks: capture.tracks)
+        }
+    }
+
+    private func removeRecoveryArtifacts(id: UUID, tracks: [WorkspaceAudioTrack]) throws {
+        let recoveryRoot = recoveryURL.standardizedFileURL.path + "/"
+        for track in tracks {
+            let source = try safeURL(forRelativePath: track.relativePath)
+            guard source.standardizedFileURL.path.hasPrefix(recoveryRoot) else { continue }
+            if FileManager.default.fileExists(atPath: source.path) { try FileManager.default.removeItem(at: source) }
+        }
+        let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
+        if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
     }
 
     private func createPrivateDirectory(_ url: URL) throws {

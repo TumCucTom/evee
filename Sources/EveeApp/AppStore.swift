@@ -43,7 +43,7 @@ final class AppStore: ObservableObject {
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
-            count += record.webhookDeliveries.filter { $0.state != .delivered }.count
+            count += record.webhookDeliveries.filter { $0.state == .pending || ($0.state == .failed && $0.retryable) }.count
         }
     }
 
@@ -253,6 +253,9 @@ final class AppStore: ObservableObject {
                 try secretStore.set(webhookSecret, for: KeychainSecretStore.webhookSigningSecretAccount)
             }
             settings.webhookSecret = ""
+            if settings.webhookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await cancelWebhookOutbox()
+            }
             try await library.save(settings)
             transcriber?.unload()
             transcriber = try TranscriberFactory.make(settings.model)
@@ -1005,6 +1008,7 @@ final class AppStore: ObservableObject {
             record.webhookDeliveries[index].lastError = nil
             record.webhookDeliveries[index].retryable = false
             record.webhookDeliveries[index].nextAttemptAt = nil
+            record.webhookDeliveries[index].payloadBody = nil
             record.updatedAt = .now
             try await library.upsert(record)
             replaceRecord(record)
@@ -1119,6 +1123,32 @@ final class AppStore: ObservableObject {
             if queued.isEmpty { statusMessage = "The webhook outbox is already clear." }
         } catch {
             statusMessage = "The webhook outbox could not be retried: \(error.localizedDescription)"
+        }
+    }
+
+    func cancelWebhookOutbox() async {
+        webhookRetryTask?.cancel()
+        webhookRetryTask = nil
+        do {
+            let snapshot = records
+            for var record in snapshot {
+                var changed = false
+                for index in record.webhookDeliveries.indices where record.webhookDeliveries[index].state != .delivered {
+                    record.webhookDeliveries[index].state = .failed
+                    record.webhookDeliveries[index].retryable = false
+                    record.webhookDeliveries[index].nextAttemptAt = nil
+                    record.webhookDeliveries[index].payloadBody = nil
+                    record.webhookDeliveries[index].lastError = "Delivery cancelled by the user."
+                    changed = true
+                }
+                if changed {
+                    record.updatedAt = .now
+                    try await library.upsert(record)
+                    replaceRecord(record)
+                }
+            }
+        } catch {
+            statusMessage = "The webhook outbox could not be cancelled: \(error.localizedDescription)"
         }
     }
 
