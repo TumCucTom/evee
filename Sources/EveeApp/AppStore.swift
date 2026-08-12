@@ -54,6 +54,7 @@ final class AppStore: ObservableObject {
     @Published private(set) var availableUpdate: EveeRelease?
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var microphoneHealthWarning: String?
+    @Published private(set) var hotMicActive = false
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
@@ -95,6 +96,8 @@ final class AppStore: ObservableObject {
     private var liveMeetingUpdateTask: Task<Void, Never>?
     private var microphoneHealthTask: Task<Void, Never>?
     private var lastNonSilentAudioAt = Date.distantPast
+    private var wakePhraseListener: WakePhraseListener?
+    private var hotMicTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -270,6 +273,7 @@ final class AppStore: ObservableObject {
             } else {
                 await retryPendingWebhookDeliveries()
             }
+            await updateHotMicState()
         } catch {
             didBootstrap = false
             statusMessage = error.localizedDescription
@@ -310,6 +314,7 @@ final class AppStore: ObservableObject {
                 api.stop()
                 localAPICredentials = nil
             }
+            await updateHotMicState()
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -487,7 +492,12 @@ final class AppStore: ObservableObject {
         }
 
         do {
+            await stopHotMic()
             if activeKind == .meeting { await startLiveMeetingTranscription() }
+            guard captureLifecycle == .starting(sessionID) else {
+                await cleanUpCancelledStart(sessionID: sessionID)
+                return
+            }
             _ = try await library.beginRecoveryCapture(kind: activeKind, id: sessionID)
             let directory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
             activeRecoveryID = sessionID
@@ -712,6 +722,9 @@ final class AppStore: ObservableObject {
     func dismissCaptureFailure() {
         guard captureLifecycle == .idle, case .failed = captureState else { return }
         captureState = .idle
+        if settings.hotMicEnabled {
+            Task { @MainActor [weak self] in await self?.updateHotMicState() }
+        }
     }
 
     private func completeRecord(
@@ -909,6 +922,9 @@ final class AppStore: ObservableObject {
         microphoneHealthTask?.cancel()
         microphoneHealthTask = nil
         microphoneHealthWarning = nil
+        if state == .idle, settings.hotMicEnabled {
+            Task { @MainActor [weak self] in await self?.updateHotMicState() }
+        }
     }
 
     var hasMeetingDraft: Bool {
@@ -1102,6 +1118,66 @@ final class AppStore: ObservableObject {
                 }
             }
         }
+    }
+
+    func updateHotMicState() async {
+        let phrase = settings.wakePhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard settings.hotMicEnabled else {
+            await stopHotMic()
+            return
+        }
+        guard settings.model == .parakeet else {
+            await stopHotMic()
+            statusMessage = "Wake-phrase listening requires the Parakeet model."
+            return
+        }
+        guard phrase.count >= 3 else {
+            await stopHotMic()
+            statusMessage = "Choose a wake phrase containing at least three characters."
+            return
+        }
+        guard captureLifecycle == .idle, !hotMicActive else { return }
+        refreshPermissionState()
+        guard microphonePermissionGranted else {
+            statusMessage = "Grant Microphone permission before enabling wake-phrase listening."
+            return
+        }
+
+        let listener = WakePhraseListener()
+        do {
+            try await listener.start(
+                deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                lowLatency: true
+            )
+            wakePhraseListener = listener
+            hotMicActive = true
+            hotMicTask = Task { @MainActor [weak self] in
+                for await transcript in listener.transcripts {
+                    guard let self, !Task.isCancelled else { return }
+                    let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    if normalized.contains(phrase.lowercased()) {
+                        self.hotMicTask = nil
+                        self.hotMicActive = false
+                        await listener.stop()
+                        self.wakePhraseListener = nil
+                        await self.beginDictation()
+                        return
+                    }
+                }
+            }
+        } catch {
+            hotMicActive = false
+            wakePhraseListener = nil
+            statusMessage = "Wake-phrase listening could not start: \(error.localizedDescription)"
+        }
+    }
+
+    private func stopHotMic() async {
+        hotMicTask?.cancel()
+        hotMicTask = nil
+        if let wakePhraseListener { await wakePhraseListener.stop() }
+        wakePhraseListener = nil
+        hotMicActive = false
     }
 
     private func stopLiveMeetingTranscription() async {

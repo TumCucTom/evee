@@ -20,7 +20,7 @@ matching a tool name is not treated as functional completeness.
 - Personal dictionary and per-application writing styles
 - Loopback JSON API with bearer authentication
 - MCP helper exposing search and record lookup tools
-- Hands-free capture, configurable microphone input and low-latency buffering
+- Hands-free capture, opt-in local wake-phrase listening, configurable microphone input and low-latency buffering
 - Email formatting, smart links, opt-in correction learning and contextual formatting
 - Automatic retention, JSON/Markdown export, diagnostics and a user-initiated release checker
 - Optional HMAC-SHA256 meeting webhooks

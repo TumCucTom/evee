@@ -63,6 +63,7 @@ private struct PublicConfiguration: Codable {
     var workspaceRetentionDays: Int
     var selectedInputDevice: Bool
     var lowLatencyMode: Bool
+    var wakePhraseListeningEnabled: Bool
 }
 
 @main
@@ -223,7 +224,8 @@ enum EveeMCP {
                 smartLinkCount: settings.smartLinks.count,
                 workspaceRetentionDays: settings.historyRetentionDays,
                 selectedInputDevice: !settings.inputDeviceUID.isEmpty,
-                lowLatencyMode: settings.lowLatencyMode
+                lowLatencyMode: settings.lowLatencyMode,
+                wakePhraseListeningEnabled: settings.hotMicEnabled
             ))
 
         default:

@@ -256,7 +256,13 @@ struct SettingsView: View {
             Section("Application") {
                 LaunchAtLogin.Toggle()
                 Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
-                Text("Audio cues mark recording start, processing, completion and errors. Wake-word mode is not available in this build.")
+                Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
+                    .disabled(store.settings.model != .parakeet)
+                if store.settings.hotMicEnabled {
+                    TextField("Wake phrase", text: $store.settings.wakePhrase)
+                    LabeledContent("Wake listener", value: store.hotMicActive ? "Active" : "Starts after Save")
+                }
+                Text("Audio cues mark recording start, processing, completion and errors. Wake-phrase listening is off by default, keeps audio in memory, uses the selected microphone and releases it before normal dictation begins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {

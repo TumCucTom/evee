@@ -494,6 +494,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var retainSelectedText = false
     public var captureVisibleContext = false
     public var audioCuesEnabled = false
+    public var hotMicEnabled = false
+    public var wakePhrase = "hey evee"
     public var inputDeviceUID = ""
     public var lowLatencyMode = false
     public var emailFormattingMode: EmailFormattingMode = .automatic
@@ -510,7 +512,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled, liveMeetingTranscriptionEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
-        case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled
+        case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled, hotMicEnabled, wakePhrase
         case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks, historyRetentionDays
     }
 
@@ -534,6 +536,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         retainSelectedText = try values.decodeIfPresent(Bool.self, forKey: .retainSelectedText) ?? false
         captureVisibleContext = try values.decodeIfPresent(Bool.self, forKey: .captureVisibleContext) ?? false
         audioCuesEnabled = try values.decodeIfPresent(Bool.self, forKey: .audioCuesEnabled) ?? false
+        hotMicEnabled = try values.decodeIfPresent(Bool.self, forKey: .hotMicEnabled) ?? false
+        wakePhrase = try values.decodeIfPresent(String.self, forKey: .wakePhrase) ?? "hey evee"
         inputDeviceUID = try values.decodeIfPresent(String.self, forKey: .inputDeviceUID) ?? ""
         lowLatencyMode = try values.decodeIfPresent(Bool.self, forKey: .lowLatencyMode) ?? false
         emailFormattingMode = try values.decodeIfPresent(EmailFormattingMode.self, forKey: .emailFormattingMode) ?? .automatic
@@ -564,6 +568,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(retainSelectedText, forKey: .retainSelectedText)
         try values.encode(captureVisibleContext, forKey: .captureVisibleContext)
         try values.encode(audioCuesEnabled, forKey: .audioCuesEnabled)
+        try values.encode(hotMicEnabled, forKey: .hotMicEnabled)
+        try values.encode(wakePhrase, forKey: .wakePhrase)
         try values.encode(inputDeviceUID, forKey: .inputDeviceUID)
         try values.encode(lowLatencyMode, forKey: .lowLatencyMode)
         try values.encode(emailFormattingMode, forKey: .emailFormattingMode)

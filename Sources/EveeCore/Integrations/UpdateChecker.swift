@@ -28,7 +28,9 @@ public struct UpdateChecker: Sendable {
     public init() {}
 
     public func latestRelease() async throws -> EveeRelease {
-        let endpoint = URL(string: "https://api.github.com/repos/TumCucTom/evee/releases/latest")!
+        guard let endpoint = URL(string: "https://api.github.com/repos/TumCucTom/evee/releases/latest") else {
+            throw UpdateCheckError.invalidRelease
+        }
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 15
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")

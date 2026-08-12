@@ -59,5 +59,16 @@ final class WritingEnhancementsTests: XCTestCase {
         XCTAssertFalse(settings.captureVisibleContext)
         XCTAssertFalse(settings.learnCorrections)
         XCTAssertTrue(settings.smartLinks.isEmpty)
+        XCTAssertFalse(settings.hotMicEnabled)
+        XCTAssertEqual(settings.wakePhrase, "hey evee")
+    }
+
+    func testWakePhrasePreferenceRoundTrips() throws {
+        var settings = EveeSettings()
+        settings.hotMicEnabled = true
+        settings.wakePhrase = "hello evee"
+        let restored = try JSONDecoder().decode(EveeSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.hotMicEnabled)
+        XCTAssertEqual(restored.wakePhrase, "hello evee")
     }
 }
