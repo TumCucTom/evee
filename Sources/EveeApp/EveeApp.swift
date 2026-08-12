@@ -1,11 +1,26 @@
 import AppKit
 import Combine
+import Darwin
 import EveeCore
 import SwiftUI
 
 @main
 struct EveeApp: App {
     @StateObject private var store = AppStore()
+
+    init() {
+        guard CommandLine.arguments.contains("--installation-self-test") else { return }
+        Task {
+            do {
+                try await InstallationSelfTest.run()
+                print("Evee installation self-test passed")
+                Darwin.exit(EXIT_SUCCESS)
+            } catch {
+                fputs("Evee installation self-test failed: \(error.localizedDescription)\n", stderr)
+                Darwin.exit(EXIT_FAILURE)
+            }
+        }
+    }
 
     var body: some Scene {
         WindowGroup {

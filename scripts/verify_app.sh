@@ -23,15 +23,26 @@ test "$bundle_identifier" = "com.tumcuctom.evee"
 mcp_output="$(mktemp)"
 cleanup_paths=("$mcp_output")
 trap 'rm -rf "${cleanup_paths[@]}"' EXIT
+tool_names=(search recent_activity ambient_timeline ambient_app_usage get_context get_journal get_dictation get_meeting get_memo get_stats get_config)
 {
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-  printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_config","arguments":{}}}'
+  request_id=10
+  for tool_name in "${tool_names[@]}"; do
+    printf '{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"%s","arguments":{}}}\n' "$request_id" "$tool_name"
+    request_id=$((request_id + 1))
+  done
 } | "$mcp_executable" >"$mcp_output"
 grep -q '"protocolVersion"' "$mcp_output"
 grep -q '"name":"search"' "$mcp_output"
-grep -q '"id":3' "$mcp_output"
-grep -q '"content"' "$mcp_output"
+if grep -q '"error"' "$mcp_output"; then
+  echo "At least one packaged MCP protocol call failed" >&2
+  cat "$mcp_output" >&2
+  exit 1
+fi
+for request_id in $(seq 10 20); do
+  grep -q "\"id\":$request_id" "$mcp_output"
+done
 
 while IFS= read -r dependency; do
   case "$dependency" in
@@ -42,22 +53,12 @@ while IFS= read -r dependency; do
   esac
 done < <(otool -L "$main_executable"; otool -L "$mcp_executable")
 
-# Launch the app after moving it away from the SwiftPM build tree. A process
-# that dies during bootstrap fails this smoke check. CI owns and then removes
-# only the temporary copy and process it creates.
+# Launch the app after moving it away from the SwiftPM build tree and require
+# its bundled persistence, search, privacy and helper self-test to complete.
 smoke_root="$(mktemp -d)"
 cleanup_paths+=("$smoke_root")
 ditto "$app_dir" "$smoke_root/Evee.app"
-"$smoke_root/Evee.app/Contents/MacOS/Evee" >"$smoke_root/stdout.log" 2>"$smoke_root/stderr.log" &
-smoke_pid=$!
-sleep 5
-if ! kill -0 "$smoke_pid" 2>/dev/null; then
-  wait "$smoke_pid" || true
-  echo "Packaged Evee exited during launch smoke test" >&2
-  cat "$smoke_root/stderr.log" >&2
-  exit 1
-fi
-kill -TERM "$smoke_pid"
-wait "$smoke_pid" || true
+"$smoke_root/Evee.app/Contents/MacOS/Evee" --installation-self-test >"$smoke_root/stdout.log" 2>"$smoke_root/stderr.log"
+grep -q 'installation self-test passed' "$smoke_root/stdout.log"
 
 echo "Verified $app_dir"
