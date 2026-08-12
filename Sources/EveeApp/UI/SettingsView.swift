@@ -144,6 +144,8 @@ struct SettingsView: View {
 
             Section("Privacy and storage") {
                 Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
+                Toggle("Show a live local transcript while recording", isOn: $store.settings.liveMeetingTranscriptionEnabled)
+                    .disabled(store.settings.model != .parakeet)
                 HStack {
                     Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
                         .disabled(!store.settings.meetingCaptureEnabled)
@@ -167,6 +169,12 @@ struct SettingsView: View {
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
+                Picker("Delete workspace records after", selection: $store.settings.historyRetentionDays) {
+                    Text("Never").tag(0)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("1 year").tag(365)
+                }
                 Toggle("Store app and window context with dictations", isOn: $store.settings.retainContextMetadata)
                 Toggle("Store original selected text for transforms", isOn: $store.settings.retainSelectedText)
                 Toggle("Capture and store visible accessibility text", isOn: $store.settings.captureVisibleContext)
@@ -182,9 +190,14 @@ struct SettingsView: View {
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Automatic history expiry is not available yet. Delete individual records from the workspace.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Export JSON") { Task { await store.exportWorkspace(format: .json) } }
+                    Button("Export Markdown") { Task { await store.exportWorkspace(format: .markdown) } }
+                    Spacer()
+                    Text("Exports omit retry payload bodies and never include Keychain secrets.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Local API") {

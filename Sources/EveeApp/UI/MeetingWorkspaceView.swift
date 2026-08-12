@@ -82,6 +82,37 @@ struct MeetingWorkspaceView: View {
 
                 Divider()
 
+                if let liveMeetingStatus = store.liveMeetingStatus {
+                    Text(liveMeetingStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(liveMeetingStatus)
+                }
+
+                if !store.liveMeetingTranscript.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Live transcript").font(.system(size: 12, weight: .semibold))
+                        ForEach(store.liveMeetingTranscript.suffix(12)) { update in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(update.channel == .microphone ? "You" : "Others")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(update.channel == .microphone ? AnimaTheme.indigo : AnimaTheme.violet)
+                                    .frame(width: 48, alignment: .leading)
+                                Text(update.text)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(update.isConfirmed ? .primary : .secondary)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(AnimaTheme.raisedSurface)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .accessibilityElement(children: .contain)
+                }
+
+                Divider()
+
                 TextField("Meeting title", text: $store.meetingTitle)
                     .textFieldStyle(.roundedBorder)
                     .accessibilityLabel("Meeting title")

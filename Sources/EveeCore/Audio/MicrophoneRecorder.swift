@@ -29,8 +29,13 @@ public final class MicrophoneRecorder: ObservableObject {
     private let writeErrors = AudioWriteErrorState()
     private var file: AVAudioFile?
     private var outputURL: URL?
+    private let bufferRelay = AudioBufferRelay()
 
     public init() {}
+
+    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        bufferRelay.set(handler)
+    }
 
     public static var isPermissionGranted: Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
@@ -68,6 +73,7 @@ public final class MicrophoneRecorder: ObservableObject {
         let output = try AVAudioFile(forWriting: url, settings: format.settings)
         writeErrors.reset()
         let writeErrors = self.writeErrors
+        let bufferRelay = self.bufferRelay
         input.installTap(onBus: 0, bufferSize: lowLatency ? 256 : 1_024, format: format) { [weak self] buffer, _ in
             do {
                 try output.write(from: buffer)
@@ -81,6 +87,7 @@ public final class MicrophoneRecorder: ObservableObject {
             for index in 0..<count { sum += channel[index] * channel[index] }
             let rms = sqrt(sum / Float(count))
             Task { @MainActor in self?.level = min(1, rms * 14) }
+            bufferRelay.publishCopy(of: buffer)
         }
 
         do {

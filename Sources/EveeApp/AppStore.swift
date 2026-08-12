@@ -48,6 +48,8 @@ final class AppStore: ObservableObject {
     @Published private(set) var meetingDiarizationReady = false
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
     @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
+    @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
+    @Published private(set) var liveMeetingStatus: String?
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
@@ -85,6 +87,8 @@ final class AppStore: ObservableObject {
     private var meetingDraftCaptureID: UUID?
     private var didBootstrap = false
     private var webhookRetryTask: Task<Void, Never>?
+    private var liveMeetingTranscriber: LiveMeetingTranscriber?
+    private var liveMeetingUpdateTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -233,6 +237,10 @@ final class AppStore: ObservableObject {
             try await library.prepare()
             settings = try await library.loadSettings()
             try await loadAndMigrateSecrets()
+            if settings.historyRetentionDays > 0 {
+                let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
+                _ = try await library.purgeRecords(olderThan: cutoff)
+            }
             records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
             try await library.reconcileAudioStorage()
             if let draft = try await library.loadMeetingDraft() {
@@ -274,6 +282,15 @@ final class AppStore: ObservableObject {
                 await cancelWebhookOutbox()
             }
             try await library.save(settings)
+            if settings.historyRetentionDays > 0 {
+                let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
+                let removed = try await library.purgeRecords(olderThan: cutoff)
+                if removed > 0 {
+                    records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
+                    if let selectedRecordID, !records.contains(where: { $0.id == selectedRecordID }) { self.selectedRecordID = nil }
+                    statusMessage = "Removed \(removed) \(removed == 1 ? "record" : "records") outside the retention window."
+                }
+            }
             transcriber?.unload()
             transcriber = try TranscriberFactory.make(settings.model)
             modelReady = transcriber?.isDownloaded == true
@@ -460,6 +477,7 @@ final class AppStore: ObservableObject {
         }
 
         do {
+            if activeKind == .meeting { await startLiveMeetingTranscription() }
             _ = try await library.beginRecoveryCapture(kind: activeKind, id: sessionID)
             let directory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
             activeRecoveryID = sessionID
@@ -548,6 +566,7 @@ final class AppStore: ObservableObject {
                 }
                 isSystemAudioActive = false
             }
+            if activeKind == .meeting { await stopLiveMeetingTranscription() }
 
             guard let recoveryID = activeRecoveryID else {
                 throw NSError(domain: "Evee.Recovery", code: 1, userInfo: [NSLocalizedDescriptionKey: "The capture recovery session is unavailable."])
@@ -665,6 +684,7 @@ final class AppStore: ObservableObject {
             try? await systemAudioRecorder.stop()
             isSystemAudioActive = false
         }
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -806,6 +826,7 @@ final class AppStore: ObservableObject {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -819,6 +840,7 @@ final class AppStore: ObservableObject {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         isSystemAudioActive = false
 
         let recoveryPath = activeAudioURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil }
@@ -869,6 +891,8 @@ final class AppStore: ObservableObject {
         systemTrackStartedAt = nil
         isSystemAudioActive = false
         stopRequestedDuringStart = nil
+        recorder.setBufferHandler(nil)
+        systemAudioRecorder.setBufferHandler(nil)
     }
 
     var hasMeetingDraft: Bool {
@@ -1010,6 +1034,54 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func startLiveMeetingTranscription() async {
+        liveMeetingTranscript = []
+        liveMeetingStatus = nil
+        guard settings.liveMeetingTranscriptionEnabled else { return }
+        guard settings.model == .parakeet else {
+            liveMeetingStatus = "Live transcript preview requires the Parakeet model; the saved meeting will still be transcribed after recording."
+            return
+        }
+        let live = LiveMeetingTranscriber()
+        do {
+            try await live.start(includeSystem: settings.meetingCaptureEnabled)
+            liveMeetingTranscriber = live
+            recorder.setBufferHandler { [weak live] buffer in
+                Task { await live?.acceptMicrophone(buffer) }
+            }
+            systemAudioRecorder.setBufferHandler { [weak live] buffer in
+                Task { await live?.acceptSystem(buffer) }
+            }
+            liveMeetingStatus = "Live local transcript is active. Final text is rebuilt from the saved tracks after you stop."
+            liveMeetingUpdateTask = Task { @MainActor [weak self] in
+                for await update in live.updates {
+                    guard let self, !Task.isCancelled else { return }
+                    if update.isConfirmed {
+                        self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
+                    } else {
+                        self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
+                    }
+                    self.liveMeetingTranscript.append(update)
+                    if self.liveMeetingTranscript.count > 100 {
+                        self.liveMeetingTranscript.removeFirst(self.liveMeetingTranscript.count - 100)
+                    }
+                }
+            }
+        } catch {
+            liveMeetingStatus = "Live transcript preview is unavailable: \(error.localizedDescription). Recording and final transcription will continue."
+            await live.stop()
+        }
+    }
+
+    private func stopLiveMeetingTranscription() async {
+        recorder.setBufferHandler(nil)
+        systemAudioRecorder.setBufferHandler(nil)
+        if let liveMeetingTranscriber { await liveMeetingTranscriber.stop() }
+        liveMeetingUpdateTask?.cancel()
+        liveMeetingUpdateTask = nil
+        liveMeetingTranscriber = nil
+    }
+
     func update(_ record: WorkspaceRecord) async {
         do {
             var changed = record
@@ -1037,6 +1109,22 @@ final class AppStore: ObservableObject {
             records.removeAll { $0.id == record.id }
             if selectedRecordID == record.id { selectedRecordID = nil }
         } catch { statusMessage = error.localizedDescription }
+    }
+
+    func exportWorkspace(format: WorkspaceExportFormat) async {
+        let panel = NSSavePanel()
+        panel.title = "Export Evee workspace"
+        panel.nameFieldStringValue = "Evee Workspace.\(format.fileExtension)"
+        panel.allowedFileTypes = [format.fileExtension]
+        panel.canCreateDirectories = true
+        guard await panel.begin() == .OK, let destination = panel.url else { return }
+        do {
+            let data = try WorkspaceExporter.data(for: records, format: format)
+            try data.write(to: destination, options: .atomic)
+            statusMessage = "Exported \(records.count) \(records.count == 1 ? "record" : "records") as \(format.title)."
+        } catch {
+            statusMessage = "The workspace could not be exported: \(error.localizedDescription)"
+        }
     }
 
     private func loadAndMigrateSecrets() async throws {

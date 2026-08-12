@@ -477,6 +477,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var retainMeetingAudio = false
     public var meetingCaptureEnabled = false
     public var meetingDiarizationEnabled = false
+    public var liveMeetingTranscriptionEnabled = true
     public var localAPIEnabled = false
     public var localAPIPort: UInt16 = 4739
     public var webhookURL = ""
@@ -495,16 +496,18 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var emailSignOff = ""
     public var learnCorrections = false
     public var smartLinks: [SmartLink] = []
+    /// Zero keeps records until they are deleted manually.
+    public var historyRetentionDays = 0
     public var dictionary: [DictionaryTerm] = []
     public var appStyles: [AppWritingStyle] = []
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled
+        case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled, liveMeetingTranscriptionEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
         case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled
-        case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks
+        case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks, historyRetentionDays
     }
 
     public init(from decoder: Decoder) throws {
@@ -516,6 +519,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         retainMeetingAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMeetingAudio) ?? false
         meetingCaptureEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingCaptureEnabled) ?? false
         meetingDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingDiarizationEnabled) ?? false
+        liveMeetingTranscriptionEnabled = try values.decodeIfPresent(Bool.self, forKey: .liveMeetingTranscriptionEnabled) ?? true
         localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
         localAPIPort = try values.decodeIfPresent(UInt16.self, forKey: .localAPIPort) ?? 4_739
         webhookURL = try values.decodeIfPresent(String.self, forKey: .webhookURL) ?? ""
@@ -532,6 +536,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         emailSignOff = try values.decodeIfPresent(String.self, forKey: .emailSignOff) ?? ""
         learnCorrections = try values.decodeIfPresent(Bool.self, forKey: .learnCorrections) ?? false
         smartLinks = try values.decodeIfPresent([SmartLink].self, forKey: .smartLinks) ?? []
+        historyRetentionDays = try values.decodeIfPresent(Int.self, forKey: .historyRetentionDays) ?? 0
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
     }
@@ -545,6 +550,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(retainMeetingAudio, forKey: .retainMeetingAudio)
         try values.encode(meetingCaptureEnabled, forKey: .meetingCaptureEnabled)
         try values.encode(meetingDiarizationEnabled, forKey: .meetingDiarizationEnabled)
+        try values.encode(liveMeetingTranscriptionEnabled, forKey: .liveMeetingTranscriptionEnabled)
         try values.encode(localAPIEnabled, forKey: .localAPIEnabled)
         try values.encode(localAPIPort, forKey: .localAPIPort)
         try values.encode(webhookURL, forKey: .webhookURL)
@@ -560,6 +566,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(emailSignOff, forKey: .emailSignOff)
         try values.encode(learnCorrections, forKey: .learnCorrections)
         try values.encode(smartLinks, forKey: .smartLinks)
+        try values.encode(historyRetentionDays, forKey: .historyRetentionDays)
         try values.encode(dictionary, forKey: .dictionary)
         try values.encode(appStyles, forKey: .appStyles)
         // webhookSecret is deliberately omitted. It exists in CodingKeys only so

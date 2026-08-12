@@ -250,6 +250,26 @@ public actor LibraryStore {
         try? reconcileRecordAudio(using: records)
     }
 
+    @discardableResult
+    public func purgeRecords(olderThan cutoff: Date) throws -> Int {
+        let records = try loadRecords()
+        let removed = records.filter { $0.createdAt < cutoff }
+        guard !removed.isEmpty else { return 0 }
+        let retained = records.filter { $0.createdAt >= cutoff }
+
+        // Commit metadata first so an interrupted purge can leave only harmless
+        // orphaned audio, never records pointing at files we already removed.
+        try save(retained)
+        let paths = removed.flatMap { record in
+            [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
+        }
+        for relativePath in Set(paths) {
+            if let url = try? safeURL(forRelativePath: relativePath) { try? FileManager.default.removeItem(at: url) }
+        }
+        try? reconcileRecordAudio(using: retained)
+        return removed.count
+    }
+
     // MARK: - Durable dual-track audio and crash recovery
 
     @discardableResult

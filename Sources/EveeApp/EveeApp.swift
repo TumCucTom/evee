@@ -173,6 +173,7 @@ private final class CaptureOverlayController {
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.sharingType = .none
         self.panel = panel
         return panel
     }
