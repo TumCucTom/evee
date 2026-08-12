@@ -10,7 +10,7 @@ struct OnboardingView: View {
             LinearGradient(colors: [AnimaTheme.paper, AnimaTheme.cloud.opacity(0.74)], startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea()
             Circle().stroke(AnimaTheme.violet.opacity(0.10), lineWidth: 2).frame(width: 620, height: 620).offset(x: 330, y: -250).accessibilityHidden(true)
             VStack(spacing: 22) {
-                HStack(spacing: 12) { AlphaMark(size: 48); Text("Evee").font(.system(size: 35, weight: .bold)).foregroundStyle(AnimaTheme.aubergine) }
+                HStack(spacing: 12) { EveeMark(size: 48); Text("Evee").font(.system(size: 35, weight: .bold)).foregroundStyle(AnimaTheme.aubergine) }
                 VStack(spacing: 8) {
                     Text("Speak naturally. Stay in flow.").font(.system(size: 30, weight: .bold)).tracking(-0.7)
                     Text("Private dictation, meetings and voice memory. Everything runs on your Mac.")

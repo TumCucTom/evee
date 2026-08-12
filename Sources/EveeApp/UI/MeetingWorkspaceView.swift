@@ -129,7 +129,7 @@ struct MeetingWorkspaceView: View {
 
     private var isProcessingMeeting: Bool {
         guard store.captureKind == .meeting else { return false }
-        switch store.captureState {
+        return switch store.captureState {
         case .transcribing, .delivering: true
         default: false
         }

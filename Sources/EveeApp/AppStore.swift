@@ -158,7 +158,7 @@ final class AppStore: ObservableObject {
     func beginDictation() async {
         guard captureLifecycle == .idle else { return }
         refreshPermissionState()
-        guard microphonePermissionGranted else {
+        if !microphonePermissionGranted {
             await requestMicrophonePermission()
             guard microphonePermissionGranted else {
                 statusMessage = AudioCaptureError.microphoneDenied.localizedDescription
