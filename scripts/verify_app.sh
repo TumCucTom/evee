@@ -15,7 +15,8 @@ test -f "$contents/Resources/Evee.icns"
 plutil -lint "$contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
 entitlements_plist="$(mktemp)"
-codesign -d --entitlements "$entitlements_plist" "$app_dir"
+codesign -d --entitlements :- --xml "$app_dir" >"$entitlements_plist" 2>/dev/null
+/usr/bin/plutil -lint "$entitlements_plist"
 audio_entitlement="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$entitlements_plist")"
 test "$audio_entitlement" = "true"
 

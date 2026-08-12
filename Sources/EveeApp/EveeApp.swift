@@ -129,7 +129,7 @@ private final class CaptureOverlayController {
         }
         guard let message else { return }
         NSAccessibility.post(
-            element: NSApp,
+            element: NSApplication.shared,
             notification: .announcementRequested,
             userInfo: [
                 .announcement: message,
