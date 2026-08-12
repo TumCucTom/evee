@@ -198,4 +198,35 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: retainedURL.path))
         try? FileManager.default.removeItem(at: root)
     }
+
+    func testReconciliationHonoursCommittedRecoveryOwnership() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
+        try Data("audio".utf8).write(to: input)
+        let store = LibraryStore(rootURL: root)
+        let recovery = try await store.beginRecoveryCapture(kind: .dictation)
+        _ = try await store.addRecoveryTrack(captureID: recovery.id, kind: .dictation, role: .microphone, sourceURL: input)
+        let record = WorkspaceRecord(kind: .dictation, title: "Committed", text: "Saved", recoverySourceID: recovery.id)
+        try await store.upsert(record)
+
+        try await store.reconcileAudioStorage()
+        let remaining = try await store.recoverableCaptures()
+        XCTAssertFalse(remaining.contains(where: { $0.id == recovery.id }))
+        XCTAssertNotNil(try await store.record(id: record.id))
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testPurgingRecoveryIsRemovedOnLaunchReconciliation() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
+        try Data("private audio".utf8).write(to: input)
+        let store = LibraryStore(rootURL: root)
+        let recovery = try await store.beginRecoveryCapture(kind: .memo)
+        _ = try await store.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: input)
+        try await store.updateRecoveryCapture(id: recovery.id, status: .purging)
+
+        try await store.reconcileAudioStorage()
+        XCTAssertFalse(try await store.recoverableCaptures().contains(where: { $0.id == recovery.id }))
+        try? FileManager.default.removeItem(at: root)
+    }
 }

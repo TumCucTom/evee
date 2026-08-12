@@ -91,6 +91,7 @@ struct SettingsView: View {
 
             Section("Privacy and storage") {
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
+                Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
                 Text("Transcripts and preferences stay under Application Support/Evee. Audio retention is off by default. Failed and discarded captures are cleaned from recovery storage.")
                     .font(.caption)

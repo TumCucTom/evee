@@ -330,6 +330,7 @@ public actor LibraryStore {
         }
 
         let capture = try recoverableCaptures().first { $0.id == recoveryID }
+        record.recoverySourceID = recoveryID
         let recoveryDirectory = recoveryURL.appendingPathComponent(recoveryID.uuidString, isDirectory: true)
         var moves: [(source: URL, destination: URL)] = []
 
@@ -349,7 +350,9 @@ public actor LibraryStore {
                         if FileManager.default.fileExists(atPath: destination.path) {
                             try FileManager.default.removeItem(at: destination)
                         }
-                        try FileManager.default.moveItem(at: source, to: destination)
+                        // Copy first: the recovery capture remains the crash-safe source of
+                        // truth until record metadata has durably committed.
+                        try FileManager.default.copyItem(at: source, to: destination)
                         moves.append((source, destination))
                     }
                     try makePrivate(destination)
@@ -360,19 +363,28 @@ public actor LibraryStore {
                 record.audioTracks = retained
                 record.audioRelativePath = retained.first(where: { $0.role == .microphone })?.relativePath
                 try upsert(record)
+                try updateRecoveryCapture(id: recoveryID, status: .committed)
             } catch {
                 for move in moves.reversed() where FileManager.default.fileExists(atPath: move.destination.path) {
-                    try? FileManager.default.moveItem(at: move.destination, to: move.source)
+                    try? FileManager.default.removeItem(at: move.destination)
                 }
                 throw error
             }
         } else {
-            try upsert(record)
+            // Persist a purge intent before metadata. A restart can now honour the
+            // user's no-retention choice even if the process dies before cleanup.
+            do {
+                try updateRecoveryCapture(id: recoveryID, status: .purging)
+                try upsert(record)
+            } catch {
+                try? updateRecoveryCapture(id: recoveryID, status: .captured, failureReason: error.localizedDescription)
+                throw error
+            }
         }
 
         // Metadata now owns the result (or intentionally owns no audio), so the
         // recovery copy is safe to remove. Failed cleanup is reconciled on launch.
-        try? FileManager.default.removeItem(at: recoveryDirectory)
+        try FileManager.default.removeItem(at: recoveryDirectory)
         return record
     }
 
@@ -384,7 +396,9 @@ public actor LibraryStore {
     }
 
     public func reconcileAudioStorage() throws {
-        try reconcileRecordAudio(using: loadRecords())
+        let records = try loadRecords()
+        try reconcileRecordAudio(using: records)
+        try reconcileRecoveryAudio(using: records)
     }
 
     public func safeURL(forRelativePath relativePath: String) throws -> URL {
@@ -434,6 +448,21 @@ public actor LibraryStore {
                UUID(uuidString: child.lastPathComponent) != nil,
                !ownedIDs.contains(child.lastPathComponent) {
                 try? FileManager.default.removeItem(at: child)
+            }
+        }
+    }
+
+    private func reconcileRecoveryAudio(using records: [WorkspaceRecord]) throws {
+        guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
+        let directories = try FileManager.default.contentsOfDirectory(
+            at: recoveryURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        for directory in directories where (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+            guard let manifest = try? readRecoveryManifest(directory: directory) else { continue }
+            if manifest.status == .committed || manifest.status == .purging || records.contains(where: { $0.recoverySourceID == manifest.id }) {
+                try FileManager.default.removeItem(at: directory)
             }
         }
     }

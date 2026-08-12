@@ -42,6 +42,8 @@ public enum CaptureRecoveryStatus: String, Codable, Sendable {
     case captured
     case processing
     case failed
+    case committed
+    case purging
 }
 
 public struct CaptureRecoveryManifest: Identifiable, Codable, Hashable, Sendable {
@@ -157,6 +159,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     public var notes: String
     public var tags: [String]
     public var webhookDeliveries: [WebhookDelivery]
+    public var recoverySourceID: UUID?
 
     public init(
         id: UUID = UUID(),
@@ -173,7 +176,8 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         segments: [TranscriptSegment] = [],
         notes: String = "",
         tags: [String] = [],
-        webhookDeliveries: [WebhookDelivery] = []
+        webhookDeliveries: [WebhookDelivery] = [],
+        recoverySourceID: UUID? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -190,11 +194,12 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         self.notes = notes
         self.tags = tags
         self.webhookDeliveries = webhookDeliveries
+        self.recoverySourceID = recoverySourceID
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, createdAt, updatedAt, title, text, rawText, sourceApplication
-        case audioRelativePath, audioTracks, duration, segments, notes, tags, webhookDeliveries
+        case audioRelativePath, audioTracks, duration, segments, notes, tags, webhookDeliveries, recoverySourceID
     }
 
     public init(from decoder: Decoder) throws {
@@ -214,6 +219,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         notes = try values.decodeIfPresent(String.self, forKey: .notes) ?? ""
         tags = try values.decodeIfPresent([String].self, forKey: .tags) ?? []
         webhookDeliveries = try values.decodeIfPresent([WebhookDelivery].self, forKey: .webhookDeliveries) ?? []
+        recoverySourceID = try values.decodeIfPresent(UUID.self, forKey: .recoverySourceID)
     }
 }
 
@@ -268,6 +274,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var model: SpeechModel = .parakeet
     public var languageCode = "auto"
     public var retainDictationAudio = false
+    public var retainMemoAudio = true
     public var retainMeetingAudio = false
     public var meetingCaptureEnabled = false
     public var localAPIEnabled = false
@@ -283,7 +290,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case model, languageCode, retainDictationAudio, retainMeetingAudio, meetingCaptureEnabled
+        case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
     }
 
@@ -292,6 +299,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         model = try values.decodeIfPresent(SpeechModel.self, forKey: .model) ?? .parakeet
         languageCode = try values.decodeIfPresent(String.self, forKey: .languageCode) ?? "auto"
         retainDictationAudio = try values.decodeIfPresent(Bool.self, forKey: .retainDictationAudio) ?? false
+        retainMemoAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMemoAudio) ?? true
         retainMeetingAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMeetingAudio) ?? false
         meetingCaptureEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingCaptureEnabled) ?? false
         localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
@@ -308,6 +316,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(model, forKey: .model)
         try values.encode(languageCode, forKey: .languageCode)
         try values.encode(retainDictationAudio, forKey: .retainDictationAudio)
+        try values.encode(retainMemoAudio, forKey: .retainMemoAudio)
         try values.encode(retainMeetingAudio, forKey: .retainMeetingAudio)
         try values.encode(meetingCaptureEnabled, forKey: .meetingCaptureEnabled)
         try values.encode(localAPIEnabled, forKey: .localAPIEnabled)

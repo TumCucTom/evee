@@ -181,7 +181,6 @@ final class AppStore: ObservableObject {
                 api.stop()
                 localAPICredentials = nil
             }
-            statusMessage = "Settings saved."
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -258,6 +257,11 @@ final class AppStore: ObservableObject {
 
     func beginMeeting() async {
         guard captureLifecycle == .idle else { return }
+        if meetingDraftCaptureID != nil {
+            statusMessage = "An interrupted meeting draft is still open. Recover or discard it before starting another meeting."
+            route = .meetings
+            return
+        }
         activeApplication = nil
         activeKind = .meeting
         await beginCapture(prefix: "meeting")
@@ -464,7 +468,11 @@ final class AppStore: ObservableObject {
     private func completeRecord(sessionID: UUID, raw: String, polished: String, segments: [TranscriptSegment]) async throws {
         guard captureLifecycle == .finishing(sessionID) else { return }
         let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
-        let keepAudio = activeKind == .meeting ? settings.retainMeetingAudio : settings.retainDictationAudio
+        let keepAudio = switch activeKind {
+        case .dictation: settings.retainDictationAudio
+        case .meeting: settings.retainMeetingAudio
+        case .memo: settings.retainMemoAudio
+        }
         let recordKind = activeKind
         let title: String = switch activeKind {
         case .dictation: String(polished.prefix(72))
@@ -606,6 +614,10 @@ final class AppStore: ObservableObject {
 
     func recover(_ capture: CaptureRecoveryManifest) async {
         guard captureLifecycle == .idle else { return }
+        if capture.kind == .meeting, let draftID = meetingDraftCaptureID, draftID != capture.id {
+            statusMessage = "These notes belong to a different interrupted meeting. Recover or discard that meeting first."
+            return
+        }
         guard let microphoneTrack = capture.tracks.first(where: { $0.role == .microphone }) else {
             statusMessage = "This recovery does not contain a microphone recording. You can discard it if the source audio is no longer available."
             return
