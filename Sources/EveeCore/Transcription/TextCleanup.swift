@@ -27,6 +27,12 @@ public struct TextCleanupPipeline: Sendable {
                 .replacingOccurrences(of: "basically ", with: "", options: .caseInsensitive)
         }
 
+        if tone == .professional {
+            text = professionalStyle(text)
+        } else if tone == .casual {
+            text = casualStyle(text)
+        }
+
         if useParagraphs {
             text = text.replacingOccurrences(of: " new paragraph ", with: "\n\n", options: .caseInsensitive)
         }
@@ -35,6 +41,36 @@ public struct TextCleanupPipeline: Sendable {
             text.append(".")
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func professionalStyle(_ input: String) -> String {
+        let replacements = [
+            (#"(?i)\bI'm\b"#, "I am"),
+            (#"(?i)\bI'll\b"#, "I will"),
+            (#"(?i)\bwe're\b"#, "we are"),
+            (#"(?i)\bwe'll\b"#, "we will"),
+            (#"(?i)\bcan't\b"#, "cannot"),
+            (#"(?i)\bwon't\b"#, "will not"),
+            (#"(?i)\bdon't\b"#, "do not"),
+            (#"(?i)\bkind of\b"#, "somewhat"),
+            (#"(?i)\bsort of\b"#, "somewhat"),
+        ]
+        return replacements.reduce(input) { result, item in
+            result.replacingOccurrences(of: item.0, with: item.1, options: .regularExpression)
+        }
+    }
+
+    private func casualStyle(_ input: String) -> String {
+        let replacements = [
+            (#"(?i)\bI would like to\b"#, "I'd like to"),
+            (#"(?i)\bwe are\b"#, "we're"),
+            (#"(?i)\bwe will\b"#, "we'll"),
+            (#"(?i)\bcannot\b"#, "can't"),
+            (#"(?i)\bdo not\b"#, "don't"),
+        ]
+        return replacements.reduce(input) { result, item in
+            result.replacingOccurrences(of: item.0, with: item.1, options: .regularExpression)
+        }
     }
 
     private func removeFillers(_ input: String) -> String {

@@ -64,6 +64,8 @@ final class AppStore: ObservableObject {
     private var activeOperation: WorkspaceRecordOperation = .capture
     private var activeSelectedText: String?
     private var captureStartedAt: Date?
+    private var microphoneTrackStartedAt: Date?
+    private var systemTrackStartedAt: Date?
     private var cancellables = Set<AnyCancellable>()
     private var pushToTalkHeld = false
     private var transformShortcutHeld = false
@@ -72,6 +74,7 @@ final class AppStore: ObservableObject {
     private var shortcutTask: Task<Void, Never>?
     private var meetingDraftCaptureID: UUID?
     private var didBootstrap = false
+    private var webhookRetryTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -409,6 +412,7 @@ final class AppStore: ObservableObject {
             await refreshRecoverableCaptures()
             let url = directory.appendingPathComponent("microphone.caf")
             activeAudioURL = url
+            microphoneTrackStartedAt = .now
             try await recorder.start(at: url)
 
             guard captureLifecycle == .starting(sessionID) else {
@@ -416,10 +420,11 @@ final class AppStore: ObservableObject {
                 return
             }
 
-            if activeKind == .meeting {
+            if activeKind == .meeting && settings.meetingCaptureEnabled {
                 let systemURL = directory.appendingPathComponent("system.m4a")
                 activeSystemAudioURL = systemURL
                 do {
+                    systemTrackStartedAt = .now
                     try await systemAudioRecorder.start(at: systemURL)
                     guard captureLifecycle == .starting(sessionID) else {
                         await cleanUpCancelledStart(sessionID: sessionID)
@@ -432,9 +437,14 @@ final class AppStore: ObservableObject {
                         return
                     }
                     activeSystemAudioURL = nil
+                    systemTrackStartedAt = nil
                     isSystemAudioActive = false
                     statusMessage = "Meeting capture is using your microphone only. Enable Screen Recording permission to include everyone else."
                 }
+            } else if activeKind == .meeting {
+                activeSystemAudioURL = nil
+                systemTrackStartedAt = nil
+                isSystemAudioActive = false
             }
 
             let startedAt = Date.now
@@ -516,15 +526,25 @@ final class AppStore: ObservableObject {
 
             var raw = microphoneTranscript.text
             var segments: [TranscriptSegment] = activeKind == .meeting
-                ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil)
+                ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil, microphoneOffset: microphoneOffset)
                 : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
             if activeKind == .meeting,
                let systemURL = activeSystemAudioURL,
-               FileManager.default.fileExists(atPath: systemURL.path),
-               let systemTranscript = try? await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode) {
+               FileManager.default.fileExists(atPath: systemURL.path) {
+                let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
                 guard captureLifecycle == .finishing(sessionID) else { return }
                 raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
-                segments = MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: systemTranscript)
+                let speakerIntervals = settings.meetingDiarizationEnabled
+                    ? try await FluidOfflineMeetingDiarizer().diarize(fileURL: systemURL)
+                    : []
+                segments = MeetingTranscriptAssembler().assemble(
+                    microphone: microphoneTranscript,
+                    system: systemTranscript,
+                    systemSpeakerIntervals: speakerIntervals,
+                    microphoneOffset: microphoneOffset,
+                    systemOffset: systemOffset
+                )
+                raw = chronologicalTranscript(segments)
             }
             let polished: String
             if activeOperation == .selectionTransform {
@@ -773,6 +793,8 @@ final class AppStore: ObservableObject {
         activeOperation = .capture
         activeSelectedText = nil
         captureStartedAt = nil
+        microphoneTrackStartedAt = nil
+        systemTrackStartedAt = nil
         isSystemAudioActive = false
         stopRequestedDuringStart = nil
     }
@@ -823,11 +845,23 @@ final class AppStore: ObservableObject {
                 : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
             if capture.kind == .meeting,
                let systemURL = activeSystemAudioURL,
-               FileManager.default.fileExists(atPath: systemURL.path),
-               let systemTranscript = try? await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode) {
+               FileManager.default.fileExists(atPath: systemURL.path) {
+                let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
                 guard captureLifecycle == .finishing(sessionID) else { return }
                 raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
-                segments = MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: systemTranscript)
+                let speakerIntervals = settings.meetingDiarizationEnabled
+                    ? try await FluidOfflineMeetingDiarizer().diarize(fileURL: systemURL)
+                    : []
+                let microphoneOffset = recoveryOffset(for: microphoneTrack, in: capture)
+                let systemOffset = capture.tracks.first(where: { $0.role == .system }).map { recoveryOffset(for: $0, in: capture) } ?? 0
+                segments = MeetingTranscriptAssembler().assemble(
+                    microphone: microphoneTranscript,
+                    system: systemTranscript,
+                    systemSpeakerIntervals: speakerIntervals,
+                    microphoneOffset: microphoneOffset,
+                    systemOffset: systemOffset
+                )
+                raw = chronologicalTranscript(segments)
             }
 
             let polished = cleanup.clean(
@@ -1000,6 +1034,7 @@ final class AppStore: ObservableObject {
             record.updatedAt = .now
             try await library.upsert(record)
             replaceRecord(record)
+            scheduleWebhookRetry()
         } catch {
             statusMessage = "Webhook delivery failed and its outbox state could not be saved: \(error.localizedDescription)"
         }
@@ -1015,6 +1050,46 @@ final class AppStore: ObservableObject {
         for (recordID, deliveryID) in queued {
             await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
         }
+        scheduleWebhookRetry()
+    }
+
+    private func scheduleWebhookRetry() {
+        webhookRetryTask?.cancel()
+        let nextDate = records
+            .flatMap(\.webhookDeliveries)
+            .filter { $0.state == .failed && $0.retryable }
+            .compactMap(\.nextAttemptAt)
+            .min()
+        guard let nextDate else { webhookRetryTask = nil; return }
+        webhookRetryTask = Task { [weak self] in
+            let delay = max(0, nextDate.timeIntervalSinceNow)
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            await self?.retryPendingWebhookDeliveries()
+        }
+    }
+
+    private var microphoneOffset: TimeInterval {
+        guard let microphoneTrackStartedAt else { return 0 }
+        let commonStart = [microphoneTrackStartedAt, systemTrackStartedAt].compactMap { $0 }.min() ?? microphoneTrackStartedAt
+        return max(0, microphoneTrackStartedAt.timeIntervalSince(commonStart))
+    }
+
+    private var systemOffset: TimeInterval {
+        guard let systemTrackStartedAt else { return 0 }
+        let commonStart = [microphoneTrackStartedAt, systemTrackStartedAt].compactMap { $0 }.min() ?? systemTrackStartedAt
+        return max(0, systemTrackStartedAt.timeIntervalSince(commonStart))
+    }
+
+    private func recoveryOffset(for track: WorkspaceAudioTrack, in capture: CaptureRecoveryManifest) -> TimeInterval {
+        max(0, track.createdAt.timeIntervalSince(capture.startedAt))
+    }
+
+    private func chronologicalTranscript(_ segments: [TranscriptSegment]) -> String {
+        segments.sorted { $0.start < $1.start }.map { segment in
+            if let speaker = segment.speaker { return "\(speaker): \(segment.text)" }
+            return segment.text
+        }.joined(separator: "\n\n")
     }
 
     func retryWebhookDeliveriesNow() async {

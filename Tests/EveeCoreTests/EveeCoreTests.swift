@@ -31,6 +31,12 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(TextCleanupPipeline().clean("um keep this", tone: .verbatim), "um keep this")
     }
 
+    func testProfessionalAndCasualStylesHaveDistinctDeterministicOutput() {
+        let pipeline = TextCleanupPipeline()
+        XCTAssertEqual(pipeline.clean("I'm sure we can't do that", tone: .professional), "I am sure we cannot do that.")
+        XCTAssertEqual(pipeline.clean("I would like to confirm we are ready", tone: .casual), "I'd like to confirm we're ready.")
+    }
+
     func testLegacyLibraryMigratesWithoutLosingRecords() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

@@ -40,6 +40,18 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertEqual(segments[0].timingSource, .trackEstimate)
     }
 
+    func testNormalizedTokenLeadingSpacesRemainWordBoundaries() {
+        let timings = [
+            TranscriptTokenTiming(token: "Hello", start: 0, end: 0.3),
+            TranscriptTokenTiming(token: " world", start: 0.31, end: 0.7),
+            TranscriptTokenTiming(token: ".", start: 0.7, end: 0.75),
+        ]
+
+        let segments = TokenTimingSegmenter().segments(transcriptText: "Hello world.", duration: 0.75, timings: timings)
+
+        XCTAssertEqual(segments.first?.text, "Hello world.")
+    }
+
     func testAssemblerAlignsTracksAndUsesAnonymousSpeakerClusters() {
         let microphone = LocalTranscript(
             text: "Welcome",

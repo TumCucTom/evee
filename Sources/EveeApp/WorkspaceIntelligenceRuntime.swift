@@ -43,13 +43,20 @@ final class WorkspaceIntelligenceRuntime {
     private func captureCurrentApplication() {
         guard let application = NSWorkspace.shared.frontmostApplication,
               let name = application.localizedName else { return }
-        let title = frontmostWindowTitle(processIdentifier: application.processIdentifier)
-        let observation = WorkspaceApplicationObservation(
-            bundleIdentifier: application.bundleIdentifier,
-            applicationName: name,
-            windowTitle: title
-        )
-        Task { try? await store.record(observation) }
+        let bundleIdentifier = application.bundleIdentifier
+        let processIdentifier = application.processIdentifier
+        Task {
+            guard let preferences = try? await store.preferences(), preferences.isEnabled else { return }
+            let title = preferences.includeWindowTitles
+                ? frontmostWindowTitle(processIdentifier: processIdentifier)
+                : nil
+            let observation = WorkspaceApplicationObservation(
+                bundleIdentifier: bundleIdentifier,
+                applicationName: name,
+                windowTitle: title
+            )
+            try? await store.record(observation)
+        }
     }
 
     private func frontmostWindowTitle(processIdentifier: pid_t) -> String? {

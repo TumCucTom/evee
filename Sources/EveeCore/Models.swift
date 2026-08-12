@@ -410,6 +410,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var retainMemoAudio = true
     public var retainMeetingAudio = false
     public var meetingCaptureEnabled = false
+    public var meetingDiarizationEnabled = false
     public var localAPIEnabled = false
     public var localAPIPort: UInt16 = 4739
     public var webhookURL = ""
@@ -426,7 +427,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled
+        case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
         case textDeliveryMode, retainContextMetadata, retainSelectedText
     }
@@ -439,6 +440,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         retainMemoAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMemoAudio) ?? true
         retainMeetingAudio = try values.decodeIfPresent(Bool.self, forKey: .retainMeetingAudio) ?? false
         meetingCaptureEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingCaptureEnabled) ?? false
+        meetingDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingDiarizationEnabled) ?? false
         localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
         localAPIPort = try values.decodeIfPresent(UInt16.self, forKey: .localAPIPort) ?? 4_739
         webhookURL = try values.decodeIfPresent(String.self, forKey: .webhookURL) ?? ""
@@ -459,6 +461,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(retainMemoAudio, forKey: .retainMemoAudio)
         try values.encode(retainMeetingAudio, forKey: .retainMeetingAudio)
         try values.encode(meetingCaptureEnabled, forKey: .meetingCaptureEnabled)
+        try values.encode(meetingDiarizationEnabled, forKey: .meetingDiarizationEnabled)
         try values.encode(localAPIEnabled, forKey: .localAPIEnabled)
         try values.encode(localAPIPort, forKey: .localAPIPort)
         try values.encode(webhookURL, forKey: .webhookURL)

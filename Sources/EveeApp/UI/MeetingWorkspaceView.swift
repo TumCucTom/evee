@@ -67,7 +67,7 @@ struct MeetingWorkspaceView: View {
                             .font(.system(size: 13, weight: .semibold))
                         Text(store.isSystemAudioActive
                              ? "Evee is capturing both sides locally. No participant or bot joins your call."
-                             : "Other speakers may be missing. Allow Screen & System Audio Recording for complete meeting capture.")
+                             : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

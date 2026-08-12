@@ -155,9 +155,9 @@ public struct TokenTimingSegmenter: Sendable {
         var result = ""
         let punctuation = CharacterSet(charactersIn: ".,!?;:%)]}")
         for raw in tokens {
+            let startsWord = raw.first?.isWhitespace == true || raw.hasPrefix("▁") || raw.hasPrefix("Ġ")
             var value = cleanedToken(raw)
             guard !value.isEmpty else { continue }
-            let startsWord = value.hasPrefix("▁") || value.hasPrefix("Ġ")
             value = value.trimmingCharacters(in: CharacterSet(charactersIn: "▁Ġ"))
             guard !value.isEmpty else { continue }
             let firstScalar = value.unicodeScalars.first
@@ -349,12 +349,20 @@ public struct MeetingTranscriptAssembler: Sendable {
     }
 
     private func anonymousSpeakerLabels(_ intervals: [SpeakerInterval]) -> [String: String] {
-        let ordered = Dictionary(grouping: intervals, by: \.speakerID)
-            .map { (id: $0.key, first: $0.value.map(\.start).min() ?? .infinity) }
-            .sorted { lhs, rhs in lhs.first == rhs.first ? lhs.id < rhs.id : lhs.first < rhs.first }
-        return Dictionary(uniqueKeysWithValues: ordered.enumerated().map { index, value in
-            (value.id, "Participant \(index + 1)")
-        })
+        let grouped: [String: [SpeakerInterval]] = Dictionary(grouping: intervals, by: \.speakerID)
+        var ordered: [(id: String, first: TimeInterval)] = []
+        for (speakerID, speakerIntervals) in grouped {
+            let first = speakerIntervals.map(\.start).min() ?? .infinity
+            ordered.append((id: speakerID, first: first))
+        }
+        ordered.sort { lhs, rhs in
+            lhs.first == rhs.first ? lhs.id < rhs.id : lhs.first < rhs.first
+        }
+        var labels: [String: String] = [:]
+        for (index, value) in ordered.enumerated() {
+            labels[value.id] = "Participant \(index + 1)"
+        }
+        return labels
     }
 
     private func bestSpeaker(

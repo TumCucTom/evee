@@ -102,12 +102,21 @@ struct SettingsView: View {
             }
 
             Section("Privacy and storage") {
+                Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
+                Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
+                    .disabled(!store.settings.meetingCaptureEnabled)
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
                 Toggle("Store app and window context with dictations", isOn: $store.settings.retainContextMetadata)
                 Toggle("Store original selected text for transforms", isOn: $store.settings.retainSelectedText)
                 Text("Context is captured in memory to guard delivery. Long-term app/window metadata and original selected text are off by default and controlled separately. Password and protected fields are never read.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("System-audio meeting capture is off by default and requires Screen & System Audio Recording permission. Audio retention is controlled separately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Anonymous speaker separation is off by default. Enabling it downloads and runs an additional local model when a meeting is processed; speaker names are never inferred.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")

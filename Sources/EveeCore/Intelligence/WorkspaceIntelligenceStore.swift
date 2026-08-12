@@ -72,6 +72,13 @@ public actor WorkspaceIntelligenceStore {
             try finishActive(at: date, preferences: preferences)
             activeObservation = observation
             activeSince = date
+        } else if let activeSince,
+                  date.timeIntervalSince(activeSince) >= preferences.minimumDwellSeconds {
+            // Checkpoint a still-active application on every sample. A hard kill
+            // can then lose only the final short interval, not the whole visit.
+            try finishActive(at: date, preferences: preferences)
+            activeObservation = observation
+            self.activeSince = date
         }
         let snapshot = WorkspaceContextSnapshot(
             capturedAt: date,
@@ -90,6 +97,7 @@ public actor WorkspaceIntelligenceStore {
 
     public func timeline(since: Date? = nil, limit: Int = 100) throws -> WorkspaceIntelligenceStatus<[WorkspaceDwellEvent]> {
         let preferences = try preferences()
+        guard preferences.isEnabled else { return WorkspaceIntelligenceStatus(enabled: false, value: []) }
         let events = try storedEvents()
             .filter { since == nil || $0.endedAt >= since! }
             .sorted { $0.startedAt > $1.startedAt }
@@ -104,6 +112,7 @@ public actor WorkspaceIntelligenceStore {
 
     public func applicationUsage(since: Date? = nil, limit: Int = 100) throws -> WorkspaceIntelligenceStatus<[WorkspaceApplicationUsage]> {
         let preferences = try preferences()
+        guard preferences.isEnabled else { return WorkspaceIntelligenceStatus(enabled: false, value: []) }
         let events = try storedEvents().filter { since == nil || $0.endedAt >= since! }
         let groups = Dictionary(grouping: events) { event in
             [event.bundleIdentifier ?? "", event.applicationName].joined(separator: "\u{1F}")
@@ -126,6 +135,9 @@ public actor WorkspaceIntelligenceStore {
 
     public func journal(limit: Int = 30) throws -> WorkspaceIntelligenceStatus<[WorkspaceJournalEntry]> {
         let preferences = try preferences()
+        guard preferences.isEnabled && preferences.journalEnabled else {
+            return WorkspaceIntelligenceStatus(enabled: false, value: [])
+        }
         let entries = try storedJournal().sorted { $0.day > $1.day }
         return WorkspaceIntelligenceStatus(
             enabled: preferences.isEnabled && preferences.journalEnabled,
@@ -174,25 +186,37 @@ public actor WorkspaceIntelligenceStore {
 
     private func rebuildJournal(events: [WorkspaceDwellEvent], generatedAt: Date) throws {
         let calendar = Calendar(identifier: .gregorian)
-        let existing = Dictionary(uniqueKeysWithValues: try storedJournal().map { (calendar.startOfDay(for: $0.day), $0.id) })
-        let grouped = Dictionary(grouping: events) { calendar.startOfDay(for: $0.startedAt) }
-        let entries = grouped.map { day, values in
-            let appGroups = Dictionary(grouping: values, by: \.applicationName)
-            let applications = appGroups.map { name, appEvents in
-                WorkspaceJournalApplication(
+        let previous = try storedJournal()
+        var existing: [Date: UUID] = [:]
+        for entry in previous { existing[calendar.startOfDay(for: entry.day)] = entry.id }
+        let grouped: [Date: [WorkspaceDwellEvent]] = Dictionary(grouping: events) {
+            calendar.startOfDay(for: $0.startedAt)
+        }
+        var entries: [WorkspaceJournalEntry] = []
+        for (day, values) in grouped {
+            let appGroups: [String: [WorkspaceDwellEvent]] = Dictionary(grouping: values, by: \.applicationName)
+            var applications: [WorkspaceJournalApplication] = []
+            for (name, appEvents) in appGroups {
+                let duration = appEvents.reduce(TimeInterval.zero) { partial, event in partial + event.duration }
+                applications.append(WorkspaceJournalApplication(
                     applicationName: name,
-                    duration: appEvents.reduce(0) { $0 + $1.duration },
+                    duration: duration,
                     visitCount: appEvents.count
-                )
-            }.sorted { $0.duration == $1.duration ? $0.applicationName < $1.applicationName : $0.duration > $1.duration }
-            return WorkspaceJournalEntry(
+                ))
+            }
+            applications.sort {
+                $0.duration == $1.duration ? $0.applicationName < $1.applicationName : $0.duration > $1.duration
+            }
+            let trackedDuration = values.reduce(TimeInterval.zero) { partial, event in partial + event.duration }
+            entries.append(WorkspaceJournalEntry(
                 id: existing[day] ?? UUID(),
                 day: day,
                 generatedAt: generatedAt,
-                trackedDuration: values.reduce(0) { $0 + $1.duration },
+                trackedDuration: trackedDuration,
                 applications: applications
-            )
-        }.sorted { $0.day > $1.day }
+            ))
+        }
+        entries.sort { $0.day > $1.day }
         try write(entries, to: journalURL)
     }
 

@@ -24,6 +24,7 @@ private struct PublicConfiguration: Codable {
     var retainDictationAudio: Bool
     var retainMeetingAudio: Bool
     var meetingCaptureEnabled: Bool
+    var meetingDiarizationEnabled: Bool
     var localAPIEnabled: Bool
     var localAPIPort: UInt16
     var webhookConfigured: Bool
@@ -154,6 +155,7 @@ enum EveeMCP {
                 retainDictationAudio: settings.retainDictationAudio,
                 retainMeetingAudio: settings.retainMeetingAudio,
                 meetingCaptureEnabled: settings.meetingCaptureEnabled,
+                meetingDiarizationEnabled: settings.meetingDiarizationEnabled,
                 localAPIEnabled: settings.localAPIEnabled,
                 localAPIPort: settings.localAPIPort,
                 webhookConfigured: !settings.webhookURL.isEmpty,

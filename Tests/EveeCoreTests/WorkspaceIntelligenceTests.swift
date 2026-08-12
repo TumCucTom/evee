@@ -70,6 +70,24 @@ final class WorkspaceIntelligenceTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testDisabledCollectionDoesNotDiscloseHistoricalActivity() async throws {
+        let (store, root) = makeStore()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.savePreferences(.init(isEnabled: true, journalEnabled: true, minimumDwellSeconds: 1), at: start)
+        try await store.record(.init(bundleIdentifier: "test.editor", applicationName: "Editor"), at: start)
+        try await store.stop(at: start.addingTimeInterval(10))
+        try await store.savePreferences(.init(isEnabled: false), at: start.addingTimeInterval(11))
+
+        let timeline = try await store.timeline()
+        let usage = try await store.applicationUsage()
+        let journal = try await store.journal()
+        XCTAssertFalse(timeline.enabled)
+        XCTAssertTrue(timeline.value.isEmpty)
+        XCTAssertTrue(usage.value.isEmpty)
+        XCTAssertTrue(journal.value.isEmpty)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     private func makeStore() -> (WorkspaceIntelligenceStore, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         return (WorkspaceIntelligenceStore(rootURL: root), root)
