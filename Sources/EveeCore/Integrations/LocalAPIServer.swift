@@ -94,7 +94,7 @@ public final class LocalAPIServer: @unchecked Sendable {
     }
 
     private func loadOrCreateToken() async throws -> String {
-        let root = await store.rootURL
+        let root = store.rootURL
         try await store.prepare()
         let url = root.appendingPathComponent("api.token")
         if let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {

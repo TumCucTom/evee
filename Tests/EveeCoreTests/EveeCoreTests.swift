@@ -15,8 +15,10 @@ final class EveeCoreTests: XCTestCase {
         let store = LibraryStore(rootURL: root)
         let record = WorkspaceRecord(kind: .meeting, title: "Scribe review", text: "Discussed transcript storage")
         try await store.upsert(record)
-        XCTAssertEqual(try await store.search("transcript").map(\.id), [record.id])
-        XCTAssertEqual(try await store.record(id: record.id)?.title, "Scribe review")
+        let matches = try await store.search("transcript")
+        let roundTripped = try await store.record(id: record.id)
+        XCTAssertEqual(matches.map(\.id), [record.id])
+        XCTAssertEqual(roundTripped?.title, "Scribe review")
         try? FileManager.default.removeItem(at: root)
     }
 
