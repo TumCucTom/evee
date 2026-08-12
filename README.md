@@ -5,9 +5,6 @@ speak, and release to insert polished text into any app. Record a meeting
 without a bot, keep searchable dictations, meetings and memos on your Mac, and
 let local agents query the workspace through MCP or the loopback API.
 
-This is an independent implementation. Resonant Community Edition was used as
-a behavioural reference; no Resonant source files or product assets are copied.
-
 ## What is implemented
 
 - System-wide push-to-talk dictation and paste
