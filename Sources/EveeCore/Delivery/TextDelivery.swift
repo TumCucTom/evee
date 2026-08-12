@@ -149,6 +149,7 @@ public enum TextDelivery {
         }
 
         try verifyTarget(target, expectedSelectedText: expectedSelectedText)
+        let valueBeforePaste = sendAfterPaste ? focusedEditableValue(processIdentifier: target.processIdentifier) : nil
 
         let pasteboard = NSPasteboard.general
         let prior = PasteboardSnapshot(pasteboard)
@@ -177,10 +178,26 @@ public enum TextDelivery {
         up?.post(tap: .cghidEventTap)
 
         if sendAfterPaste {
-            try? await Task.sleep(for: .milliseconds(150))
-            do {
-                try verifyTarget(target, expectedSelectedText: nil)
-            } catch {
+            var insertionVerified = false
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(100))
+                do {
+                    try verifyTarget(target, expectedSelectedText: nil)
+                } catch {
+                    if pasteboard.changeCount == dictatedClipboardChange {
+                        prior.restore(to: pasteboard)
+                    }
+                    throw DeliveryError.autoSendDeclined(target.name)
+                }
+                if let before = valueBeforePaste,
+                   let after = focusedEditableValue(processIdentifier: target.processIdentifier),
+                   after != before,
+                   after.contains(text) {
+                    insertionVerified = true
+                    break
+                }
+            }
+            guard insertionVerified else {
                 if pasteboard.changeCount == dictatedClipboardChange {
                     prior.restore(to: pasteboard)
                 }
@@ -277,6 +294,18 @@ public enum TextDelivery {
             subrole: copyString(kAXSubroleAttribute as CFString, from: element),
             selectedText: selectedText(from: element)
         )
+    }
+
+    private static func focusedEditableValue(processIdentifier: pid_t) -> String? {
+        let application = AXUIElementCreateApplication(processIdentifier)
+        guard let element = copyElement(kAXFocusedUIElementAttribute as CFString, from: application) else { return nil }
+        if copyBoolean("AXProtectedContent" as CFString, from: element) == true
+            || copyString(kAXRoleAttribute as CFString, from: element) == "AXSecureTextField"
+            || copyString(kAXSubroleAttribute as CFString, from: element) == "AXSecureTextField" {
+            return nil
+        }
+        guard let value = copyString(kAXValueAttribute as CFString, from: element), value.count <= 1_000_000 else { return nil }
+        return value
     }
 
     private static func copyElement(_ attribute: CFString, from element: AXUIElement) -> AXUIElement? {

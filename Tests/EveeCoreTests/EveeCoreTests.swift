@@ -263,4 +263,50 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertFalse(visible.contains(where: { $0.id == recovery.id }))
         try? FileManager.default.removeItem(at: root)
     }
+
+    func testRetainedCommitRejectsMissingRecoveryCapture() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = LibraryStore(rootURL: root)
+        let record = WorkspaceRecord(kind: .memo, title: "Missing", text: "Must not silently downgrade")
+
+        do {
+            _ = try await store.commitRecoveredRecord(record, recoveryID: UUID(), keepAudio: true)
+            XCTFail("Expected retained commit to reject a missing recovery capture")
+        } catch LibraryStoreError.missingRecoveryCapture(_) {
+            let persisted = try await store.record(id: record.id)
+            XCTAssertNil(persisted)
+        }
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRetainedCommitRejectsMissingDeclaredAudioSource() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
+        try Data("audio".utf8).write(to: input)
+        let store = LibraryStore(rootURL: root)
+        let recovery = try await store.beginRecoveryCapture(kind: .memo)
+        let manifest = try await store.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: input)
+        let retainedSource = try await store.safeURL(forRelativePath: try XCTUnwrap(manifest.tracks.first?.relativePath))
+        try FileManager.default.removeItem(at: retainedSource)
+        let record = WorkspaceRecord(kind: .memo, title: "Incomplete", text: "Reject incomplete media")
+
+        do {
+            _ = try await store.commitRecoveredRecord(record, recoveryID: recovery.id, keepAudio: true)
+            XCTFail("Expected retained commit to reject a missing declared source")
+        } catch LibraryStoreError.missingAudioSource(_) {
+            let persisted = try await store.record(id: record.id)
+            XCTAssertNil(persisted)
+        }
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: input)
+    }
+
+    func testWebhookPayloadIsStableAcrossOutboxMutations() throws {
+        var record = WorkspaceRecord(kind: .meeting, title: "Review", text: "Stable body")
+        let original = try MeetingWebhook.payload(for: record)
+        record.webhookDeliveries.append(WebhookDelivery(destination: "https://example.com/hook", state: .failed, attemptCount: 3))
+        let afterOutboxMutation = try MeetingWebhook.payload(for: record)
+
+        XCTAssertEqual(original, afterOutboxMutation)
+    }
 }

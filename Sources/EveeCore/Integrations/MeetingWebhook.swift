@@ -70,18 +70,29 @@ public struct MeetingWebhook: Sendable {
         destination: URL,
         secret: String,
         deliveryID: UUID = UUID(),
-        maxAttempts: Int = 3
+        maxAttempts: Int = 3,
+        payloadBody: Data? = nil,
+        startingAttemptCount: Int = 0
     ) async throws -> WebhookDeliveryReceipt {
         try WebhookEndpointPolicy.validate(destination)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let body = try encoder.encode(record)
+        let body: Data
+        if let payloadBody {
+            body = payloadBody
+        } else {
+            body = try Self.payload(for: record)
+        }
         let attempts = max(1, min(maxAttempts, 5))
-        var delivery = WebhookDelivery(id: deliveryID, destination: destination.absoluteString)
+        var delivery = WebhookDelivery(
+            id: deliveryID,
+            destination: destination.absoluteString,
+            attemptCount: startingAttemptCount,
+            payloadBody: body
+        )
 
         for attempt in 1...attempts {
-            delivery.attemptCount = attempt
-            delivery.lastAttemptAt = .now
+            delivery.attemptCount = startingAttemptCount + attempt
+            let attemptDate = Date.now
+            delivery.lastAttemptAt = attemptDate
             do {
                 var request = URLRequest(url: destination)
                 request.httpMethod = "POST"
@@ -92,7 +103,7 @@ public struct MeetingWebhook: Sendable {
                 request.setValue("meeting.completed", forHTTPHeaderField: "X-Evee-Event")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "X-Evee-Delivery-ID")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "Idempotency-Key")
-                request.setValue(ISO8601DateFormatter().string(from: delivery.lastAttemptAt!), forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
+                request.setValue(ISO8601DateFormatter().string(from: attemptDate), forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
 
                 if !secret.isEmpty {
                     request.setValue(Self.signature(for: body, secret: secret), forHTTPHeaderField: "X-Evee-Signature-256")
@@ -107,6 +118,8 @@ public struct MeetingWebhook: Sendable {
                         continue
                     }
                     delivery.state = .failed
+                    delivery.retryable = Self.isTransient(statusCode: http.statusCode)
+                    delivery.nextAttemptAt = delivery.retryable ? Self.nextAttempt(after: delivery.attemptCount) : nil
                     delivery.lastError = "Webhook returned HTTP \(http.statusCode)."
                     throw WebhookDeliveryFailure(delivery: delivery)
                 }
@@ -115,7 +128,7 @@ public struct MeetingWebhook: Sendable {
                 return WebhookDeliveryReceipt(
                     deliveryID: deliveryID,
                     destination: destination,
-                    attemptCount: attempt,
+                    attemptCount: delivery.attemptCount,
                     statusCode: http.statusCode,
                     deliveredAt: deliveredAt
                 )
@@ -128,11 +141,15 @@ public struct MeetingWebhook: Sendable {
                     continue
                 }
                 delivery.state = .failed
+                delivery.retryable = true
+                delivery.nextAttemptAt = Self.nextAttempt(after: delivery.attemptCount)
                 throw WebhookDeliveryFailure(delivery: delivery)
             }
         }
 
         delivery.state = .failed
+        delivery.retryable = true
+        delivery.nextAttemptAt = Self.nextAttempt(after: delivery.attemptCount)
         delivery.lastError = delivery.lastError ?? "Webhook delivery exhausted all attempts."
         throw WebhookDeliveryFailure(delivery: delivery)
     }
@@ -143,8 +160,23 @@ public struct MeetingWebhook: Sendable {
         return Data(signature).map { String(format: "%02x", $0) }.joined()
     }
 
+    public static func payload(for record: WorkspaceRecord) throws -> Data {
+        var stable = record
+        stable.webhookDeliveries = []
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(stable)
+    }
+
     private static func isTransient(statusCode: Int) -> Bool {
         statusCode == 408 || statusCode == 425 || statusCode == 429 || (500...599).contains(statusCode)
+    }
+
+    private static func nextAttempt(after attemptCount: Int) -> Date {
+        let exponent = min(max(attemptCount, 1), 10)
+        let seconds = min(TimeInterval(30 * (1 << (exponent - 1))), 21_600)
+        return .now.addingTimeInterval(seconds)
     }
 
     private func backoff(after attempt: Int) async throws {

@@ -18,7 +18,26 @@ public protocol LocalTranscriber: AnyObject, Sendable {
     func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws
     func load() async throws
     func transcribe(fileURL: URL, languageCode: String?) async throws -> String
+    func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript
     func unload()
+}
+
+public extension LocalTranscriber {
+    func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
+        let text = try await transcribe(fileURL: fileURL, languageCode: languageCode)
+        let asset = AVURLAsset(url: fileURL)
+        let duration = max(0, try await asset.load(.duration).seconds)
+        return LocalTranscript(
+            text: text,
+            duration: duration,
+            segments: [LocalTranscriptSegment(
+                start: 0,
+                end: duration,
+                text: text,
+                timingSource: .trackEstimate
+            )]
+        )
+    }
 }
 
 public enum TranscriptionError: LocalizedError {
@@ -82,6 +101,10 @@ public final class ParakeetTranscriber: LocalTranscriber, @unchecked Sendable {
     }
 
     public func transcribe(fileURL: URL, languageCode: String?) async throws -> String {
+        try await transcribeDetailed(fileURL: fileURL, languageCode: languageCode).text
+    }
+
+    public func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
         try await load()
         guard let manager = lock.withLock({ manager }) else { throw TranscriptionError.modelUnavailable }
         let hint = normalizedLanguage(languageCode).flatMap(Language.init(rawValue:))
@@ -89,7 +112,21 @@ public final class ParakeetTranscriber: LocalTranscriber, @unchecked Sendable {
         let result = try await manager.transcribe(fileURL, decoderState: &decoderState, language: hint)
         let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw TranscriptionError.emptyResult }
-        return text
+        let timings = (result.tokenTimings ?? []).map {
+            TranscriptTokenTiming(
+                token: $0.token,
+                start: TimeInterval($0.startTime),
+                end: TimeInterval($0.endTime),
+                confidence: $0.confidence
+            )
+        }
+        let duration = TimeInterval(result.duration)
+        let segments = TokenTimingSegmenter().segments(
+            transcriptText: text,
+            duration: duration,
+            timings: timings
+        )
+        return LocalTranscript(text: text, duration: duration, segments: segments)
     }
 
     public func unload() { lock.withLock { manager = nil } }
@@ -128,20 +165,33 @@ public final class QwenTranscriber: LocalTranscriber, @unchecked Sendable {
     }
 
     public func transcribe(fileURL: URL, languageCode: String?) async throws -> String {
+        try await transcribeDetailed(fileURL: fileURL, languageCode: languageCode).text
+    }
+
+    public func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
         try await load()
         guard let manager = lock.withLock({ manager }) else { throw TranscriptionError.modelUnavailable }
         let reader = try AudioSampleChunkReader(url: fileURL)
         let language = normalizedLanguage(languageCode)
         var transcripts: [String] = []
-        while let samples = try reader.next() {
+        var segments: [LocalTranscriptSegment] = []
+        while let chunk = try reader.nextTimed() {
             try Task.checkCancellation()
-            let text = try await manager.transcribe(audioSamples: samples, language: language)
+            let text = try await manager.transcribe(audioSamples: chunk.samples, language: language)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { transcripts.append(text) }
+            if !text.isEmpty {
+                transcripts.append(text)
+                segments.append(LocalTranscriptSegment(
+                    start: chunk.start,
+                    end: chunk.end,
+                    text: text,
+                    timingSource: .audioChunk
+                ))
+            }
         }
         let combined = transcripts.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !combined.isEmpty else { throw TranscriptionError.emptyResult }
-        return combined
+        return LocalTranscript(text: combined, duration: reader.duration, segments: segments)
     }
 
     public func unload() { lock.withLock { manager = nil } }
@@ -162,6 +212,11 @@ final class AudioSampleChunkReader {
     private let sourceFormat: AVAudioFormat
     private let targetFormat: AVAudioFormat
     private let sourceFramesPerChunk: AVAudioFrameCount
+
+    var duration: TimeInterval {
+        guard sourceFormat.sampleRate > 0 else { return 0 }
+        return Double(file.length) / sourceFormat.sampleRate
+    }
 
     init(url: URL, chunkDuration: TimeInterval = defaultChunkDuration) throws {
         guard chunkDuration.isFinite, chunkDuration > 0,
@@ -189,7 +244,12 @@ final class AudioSampleChunkReader {
     }
 
     func next() throws -> [Float]? {
+        try nextTimed()?.samples
+    }
+
+    func nextTimed() throws -> AudioSampleChunk? {
         guard file.framePosition < file.length else { return nil }
+        let sourceStartFrame = file.framePosition
         let remaining = file.length - file.framePosition
         let inputCapacity = AVAudioFrameCount(min(Int64(sourceFramesPerChunk), remaining))
         guard inputCapacity > 0,
@@ -226,8 +286,18 @@ final class AudioSampleChunkReader {
               let channel = output.floatChannelData?[0] else {
             throw AudioCaptureError.invalidFormat
         }
-        return Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
+        return AudioSampleChunk(
+            samples: Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength))),
+            start: Double(sourceStartFrame) / sourceFormat.sampleRate,
+            end: Double(file.framePosition) / sourceFormat.sampleRate
+        )
     }
+}
+
+struct AudioSampleChunk {
+    var samples: [Float]
+    var start: TimeInterval
+    var end: TimeInterval
 }
 
 private extension NSLock {

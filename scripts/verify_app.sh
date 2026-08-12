@@ -14,6 +14,8 @@ test -f "$contents/Resources/Evee.icns"
 
 plutil -lint "$contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
+audio_entitlement="$(codesign -d --entitlements :- "$app_dir" 2>/dev/null | plutil -extract com.apple.security.device.audio-input raw -)"
+test "$audio_entitlement" = "true"
 
 bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$contents/Info.plist")"
 test "$bundle_identifier" = "com.tumcuctom.evee"

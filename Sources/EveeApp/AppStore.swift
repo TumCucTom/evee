@@ -41,6 +41,12 @@ final class AppStore: ObservableObject {
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
     @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
 
+    var webhookOutboxCount: Int {
+        records.reduce(into: 0) { count, record in
+            count += record.webhookDeliveries.filter { $0.state != .delivered }.count
+        }
+    }
+
     let recorder = MicrophoneRecorder()
     private let systemAudioRecorder = SystemAudioRecorder()
     private let library = LibraryStore.shared
@@ -505,24 +511,26 @@ final class AppStore: ObservableObject {
             captureState = .transcribing
             let engine = try transcriber ?? TranscriberFactory.make(settings.model)
             transcriber = engine
-            let micText = try await engine.transcribe(fileURL: audioURL, languageCode: settings.languageCode)
+            let microphoneTranscript = try await engine.transcribeDetailed(fileURL: audioURL, languageCode: settings.languageCode)
             guard captureLifecycle == .finishing(sessionID) else { return }
 
-            var raw = micText
-            var segments = [TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: activeKind == .meeting ? "You" : nil, text: micText)]
+            var raw = microphoneTranscript.text
+            var segments: [TranscriptSegment] = activeKind == .meeting
+                ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil)
+                : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
             if activeKind == .meeting,
                let systemURL = activeSystemAudioURL,
                FileManager.default.fileExists(atPath: systemURL.path),
-               let otherText = try? await engine.transcribe(fileURL: systemURL, languageCode: settings.languageCode) {
+               let systemTranscript = try? await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode) {
                 guard captureLifecycle == .finishing(sessionID) else { return }
-                raw = "You: \(micText)\n\nOthers: \(otherText)"
-                segments.append(TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: "Others", text: otherText))
+                raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
+                segments = MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: systemTranscript)
             }
             let polished: String
             if activeOperation == .selectionTransform {
                 polished = try selectionTransform.transform(
                     selectedText: activeSelectedText ?? "",
-                    instruction: micText,
+                    instruction: microphoneTranscript.text,
                     terms: settings.dictionary
                 )
             } else {
@@ -535,7 +543,8 @@ final class AppStore: ObservableObject {
                     useParagraphs: style?.useParagraphs ?? true
                 )
             }
-            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments)
+            let intelligence = activeKind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
+            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments, meetingIntelligence: intelligence)
         } catch {
             guard captureLifecycle == .finishing(sessionID) else { return }
             await failSession(sessionID: sessionID, error: error, preserveRecoveryAudio: true)
@@ -582,7 +591,13 @@ final class AppStore: ObservableObject {
         captureState = .idle
     }
 
-    private func completeRecord(sessionID: UUID, raw: String, polished: String, segments: [TranscriptSegment]) async throws {
+    private func completeRecord(
+        sessionID: UUID,
+        raw: String,
+        polished: String,
+        segments: [TranscriptSegment],
+        meetingIntelligence: MeetingIntelligence? = nil
+    ) async throws {
         guard captureLifecycle == .finishing(sessionID) else { return }
         let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
         let keepAudio = switch activeKind {
@@ -604,6 +619,7 @@ final class AppStore: ObservableObject {
             rawText: raw,
             sourceApplication: settings.retainContextMetadata ? activeApplication?.name : nil,
             duration: duration,
+            meetingIntelligence: activeKind == .meeting ? meetingIntelligence : nil,
             notes: activeKind == .meeting ? meetingNotes : "",
             operation: activeOperation,
             context: persistedActiveContext()
@@ -798,24 +814,20 @@ final class AppStore: ObservableObject {
 
             let engine = try transcriber ?? TranscriberFactory.make(settings.model)
             transcriber = engine
-            let microphoneText = try await engine.transcribe(fileURL: microphoneURL, languageCode: settings.languageCode)
+            let microphoneTranscript = try await engine.transcribeDetailed(fileURL: microphoneURL, languageCode: settings.languageCode)
             guard captureLifecycle == .finishing(sessionID) else { return }
 
-            let duration = max(0, Date.now.timeIntervalSince(capture.startedAt))
-            var raw = microphoneText
-            var segments = [TranscriptSegment(
-                start: 0,
-                end: duration,
-                speaker: capture.kind == .meeting ? "You" : nil,
-                text: microphoneText
-            )]
+            var raw = microphoneTranscript.text
+            var segments: [TranscriptSegment] = capture.kind == .meeting
+                ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil)
+                : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
             if capture.kind == .meeting,
                let systemURL = activeSystemAudioURL,
                FileManager.default.fileExists(atPath: systemURL.path),
-               let systemText = try? await engine.transcribe(fileURL: systemURL, languageCode: settings.languageCode) {
+               let systemTranscript = try? await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode) {
                 guard captureLifecycle == .finishing(sessionID) else { return }
-                raw = "You: \(microphoneText)\n\nOthers: \(systemText)"
-                segments.append(TranscriptSegment(start: 0, end: duration, speaker: "Others", text: systemText))
+                raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
+                segments = MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: systemTranscript)
             }
 
             let polished = cleanup.clean(
@@ -825,7 +837,8 @@ final class AppStore: ObservableObject {
                 appendPeriod: true,
                 useParagraphs: true
             )
-            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments)
+            let intelligence = capture.kind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
+            try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments, meetingIntelligence: intelligence)
         } catch {
             guard captureLifecycle == .finishing(sessionID) else { return }
             try? await library.updateRecoveryCapture(id: sessionID, status: .failed, failureReason: error.localizedDescription)
@@ -920,9 +933,12 @@ final class AppStore: ObservableObject {
 
     private func enqueueAndDeliverWebhook(record: WorkspaceRecord, destination: URL) async {
         var queued = record
-        let delivery = WebhookDelivery(destination: destination.absoluteString)
-        queued.webhookDeliveries.append(delivery)
         do {
+            let delivery = WebhookDelivery(
+                destination: destination.absoluteString,
+                payloadBody: try MeetingWebhook.payload(for: record)
+            )
+            queued.webhookDeliveries.append(delivery)
             try await library.upsert(queued)
             replaceRecord(queued)
             await deliverWebhook(recordID: queued.id, deliveryID: delivery.id)
@@ -936,11 +952,14 @@ final class AppStore: ObservableObject {
             guard var record = try await library.record(id: recordID),
                   let index = record.webhookDeliveries.firstIndex(where: { $0.id == deliveryID }),
                   let destination = URL(string: record.webhookDeliveries[index].destination) else { return }
+            let existing = record.webhookDeliveries[index]
             let receipt = try await MeetingWebhook().sendWithStatus(
                 record: record,
                 destination: destination,
                 secret: webhookSecret,
-                deliveryID: deliveryID
+                deliveryID: deliveryID,
+                payloadBody: existing.payloadBody,
+                startingAttemptCount: existing.attemptCount
             )
             record.webhookDeliveries[index].state = .delivered
             record.webhookDeliveries[index].attemptCount = receipt.attemptCount
@@ -948,6 +967,8 @@ final class AppStore: ObservableObject {
             record.webhookDeliveries[index].deliveredAt = receipt.deliveredAt
             record.webhookDeliveries[index].responseStatusCode = receipt.statusCode
             record.webhookDeliveries[index].lastError = nil
+            record.webhookDeliveries[index].retryable = false
+            record.webhookDeliveries[index].nextAttemptAt = nil
             record.updatedAt = .now
             try await library.upsert(record)
             replaceRecord(record)
@@ -958,7 +979,13 @@ final class AppStore: ObservableObject {
             var failure = WebhookDelivery(id: deliveryID, destination: "", state: .failed, attemptCount: 1, lastAttemptAt: .now, lastError: error.localizedDescription)
             if let record = try? await library.record(id: recordID),
                let existing = record.webhookDeliveries.first(where: { $0.id == deliveryID }) {
-                failure.destination = existing.destination
+                failure = existing
+                failure.state = .failed
+                failure.attemptCount += 1
+                failure.lastAttemptAt = .now
+                failure.lastError = error.localizedDescription
+                failure.retryable = true
+                failure.nextAttemptAt = .now.addingTimeInterval(60)
             }
             await persistWebhookFailure(recordID: recordID, delivery: failure)
             statusMessage = "The meeting was saved. Its webhook remains in the delivery outbox: \(error.localizedDescription)"
@@ -979,11 +1006,42 @@ final class AppStore: ObservableObject {
     }
 
     private func retryPendingWebhookDeliveries() async {
+        let now = Date.now
         let queued = records.flatMap { record in
-            record.webhookDeliveries.filter { $0.state == .pending || $0.state == .failed }.map { (record.id, $0.id) }
+            record.webhookDeliveries.filter {
+                $0.state == .pending || ($0.state == .failed && $0.retryable && ($0.nextAttemptAt ?? .distantPast) <= now)
+            }.map { (record.id, $0.id) }
         }
         for (recordID, deliveryID) in queued {
             await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
+        }
+    }
+
+    func retryWebhookDeliveriesNow() async {
+        var queued: [(UUID, UUID)] = []
+        do {
+            let snapshot = records
+            for var record in snapshot {
+                var changed = false
+                for index in record.webhookDeliveries.indices where record.webhookDeliveries[index].state != .delivered {
+                    record.webhookDeliveries[index].state = .pending
+                    record.webhookDeliveries[index].retryable = true
+                    record.webhookDeliveries[index].nextAttemptAt = nil
+                    changed = true
+                    queued.append((record.id, record.webhookDeliveries[index].id))
+                }
+                if changed {
+                    record.updatedAt = .now
+                    try await library.upsert(record)
+                    replaceRecord(record)
+                }
+            }
+            for (recordID, deliveryID) in queued {
+                await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
+            }
+            if queued.isEmpty { statusMessage = "The webhook outbox is already clear." }
+        } catch {
+            statusMessage = "The webhook outbox could not be retried: \(error.localizedDescription)"
         }
     }
 

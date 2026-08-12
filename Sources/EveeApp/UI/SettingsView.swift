@@ -140,6 +140,15 @@ struct SettingsView: View {
                 }
                 TextField("Meeting webhook URL", text: $store.settings.webhookURL)
                 SecureField("Webhook signing secret", text: $store.webhookSecret)
+                if store.webhookOutboxCount > 0 {
+                    HStack {
+                        Text("\(store.webhookOutboxCount) undelivered webhook \(store.webhookOutboxCount == 1 ? "item" : "items")")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
+                    }
+                }
                 Text("Webhook secrets are stored in Keychain. HTTPS is required except for localhost development.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -155,6 +164,10 @@ struct SettingsView: View {
                         Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                     }
                 }
+            }
+
+            Section("Local activity context") {
+                WorkspaceIntelligencePrivacyView()
             }
 
             Section("Application") {

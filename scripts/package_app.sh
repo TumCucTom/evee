@@ -2,9 +2,20 @@
 set -euo pipefail
 
 configuration="${1:-release}"
+version="${EVEE_VERSION:-0.2.0}"
+build_number="${EVEE_BUILD_NUMBER:-2}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
+
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]; then
+  echo "EVEE_VERSION must be a semantic version such as 1.2.3" >&2
+  exit 64
+fi
+if [[ ! "$build_number" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EVEE_BUILD_NUMBER must be a positive integer" >&2
+  exit 64
+fi
 
 swift build -c "$configuration"
 bin_dir="$(swift build -c "$configuration" --show-bin-path)"
@@ -51,14 +62,16 @@ cp /dev/stdin "$contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.tumcuctom.evee</string>
   <key>CFBundleName</key><string>Evee</string>
   <key>CFBundleIconFile</key><string>Evee</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleShortVersionString</key><string>0.0.0</string>
+  <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><false/>
   <key>NSMicrophoneUsageDescription</key><string>Evee records your voice for dictation and meetings.</string>
   <key>NSScreenCaptureUsageDescription</key><string>Evee can capture system audio for meetings when you enable it.</string>
 </dict></plist>
 PLIST
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$contents/Info.plist"
 
 signing_identity="${EVEE_CODESIGN_IDENTITY:--}"
 codesign_arguments=(--force --sign "$signing_identity")
@@ -66,5 +79,5 @@ if [[ "$signing_identity" != "-" ]]; then
   codesign_arguments+=(--options runtime --timestamp)
 fi
 codesign "${codesign_arguments[@]}" "$contents/Helpers/evee-mcp"
-codesign "${codesign_arguments[@]}" "$app_dir"
+codesign "${codesign_arguments[@]}" --entitlements "$repo_root/Evee.entitlements" "$app_dir"
 echo "$app_dir"

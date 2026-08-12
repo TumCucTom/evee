@@ -4,6 +4,7 @@ public enum LibraryStoreError: LocalizedError, Sendable {
     case corruptFile(URL)
     case unsafeRelativePath(String)
     case missingAudioSource(URL)
+    case missingRecoveryCapture(UUID)
     case unsupportedSchema(found: Int, supported: Int)
 
     public var errorDescription: String? {
@@ -14,6 +15,8 @@ public enum LibraryStoreError: LocalizedError, Sendable {
             return "The library rejected an unsafe relative path: \(path)"
         case .missingAudioSource(let url):
             return "The audio source no longer exists at \(url.path)."
+        case .missingRecoveryCapture(let id):
+            return "The recovery capture \(id.uuidString) is unavailable, so retained audio was not committed."
         case .unsupportedSchema(let found, let supported):
             return "This Evee library uses schema \(found), but this version supports up to schema \(supported)."
         }
@@ -158,9 +161,17 @@ public actor LibraryStore {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedLimit = max(1, min(limit, 500))
         if !needle.isEmpty {
-            let index = try workspaceSearchIndex()
-            if try !index.isCurrent(records: records) { try index.rebuild(records: records) }
-            let ids = try index.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+            let ids: [UUID]
+            do {
+                let index = try workspaceSearchIndex()
+                if try !index.isCurrent(records: records) { try index.rebuild(records: records) }
+                ids = try index.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+            } catch {
+                invalidateSearchIndex()
+                let rebuilt = try workspaceSearchIndex()
+                try rebuilt.rebuild(records: records)
+                ids = try rebuilt.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+            }
             let recordsByID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
             return ids.compactMap { recordsByID[$0] }
         }
@@ -374,7 +385,8 @@ public actor LibraryStore {
         let recoveryDirectory = recoveryURL.appendingPathComponent(recoveryID.uuidString, isDirectory: true)
         var moves: [(source: URL, destination: URL)] = []
 
-        if keepAudio, let capture {
+        if keepAudio {
+            guard let capture else { throw LibraryStoreError.missingRecoveryCapture(recoveryID) }
             let destinationDirectory = audioURL
                 .appendingPathComponent("Records", isDirectory: true)
                 .appendingPathComponent(record.id.uuidString, isDirectory: true)
@@ -384,7 +396,9 @@ public actor LibraryStore {
             do {
                 for track in capture.tracks {
                     let source = try safeURL(forRelativePath: track.relativePath)
-                    guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                    guard FileManager.default.fileExists(atPath: source.path) else {
+                        throw LibraryStoreError.missingAudioSource(source)
+                    }
                     let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
                     if source != destination {
                         if FileManager.default.fileExists(atPath: destination.path) {
@@ -401,6 +415,9 @@ public actor LibraryStore {
                     retained.append(updated)
                 }
                 record.audioTracks = retained
+                guard retained.count == capture.tracks.count, !retained.isEmpty else {
+                    throw LibraryStoreError.missingRecoveryCapture(recoveryID)
+                }
                 record.audioRelativePath = retained.first(where: { $0.role == .microphone })?.relativePath
                 try upsert(record)
             } catch {

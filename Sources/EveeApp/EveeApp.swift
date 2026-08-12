@@ -28,7 +28,10 @@ struct EveeApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 920, minHeight: 620)
                 .background(CaptureOverlayInstaller().environmentObject(store))
-                .task { await store.bootstrap() }
+                .task {
+                    WorkspaceIntelligenceRuntime.shared.start()
+                    await store.bootstrap()
+                }
         }
         .windowStyle(.hiddenTitleBar)
 
@@ -72,6 +75,7 @@ private final class CaptureOverlayController {
     private weak var store: AppStore?
     private var observation: AnyCancellable?
     private var panel: CaptureHUDPanel?
+    private var announcedPhase: CaptureAnnouncementPhase?
 
     func install(store: AppStore) {
         guard self.store !== store else { return }
@@ -82,6 +86,7 @@ private final class CaptureOverlayController {
     }
 
     private func render(_ state: CaptureState) {
+        announceStateChange(state)
         guard state != .idle, let store else {
             panel?.orderOut(nil)
             return
@@ -99,6 +104,38 @@ private final class CaptureOverlayController {
         panel.setContentSize(NSSize(width: 410, height: 54))
         position(panel)
         panel.orderFrontRegardless()
+    }
+
+    private func announceStateChange(_ state: CaptureState) {
+        let phase = CaptureAnnouncementPhase(state)
+        guard phase != announcedPhase else { return }
+        let previous = announcedPhase
+        announcedPhase = phase
+
+        let message: String?
+        switch state {
+        case .idle:
+            message = previous == nil ? nil : "Evee is ready."
+        case .starting:
+            message = "Evee is preparing audio capture."
+        case .recording:
+            message = "Evee is recording."
+        case .transcribing:
+            message = "Evee is transcribing locally."
+        case .delivering:
+            message = "Evee is inserting the finished text."
+        case .failed(let detail):
+            message = "Evee capture failed. \(detail)"
+        }
+        guard let message else { return }
+        NSAccessibility.post(
+            element: NSApp,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
     }
 
     private func makePanel() -> CaptureHUDPanel {
@@ -128,6 +165,21 @@ private final class CaptureOverlayController {
             y: visibleFrame.maxY - panel.frame.height - 10
         )
         panel.setFrameOrigin(origin)
+    }
+}
+
+private enum CaptureAnnouncementPhase: Equatable {
+    case idle, starting, recording, transcribing, delivering, failed
+
+    init(_ state: CaptureState) {
+        switch state {
+        case .idle: self = .idle
+        case .starting: self = .starting
+        case .recording: self = .recording
+        case .transcribing: self = .transcribing
+        case .delivering: self = .delivering
+        case .failed: self = .failed
+        }
     }
 }
 

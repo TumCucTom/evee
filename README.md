@@ -48,6 +48,11 @@ scripts/package_app.sh release
 open dist/Evee.app
 ```
 
+Release automation sets `EVEE_VERSION` and `EVEE_BUILD_NUMBER` so the app's
+bundle metadata matches the published artifact. Local packages default to the
+current development version; both values can be overridden for candidate
+verification.
+
 On first launch, grant Microphone and Accessibility permissions. Screen
 Recording is only needed once system-audio meeting capture is enabled.
 

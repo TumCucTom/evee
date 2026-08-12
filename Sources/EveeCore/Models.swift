@@ -139,6 +139,9 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
     public var deliveredAt: Date?
     public var responseStatusCode: Int?
     public var lastError: String?
+    public var payloadBody: Data?
+    public var retryable: Bool
+    public var nextAttemptAt: Date?
 
     public init(
         id: UUID = UUID(),
@@ -148,7 +151,10 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         lastAttemptAt: Date? = nil,
         deliveredAt: Date? = nil,
         responseStatusCode: Int? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        payloadBody: Data? = nil,
+        retryable: Bool = true,
+        nextAttemptAt: Date? = nil
     ) {
         self.id = id
         self.destination = destination
@@ -158,6 +164,29 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         self.deliveredAt = deliveredAt
         self.responseStatusCode = responseStatusCode
         self.lastError = lastError
+        self.payloadBody = payloadBody
+        self.retryable = retryable
+        self.nextAttemptAt = nextAttemptAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, destination, state, attemptCount, lastAttemptAt, deliveredAt, responseStatusCode, lastError
+        case payloadBody, retryable, nextAttemptAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        destination = try values.decode(String.self, forKey: .destination)
+        state = try values.decodeIfPresent(WebhookDeliveryState.self, forKey: .state) ?? .pending
+        attemptCount = try values.decodeIfPresent(Int.self, forKey: .attemptCount) ?? 0
+        lastAttemptAt = try values.decodeIfPresent(Date.self, forKey: .lastAttemptAt)
+        deliveredAt = try values.decodeIfPresent(Date.self, forKey: .deliveredAt)
+        responseStatusCode = try values.decodeIfPresent(Int.self, forKey: .responseStatusCode)
+        lastError = try values.decodeIfPresent(String.self, forKey: .lastError)
+        payloadBody = try values.decodeIfPresent(Data.self, forKey: .payloadBody)
+        retryable = try values.decodeIfPresent(Bool.self, forKey: .retryable) ?? true
+        nextAttemptAt = try values.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
     }
 }
 
@@ -167,13 +196,48 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
     public var end: TimeInterval
     public var speaker: String?
     public var text: String
+    public var channel: AudioTrackRole?
+    public var attribution: SpeakerAttribution
+    public var confidence: Float?
+    public var timingSource: TranscriptTimingSource
 
-    public init(id: UUID = UUID(), start: TimeInterval, end: TimeInterval, speaker: String? = nil, text: String) {
+    public init(
+        id: UUID = UUID(),
+        start: TimeInterval,
+        end: TimeInterval,
+        speaker: String? = nil,
+        text: String,
+        channel: AudioTrackRole? = nil,
+        attribution: SpeakerAttribution = .unknown,
+        confidence: Float? = nil,
+        timingSource: TranscriptTimingSource = .trackEstimate
+    ) {
         self.id = id
         self.start = start
         self.end = end
         self.speaker = speaker
         self.text = text
+        self.channel = channel
+        self.attribution = attribution
+        self.confidence = confidence
+        self.timingSource = timingSource
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, start, end, speaker, text, channel, attribution, confidence, timingSource
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        start = try values.decode(TimeInterval.self, forKey: .start)
+        end = try values.decode(TimeInterval.self, forKey: .end)
+        speaker = try values.decodeIfPresent(String.self, forKey: .speaker)
+        text = try values.decode(String.self, forKey: .text)
+        channel = try values.decodeIfPresent(AudioTrackRole.self, forKey: .channel)
+        attribution = try values.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution) ?? .unknown
+        confidence = try values.decodeIfPresent(Float.self, forKey: .confidence)
+        timingSource = try values.decodeIfPresent(TranscriptTimingSource.self, forKey: .timingSource) ?? .trackEstimate
     }
 }
 
@@ -190,6 +254,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     public var audioTracks: [WorkspaceAudioTrack]
     public var duration: TimeInterval?
     public var segments: [TranscriptSegment]
+    public var meetingIntelligence: MeetingIntelligence?
     public var notes: String
     public var tags: [String]
     public var webhookDeliveries: [WebhookDelivery]
@@ -210,6 +275,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         audioTracks: [WorkspaceAudioTrack] = [],
         duration: TimeInterval? = nil,
         segments: [TranscriptSegment] = [],
+        meetingIntelligence: MeetingIntelligence? = nil,
         notes: String = "",
         tags: [String] = [],
         webhookDeliveries: [WebhookDelivery] = [],
@@ -229,6 +295,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         self.audioTracks = audioTracks
         self.duration = duration
         self.segments = segments
+        self.meetingIntelligence = meetingIntelligence
         self.notes = notes
         self.tags = tags
         self.webhookDeliveries = webhookDeliveries
@@ -239,7 +306,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, createdAt, updatedAt, title, text, rawText, sourceApplication
-        case audioRelativePath, audioTracks, duration, segments, notes, tags, webhookDeliveries, recoverySourceID
+        case audioRelativePath, audioTracks, duration, segments, meetingIntelligence, notes, tags, webhookDeliveries, recoverySourceID
         case operation, context
     }
 
@@ -257,6 +324,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         audioTracks = try values.decodeIfPresent([WorkspaceAudioTrack].self, forKey: .audioTracks) ?? []
         duration = try values.decodeIfPresent(TimeInterval.self, forKey: .duration)
         segments = try values.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
+        meetingIntelligence = try values.decodeIfPresent(MeetingIntelligence.self, forKey: .meetingIntelligence)
         notes = try values.decodeIfPresent(String.self, forKey: .notes) ?? ""
         tags = try values.decodeIfPresent([String].self, forKey: .tags) ?? []
         webhookDeliveries = try values.decodeIfPresent([WebhookDelivery].self, forKey: .webhookDeliveries) ?? []

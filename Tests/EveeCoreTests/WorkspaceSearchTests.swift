@@ -47,4 +47,25 @@ final class WorkspaceSearchTests: XCTestCase {
         XCTAssertEqual(permissions?.intValue, 0o600)
         try? FileManager.default.removeItem(at: root)
     }
+
+    func testCorruptIndexIsRebuiltFromDurableRecords() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let record = WorkspaceRecord(kind: .memo, title: "Durable", text: "recoverable index content")
+        do {
+            let initialStore = LibraryStore(rootURL: root)
+            try await initialStore.upsert(record)
+            _ = try await initialStore.search("recoverable")
+        }
+
+        let index = root.appendingPathComponent("workspace-index.sqlite3")
+        try Data("not a sqlite database".utf8).write(to: index, options: .atomic)
+        for suffix in ["-wal", "-shm"] {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: index.path + suffix))
+        }
+
+        let reopenedStore = LibraryStore(rootURL: root)
+        let results = try await reopenedStore.search("recoverable")
+        XCTAssertEqual(results.map(\.id), [record.id])
+        try? FileManager.default.removeItem(at: root)
+    }
 }

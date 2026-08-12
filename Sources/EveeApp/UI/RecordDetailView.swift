@@ -46,6 +46,12 @@ struct RecordDetailView: View {
                     retainedAudioSection
                 }
 
+                if draft.kind == .meeting,
+                   let intelligence = draft.meetingIntelligence,
+                   !intelligence.isEmpty {
+                    meetingIntelligenceSection(intelligence)
+                }
+
                 if draft.kind == .meeting {
                     section("Notes", subtitle: "Your notes stay distinct from the transcript") {
                         TextEditor(text: $draft.notes)
@@ -71,7 +77,7 @@ struct RecordDetailView: View {
                 }
 
                 if !draft.segments.isEmpty {
-                    section("Speaker timeline", subtitle: "Speaker labels are generated from the available local audio channels") {
+                    section("Speaker timeline", subtitle: "Participant numbers are anonymous local speaker clusters, not identified people") {
                         VStack(alignment: .leading, spacing: 12) {
                             ForEach(draft.segments) { segment in
                                 HStack(alignment: .top, spacing: 10) {
@@ -82,6 +88,11 @@ struct RecordDetailView: View {
                                     VStack(alignment: .leading, spacing: 3) {
                                         if let speaker = segment.speaker {
                                             Text(speaker).font(.caption.weight(.semibold)).foregroundStyle(AnimaTheme.violet)
+                                        }
+                                        if let provenance = segmentProvenance(segment) {
+                                            Text(provenance)
+                                                .font(.system(size: 9, weight: .medium))
+                                                .foregroundStyle(.secondary)
                                         }
                                         Text(segment.text).font(.system(size: 12)).textSelection(.enabled)
                                     }
@@ -156,6 +167,83 @@ struct RecordDetailView: View {
                 }
             }
             .font(.caption)
+        }
+    }
+
+    private func meetingIntelligenceSection(_ intelligence: MeetingIntelligence) -> some View {
+        section("Meeting overview", subtitle: "Extracted locally from explicit transcript wording; verify before acting") {
+            VStack(alignment: .leading, spacing: 16) {
+                if !intelligence.summary.isEmpty {
+                    insightGroup("Summary", icon: "text.alignleft") {
+                        ForEach(intelligence.summary, id: \.self) { item in
+                            insightRow(item)
+                        }
+                    }
+                }
+                if !intelligence.decisions.isEmpty {
+                    insightGroup("Decisions", icon: "checkmark.seal") {
+                        ForEach(intelligence.decisions) { item in
+                            evidenceRow(item)
+                        }
+                    }
+                }
+                if !intelligence.actionItems.isEmpty {
+                    insightGroup("Action items", icon: "checklist") {
+                        ForEach(intelligence.actionItems) { item in
+                            VStack(alignment: .leading, spacing: 4) {
+                                evidenceRow(item)
+                                HStack(spacing: 8) {
+                                    if let assignee = item.assignee, !assignee.isEmpty {
+                                        Label(assignee, systemImage: "person")
+                                    }
+                                    if let dueText = item.dueText, !dueText.isEmpty {
+                                        Label(dueText, systemImage: "calendar")
+                                    }
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func insightGroup<Content: View>(
+        _ title: String,
+        icon: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label(title, systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(AnimaTheme.violet)
+            content()
+        }
+    }
+
+    private func insightRow(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(AnimaTheme.violet.opacity(0.7))
+                .frame(width: 5, height: 5)
+            Text(text)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
+        }
+    }
+
+    private func evidenceRow(_ item: MeetingInsight) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if let sourceTime = item.sourceTime {
+                Text(timestamp(sourceTime))
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Text(item.text)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
         }
     }
 
@@ -303,6 +391,17 @@ struct RecordDetailView: View {
         case .microphone: "Microphone"
         case .system: "Other participants"
         case .mixed: "Mixed"
+        }
+    }
+
+    private func segmentProvenance(_ segment: TranscriptSegment) -> String? {
+        switch segment.attribution {
+        case .diarized:
+            return "Anonymous speaker model"
+        case .channel:
+            return segment.channel.map(audioTrackTitle)
+        case .unknown:
+            return nil
         }
     }
 

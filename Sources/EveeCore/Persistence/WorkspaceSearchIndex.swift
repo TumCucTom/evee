@@ -33,12 +33,18 @@ final class WorkspaceSearchIndex {
             database = nil
             throw WorkspaceSearchIndexError.open(message)
         }
-        try execute("PRAGMA journal_mode=WAL;")
-        try execute("PRAGMA synchronous=FULL;")
-        try execute("PRAGMA foreign_keys=ON;")
-        try execute("CREATE TABLE IF NOT EXISTS workspace_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
-        try execute("CREATE VIRTUAL TABLE IF NOT EXISTS workspace_fts USING fts5(id UNINDEXED, kind UNINDEXED, created_at UNINDEXED, title, body, notes, tags, source_application, tokenize='unicode61 remove_diacritics 2');")
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        do {
+            try execute("PRAGMA journal_mode=WAL;")
+            try execute("PRAGMA synchronous=FULL;")
+            try execute("PRAGMA foreign_keys=ON;")
+            try execute("CREATE TABLE IF NOT EXISTS workspace_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            try execute("CREATE VIRTUAL TABLE IF NOT EXISTS workspace_fts USING fts5(id UNINDEXED, kind UNINDEXED, created_at UNINDEXED, title, body, notes, tags, source_application, tokenize='unicode61 remove_diacritics 2');")
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            sqlite3_close(database)
+            database = nil
+            throw error
+        }
     }
 
     deinit { sqlite3_close(database) }

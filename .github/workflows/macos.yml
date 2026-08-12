@@ -22,9 +22,11 @@ jobs:
         run: scripts/package_app.sh release
       - name: Verify packaged app
         run: scripts/verify_app.sh dist/Evee.app
+      - name: Archive packaged app
+        run: ditto -c -k --sequesterRsrc --keepParent dist/Evee.app "dist/Evee-${GITHUB_SHA}.zip"
       - name: Upload packaged app
         uses: actions/upload-artifact@v4
         with:
           name: Evee-${{ github.sha }}
-          path: dist/Evee.app
+          path: dist/Evee-${{ github.sha }}.zip
           if-no-files-found: error

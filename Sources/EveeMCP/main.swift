@@ -7,19 +7,6 @@ private struct MCPFailure: LocalizedError {
     var errorDescription: String? { message }
 }
 
-private struct ActivityContext: Codable {
-    var latestRecord: WorkspaceRecord?
-    var recoverableCaptures: [CaptureRecoveryManifest]
-}
-
-private struct ApplicationUsage: Codable {
-    var application: String
-    var recordCount: Int
-    var dictationCount: Int
-    var totalDuration: TimeInterval
-    var lastActivityAt: Date
-}
-
 private struct WorkspaceStats: Codable {
     var totalRecords: Int
     var dictations: Int
@@ -43,6 +30,10 @@ private struct PublicConfiguration: Codable {
     var defaultTone: WritingTone
     var dictionaryTermCount: Int
     var appStyleCount: Int
+    var activityTrackingEnabled: Bool
+    var activityWindowTitlesEnabled: Bool
+    var activityJournalEnabled: Bool
+    var activityRetentionDays: Int
 }
 
 @main
@@ -116,37 +107,22 @@ enum EveeMCP {
             return try encode(records)
 
         case "ambient_timeline":
-            // Evee currently has no continuous ambient collector; this is the durable voice-activity timeline.
             let since = parseDate(arguments["since"] as? String)
-            let records = try await store.recent(limit: limit, since: since)
-            return try encode(records)
+            let timeline = try await WorkspaceIntelligenceStore.shared.timeline(since: since, limit: limit)
+            return try encode(timeline)
 
         case "ambient_app_usage":
             let since = parseDate(arguments["since"] as? String)
-            let records = try await store.recent(limit: 500, since: since)
-            let grouped = Dictionary(grouping: records.filter { $0.sourceApplication != nil }, by: { $0.sourceApplication! })
-            let usage = grouped.map { application, values in
-                ApplicationUsage(
-                    application: application,
-                    recordCount: values.count,
-                    dictationCount: values.filter { $0.kind == .dictation }.count,
-                    totalDuration: values.compactMap(\.duration).reduce(0, +),
-                    lastActivityAt: values.map(\.createdAt).max() ?? .distantPast
-                )
-            }.sorted { $0.lastActivityAt > $1.lastActivityAt }
-            return try encode(Array(usage.prefix(limit)))
+            let usage = try await WorkspaceIntelligenceStore.shared.applicationUsage(since: since, limit: limit)
+            return try encode(usage)
 
         case "get_context":
-            let latest = try await store.recent(limit: 1).first
-            let recoverableCaptures = try await store.recoverableCaptures()
-            return try encode(ActivityContext(latestRecord: latest, recoverableCaptures: recoverableCaptures))
+            let context = try await WorkspaceIntelligenceStore.shared.currentContext()
+            return try encode(context)
 
         case "get_journal":
-            let records = try await store.recent(limit: 500)
-            let journal = records.filter { record in
-                record.tags.contains { $0.caseInsensitiveCompare("journal") == .orderedSame }
-            }
-            return try encode(Array(journal.prefix(limit)))
+            let journal = try await WorkspaceIntelligenceStore.shared.journal(limit: limit)
+            return try encode(journal)
 
         case "get_dictation":
             return try await encodeRecord(kind: .dictation, arguments: arguments, store: store)
@@ -171,6 +147,7 @@ enum EveeMCP {
 
         case "get_config":
             let settings = try await store.loadSettings()
+            let intelligence = try await WorkspaceIntelligenceStore.shared.preferences()
             return try encode(PublicConfiguration(
                 model: settings.model,
                 languageCode: settings.languageCode,
@@ -182,7 +159,11 @@ enum EveeMCP {
                 webhookConfigured: !settings.webhookURL.isEmpty,
                 defaultTone: settings.defaultTone,
                 dictionaryTermCount: settings.dictionary.count,
-                appStyleCount: settings.appStyles.count
+                appStyleCount: settings.appStyles.count,
+                activityTrackingEnabled: intelligence.isEnabled,
+                activityWindowTitlesEnabled: intelligence.includeWindowTitles,
+                activityJournalEnabled: intelligence.journalEnabled,
+                activityRetentionDays: intelligence.retentionDays
             ))
 
         default:
@@ -224,10 +205,10 @@ enum EveeMCP {
         return [
             tool("search", "Search local Evee dictations, meetings, memos, notes and tags.", ["type": "object", "properties": ["query": ["type": "string"], "kind": kindProperty, "limit": limitProperty], "required": ["query"]]),
             tool("recent_activity", "Return recent local voice activity, optionally filtered by kind and time.", ["type": "object", "properties": ["kind": kindProperty, "since": ["type": "string", "format": "date-time"], "limit": limitProperty]]),
-            tool("ambient_timeline", "Return Evee's durable voice-activity timeline. Evee does not continuously monitor unrelated activity.", sinceSchema),
-            tool("ambient_app_usage", "Summarise recorded voice activity by source application.", sinceSchema),
-            tool("get_context", "Return the latest voice record and any recoverable captures.", ["type": "object", "properties": [:]]),
-            tool("get_journal", "Return records explicitly tagged journal.", ["type": "object", "properties": ["limit": limitProperty]]),
+            tool("ambient_timeline", "Return locally collected application dwell events when activity tracking is enabled.", sinceSchema),
+            tool("ambient_app_usage", "Summarise locally collected application dwell time when activity tracking is enabled.", sinceSchema),
+            tool("get_context", "Return the current application context snapshot when activity tracking is enabled.", ["type": "object", "properties": [:]]),
+            tool("get_journal", "Return durable daily activity summaries generated from collected dwell events.", ["type": "object", "properties": ["limit": limitProperty]]),
             tool("get_dictation", "Get a dictation by UUID, or the most recent dictation when omitted.", idSchema),
             tool("get_meeting", "Get a meeting by UUID, or the most recent meeting when omitted.", idSchema),
             tool("get_memo", "Get a memo by UUID, or the most recent memo when omitted.", idSchema),
