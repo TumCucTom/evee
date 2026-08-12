@@ -60,6 +60,14 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(settings.model, .parakeet)
         XCTAssertFalse(settings.localAPIEnabled)
         XCTAssertTrue(settings.dictionary.isEmpty)
+        XCTAssertFalse(settings.audioCuesEnabled)
+    }
+
+    func testAudioCuePreferenceRoundTrips() throws {
+        var settings = EveeSettings()
+        settings.audioCuesEnabled = true
+        let restored = try JSONDecoder().decode(EveeSettings.self, from: JSONEncoder().encode(settings))
+        XCTAssertTrue(restored.audioCuesEnabled)
     }
 
     func testSettingsNeverEncodeLegacyWebhookSecret() throws {
@@ -78,6 +86,8 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertNoThrow(try WebhookEndpointPolicy.validate(URL(string: "http://localhost:9000/hook")!))
         XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "http://example.com/hook")!))
         XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "https://user:password@example.com/hook")!))
+        XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "https://example.com/hook?token=secret")!))
+        XCTAssertThrowsError(try WebhookEndpointPolicy.validate(URL(string: "https://example.com/hook#private")!))
     }
 
     func testDualTrackRecoveryCanBeRetained() async throws {
@@ -153,6 +163,28 @@ final class EveeCoreTests: XCTestCase {
             // Expected.
         }
         try? FileManager.default.removeItem(at: root)
+    }
+
+    func testAudioPathCannotEscapeThroughSymlinkedDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("linked"),
+            withDestinationURL: outside
+        )
+        let store = LibraryStore(rootURL: root)
+
+        do {
+            _ = try await store.safeURL(forRelativePath: "linked/audio.caf")
+            XCTFail("Expected a symlink escape to be rejected")
+        } catch LibraryStoreError.unsafeRelativePath(_) {
+            // Expected.
+        }
+
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: outside)
     }
 
     func testMCPRegistrationPreservesOtherServersAndUsesPrivatePermissions() throws {
@@ -351,5 +383,41 @@ final class EveeCoreTests: XCTestCase {
         let afterOutboxMutation = try MeetingWebhook.payload(for: record)
 
         XCTAssertEqual(original, afterOutboxMutation)
+    }
+
+    func testWebhookPayloadValidationRejectsEmptyInvalidAndOversizedBodies() throws {
+        XCTAssertThrowsError(try MeetingWebhook.validatePayload(Data()))
+        XCTAssertThrowsError(try MeetingWebhook.validatePayload(Data("not json".utf8)))
+        XCTAssertThrowsError(try MeetingWebhook.validatePayload(Data(repeating: 0, count: MeetingWebhook.maximumPayloadSize + 1)))
+        XCTAssertNoThrow(try MeetingWebhook.validatePayload(Data("{\"ok\":true}".utf8)))
+    }
+
+    func testAutoSendVerificationRequiresExactInsertionDeltaAndNewOccurrence() {
+        XCTAssertTrue(TextInsertionVerification.confirmsInsertion(
+            before: "Hello ",
+            after: "Hello world",
+            insertedText: "world"
+        ))
+        XCTAssertTrue(TextInsertionVerification.confirmsInsertion(
+            before: "Hello name",
+            after: "Hello team",
+            insertedText: "team",
+            replacing: "name"
+        ))
+        XCTAssertFalse(TextInsertionVerification.confirmsInsertion(
+            before: "world draft",
+            after: "world drafts",
+            insertedText: "world"
+        ))
+        XCTAssertFalse(TextInsertionVerification.confirmsInsertion(
+            before: "Hello ",
+            after: "Hello world!",
+            insertedText: "world"
+        ))
+        XCTAssertFalse(TextInsertionVerification.confirmsInsertion(
+            before: "Hello world",
+            after: "Hello world",
+            insertedText: "world"
+        ))
     }
 }

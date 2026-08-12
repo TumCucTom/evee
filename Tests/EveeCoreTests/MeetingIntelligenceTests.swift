@@ -112,6 +112,67 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertEqual(result.first?.channel, .system)
     }
 
+    func testAssemblerDoesNotForceSingleSpeakerForMixedUtterance() {
+        let system = LocalTranscript(
+            text: "A mixed exchange",
+            duration: 4,
+            segments: [LocalTranscriptSegment(start: 0, end: 4, text: "A mixed exchange", timingSource: .audioChunk)]
+        )
+        let intervals = [
+            SpeakerInterval(speakerID: "first", start: 0, end: 2, confidence: 0.95),
+            SpeakerInterval(speakerID: "second", start: 2, end: 4, confidence: 0.95),
+        ]
+
+        let result = MeetingTranscriptAssembler().assemble(
+            microphone: LocalTranscript(text: "", duration: 0, segments: []),
+            system: system,
+            systemSpeakerIntervals: intervals
+        )
+
+        XCTAssertEqual(result.first?.speaker, "Other participant")
+        XCTAssertEqual(result.first?.attribution, .channel)
+        XCTAssertNil(result.first?.confidence)
+    }
+
+    func testAssemblerAggregatesFragmentedEvidenceForOneSpeaker() throws {
+        let system = LocalTranscript(
+            text: "One participant across pauses",
+            duration: 4,
+            segments: [LocalTranscriptSegment(start: 0, end: 4, text: "One participant across pauses", confidence: 0.9, timingSource: .token)]
+        )
+        let intervals = [
+            SpeakerInterval(speakerID: "stable", start: 0, end: 1.4, confidence: 0.8),
+            SpeakerInterval(speakerID: "stable", start: 1.6, end: 4, confidence: 0.6),
+        ]
+
+        let result = MeetingTranscriptAssembler().assemble(
+            microphone: LocalTranscript(text: "", duration: 0, segments: []),
+            system: system,
+            systemSpeakerIntervals: intervals
+        )
+
+        XCTAssertEqual(result.first?.speaker, "Participant 1")
+        XCTAssertEqual(result.first?.attribution, .diarized)
+        XCTAssertEqual(try XCTUnwrap(result.first?.confidence), 0.674, accuracy: 0.001)
+    }
+
+    func testAssemblerNormalizesInvalidTrackOffsets() {
+        let microphone = LocalTranscript(
+            text: "Hello",
+            duration: 1,
+            segments: [LocalTranscriptSegment(start: 0, end: 1, text: "Hello", timingSource: .token)]
+        )
+
+        let result = MeetingTranscriptAssembler().assemble(
+            microphone: microphone,
+            system: nil,
+            microphoneOffset: .infinity
+        )
+
+        XCTAssertEqual(result.first?.start, 0)
+        XCTAssertEqual(result.first?.end, 1)
+    }
+
     func testExtractiveIntelligenceKeepsSourceEvidence() throws {
         let decisionID = UUID()
         let actionID = UUID()
@@ -157,6 +218,19 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertTrue(result.decisions.isEmpty)
         XCTAssertTrue(result.actionItems.isEmpty)
         XCTAssertEqual(result.summary, [segment.text])
+    }
+
+    func testExtractiveIntelligenceRejectsQuestionsAndNegatedActions() {
+        let segments = [
+            TranscriptSegment(start: 0, end: 1, speaker: "You", text: "We agreed to launch on Friday?"),
+            TranscriptSegment(start: 1, end: 2, speaker: "You", text: "I will not send the draft."),
+            TranscriptSegment(start: 2, end: 3, speaker: "You", text: "Do we need to follow up?"),
+        ]
+
+        let result = MeetingIntelligencePipeline().generate(from: segments)
+
+        XCTAssertTrue(result.decisions.isEmpty)
+        XCTAssertTrue(result.actionItems.isEmpty)
     }
 
     func testLegacyTranscriptSegmentDecodesWithSafeDefaults() throws {

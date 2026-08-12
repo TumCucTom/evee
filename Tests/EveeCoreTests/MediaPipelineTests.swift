@@ -3,6 +3,28 @@ import XCTest
 @testable import EveeCore
 
 final class MediaPipelineTests: XCTestCase {
+    func testRetainedAudioPolicyRejectsEmptyFilesDirectoriesAndLinks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let empty = root.appendingPathComponent("empty.caf")
+        try Data().write(to: empty)
+        let link = root.appendingPathComponent("linked.caf")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: empty)
+
+        XCTAssertThrowsError(try RetainedAudioPolicy.validate(empty))
+        XCTAssertThrowsError(try RetainedAudioPolicy.validate(root))
+        XCTAssertThrowsError(try RetainedAudioPolicy.validate(link))
+    }
+
+    func testRetainedAudioPolicyAcceptsReadableRegularFile() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("evee-audio-\(UUID().uuidString).caf")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data("audio".utf8).write(to: file)
+
+        XCTAssertNoThrow(try RetainedAudioPolicy.validate(file))
+    }
+
     func testQwenConversionReadsLongAudioInBoundedChunks() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("evee-media-\(UUID().uuidString).caf")

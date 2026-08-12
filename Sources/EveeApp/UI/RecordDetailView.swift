@@ -171,10 +171,10 @@ struct RecordDetailView: View {
     }
 
     private func meetingIntelligenceSection(_ intelligence: MeetingIntelligence) -> some View {
-        section("Meeting overview", subtitle: "Extracted locally from explicit transcript wording; verify before acting") {
+        section("Meeting overview", subtitle: "Extracted locally from the timed source transcript; verify before acting") {
             VStack(alignment: .leading, spacing: 16) {
                 if !intelligence.summary.isEmpty {
-                    insightGroup("Summary", icon: "text.alignleft") {
+                    insightGroup("Transcript highlights", icon: "text.alignleft") {
                         ForEach(intelligence.summary, id: \.self) { item in
                             insightRow(item)
                         }

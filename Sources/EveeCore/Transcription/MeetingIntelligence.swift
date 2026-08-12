@@ -290,7 +290,21 @@ public actor FluidOfflineMeetingDiarizer {
 }
 
 public struct MeetingTranscriptAssembler: Sendable {
-    public init() {}
+    /// A speaker label is only applied when the best cluster covers enough of
+    /// the utterance and clearly dominates the other overlapping clusters.
+    /// Coarse ASR chunks can contain more than one person, so assigning the
+    /// longest single overlap without these gates would overstate the model's
+    /// evidence.
+    public let minimumSpeakerCoverage: Double
+    public let minimumSpeakerDominance: Double
+
+    public init(
+        minimumSpeakerCoverage: Double = 0.5,
+        minimumSpeakerDominance: Double = 0.6
+    ) {
+        self.minimumSpeakerCoverage = min(1, max(0, minimumSpeakerCoverage))
+        self.minimumSpeakerDominance = min(1, max(0.5, minimumSpeakerDominance))
+    }
 
     /// Combines independently timed microphone and system transcripts. Offsets
     /// are relative to the meeting's common clock and must come from capture-time
@@ -302,6 +316,8 @@ public struct MeetingTranscriptAssembler: Sendable {
         microphoneOffset: TimeInterval = 0,
         systemOffset: TimeInterval = 0
     ) -> [TranscriptSegment] {
+        let microphoneOffset = normalizedOffset(microphoneOffset)
+        let systemOffset = normalizedOffset(systemOffset)
         var result = microphone.segments.map { segment in
             TranscriptSegment(
                 id: segment.id,
@@ -365,29 +381,74 @@ public struct MeetingTranscriptAssembler: Sendable {
         return labels
     }
 
+    private struct SpeakerMatch {
+        var speakerID: String
+        var confidence: Float?
+        var overlap: TimeInterval
+    }
+
+    private struct SpeakerEvidence {
+        var overlap: TimeInterval = 0
+        var confidenceTotal: Double = 0
+        var confidenceWeight: TimeInterval = 0
+
+        var confidence: Float? {
+            guard confidenceWeight > 0 else { return nil }
+            return Float(confidenceTotal / confidenceWeight)
+        }
+    }
+
     private func bestSpeaker(
         forStart start: TimeInterval,
         end: TimeInterval,
         intervals: [SpeakerInterval],
         offset: TimeInterval
-    ) -> SpeakerInterval? {
-        intervals
-            .map { interval -> (SpeakerInterval, TimeInterval) in
-                let shifted = SpeakerInterval(
-                    speakerID: interval.speakerID,
-                    start: interval.start + offset,
-                    end: interval.end + offset,
-                    confidence: interval.confidence
-                )
-                return (shifted, max(0, min(end, shifted.end) - max(start, shifted.start)))
+    ) -> SpeakerMatch? {
+        let duration = end - start
+        guard start.isFinite, end.isFinite, duration > 0 else { return nil }
+
+        var evidence: [String: SpeakerEvidence] = [:]
+        for interval in intervals {
+            let shiftedStart = interval.start + offset
+            let shiftedEnd = interval.end + offset
+            guard shiftedStart.isFinite, shiftedEnd.isFinite else { continue }
+            let overlap = max(0, min(end, shiftedEnd) - max(start, shiftedStart))
+            guard overlap > 0 else { continue }
+            var value = evidence[interval.speakerID, default: SpeakerEvidence()]
+            value.overlap += overlap
+            if let confidence = interval.confidence, confidence.isFinite {
+                value.confidenceTotal += Double(min(1, max(0, confidence))) * overlap
+                value.confidenceWeight += overlap
             }
-            .filter { $0.1 > 0 }
-            .max { lhs, rhs in lhs.1 < rhs.1 }?
-            .0
+            evidence[interval.speakerID] = value
+        }
+
+        let ordered = evidence.map { speakerID, value in
+            SpeakerMatch(speakerID: speakerID, confidence: value.confidence, overlap: value.overlap)
+        }.sorted { lhs, rhs in
+            lhs.overlap == rhs.overlap ? lhs.speakerID < rhs.speakerID : lhs.overlap > rhs.overlap
+        }
+        guard let best = ordered.first else { return nil }
+
+        // Diarizers can emit overlapping intervals. Coverage is measured
+        // against the utterance while dominance is measured against all model
+        // evidence; both must pass before a single-speaker claim is made.
+        let totalEvidence = ordered.reduce(0) { $0 + $1.overlap }
+        let coverage = min(1, best.overlap / duration)
+        let dominance = totalEvidence > 0 ? best.overlap / totalEvidence : 0
+        guard coverage >= minimumSpeakerCoverage,
+              dominance >= minimumSpeakerDominance else { return nil }
+        return best
+    }
+
+    private func normalizedOffset(_ value: TimeInterval) -> TimeInterval {
+        value.isFinite ? max(0, value) : 0
     }
 
     private func combinedConfidence(_ transcript: Float?, _ speaker: Float?) -> Float? {
-        switch (transcript, speaker) {
+        let transcript = transcript.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
+        let speaker = speaker.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
+        return switch (transcript, speaker) {
         case let (left?, right?): min(left, right)
         case let (value?, nil), let (nil, value?): value
         case (nil, nil): nil
@@ -420,7 +481,7 @@ public struct MeetingIntelligencePipeline: Sendable {
         let text = normalized(segment.text)
         let lower = text.lowercased()
         let markers = ["we decided", "we agreed", "the decision is", "decision:", "agreed to", "we committed to"]
-        guard markers.contains(where: lower.contains) else { return nil }
+        guard !isQuestion(text), markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
             kind: .decision,
             text: text,
@@ -433,7 +494,10 @@ public struct MeetingIntelligencePipeline: Sendable {
         let text = normalized(segment.text)
         let lower = text.lowercased()
         let markers = ["action item", "todo", "to-do", "follow up", "i will", "i'll", "you will", "you'll", "needs to", "need to"]
-        guard markers.contains(where: lower.contains) else { return nil }
+        let negations = ["will not", "won't", "do not need to", "don't need to", "does not need to", "doesn't need to", "no action item"]
+        guard !isQuestion(text),
+              !negations.contains(where: lower.contains),
+              markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
             kind: .actionItem,
             text: text,
@@ -487,5 +551,9 @@ public struct MeetingIntelligencePipeline: Sendable {
     private func normalized(_ text: String) -> String {
         text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isQuestion(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
     }
 }

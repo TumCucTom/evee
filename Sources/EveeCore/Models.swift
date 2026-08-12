@@ -421,6 +421,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var textDeliveryMode: TextDeliveryMode = .paste
     public var retainContextMetadata = false
     public var retainSelectedText = false
+    public var audioCuesEnabled = false
     public var dictionary: [DictionaryTerm] = []
     public var appStyles: [AppWritingStyle] = []
 
@@ -429,7 +430,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
-        case textDeliveryMode, retainContextMetadata, retainSelectedText
+        case textDeliveryMode, retainContextMetadata, retainSelectedText, audioCuesEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -449,6 +450,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         textDeliveryMode = try values.decodeIfPresent(TextDeliveryMode.self, forKey: .textDeliveryMode) ?? .paste
         retainContextMetadata = try values.decodeIfPresent(Bool.self, forKey: .retainContextMetadata) ?? false
         retainSelectedText = try values.decodeIfPresent(Bool.self, forKey: .retainSelectedText) ?? false
+        audioCuesEnabled = try values.decodeIfPresent(Bool.self, forKey: .audioCuesEnabled) ?? false
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
     }
@@ -469,6 +471,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(textDeliveryMode, forKey: .textDeliveryMode)
         try values.encode(retainContextMetadata, forKey: .retainContextMetadata)
         try values.encode(retainSelectedText, forKey: .retainSelectedText)
+        try values.encode(audioCuesEnabled, forKey: .audioCuesEnabled)
         try values.encode(dictionary, forKey: .dictionary)
         try values.encode(appStyles, forKey: .appStyles)
         // webhookSecret is deliberately omitted. It exists in CodingKeys only so

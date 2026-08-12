@@ -466,8 +466,12 @@ public actor LibraryStore {
         guard !relativePath.isEmpty, !relativePath.hasPrefix("/") else {
             throw LibraryStoreError.unsafeRelativePath(relativePath)
         }
-        let candidate = rootURL.appendingPathComponent(relativePath).standardizedFileURL
-        let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        let candidate = rootURL
+            .appendingPathComponent(relativePath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let resolvedRoot = rootURL.resolvingSymlinksInPath()
+        let rootPath = resolvedRoot.path.hasSuffix("/") ? resolvedRoot.path : resolvedRoot.path + "/"
         guard candidate.path.hasPrefix(rootPath) else {
             throw LibraryStoreError.unsafeRelativePath(relativePath)
         }

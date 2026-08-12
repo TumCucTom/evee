@@ -103,8 +103,26 @@ struct SettingsView: View {
 
             Section("Privacy and storage") {
                 Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
-                Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
-                    .disabled(!store.settings.meetingCaptureEnabled)
+                HStack {
+                    Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
+                        .disabled(!store.settings.meetingCaptureEnabled)
+                    Spacer()
+                    if store.meetingDiarizationReady {
+                        Label("Ready", systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    } else {
+                        Button(store.isPreparingMeetingDiarization ? "Preparing…" : "Prepare model") {
+                            Task { await store.prepareMeetingDiarization() }
+                        }
+                        .disabled(
+                            !store.settings.meetingCaptureEnabled ||
+                            !store.settings.meetingDiarizationEnabled ||
+                            store.isPreparingMeetingDiarization ||
+                            store.captureState != .idle
+                        )
+                    }
+                }
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
@@ -116,7 +134,7 @@ struct SettingsView: View {
                 Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Anonymous speaker separation is off by default. Enabling it downloads and runs an additional local model when a meeting is processed; speaker names are never inferred.")
+                Text("Anonymous speaker separation is off by default and uses an additional local model. Prepare it before a meeting to avoid a download while processing. If separation is unavailable, Evee still saves the transcript with honest channel labels; speaker names are never inferred.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")
@@ -182,7 +200,8 @@ struct SettingsView: View {
 
             Section("Application") {
                 LaunchAtLogin.Toggle()
-                Text("Audio cues and wake-word mode are not available in this build.")
+                Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
+                Text("Audio cues mark recording start, processing, completion and errors. Wake-word mode is not available in this build.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -19,6 +19,12 @@ enum InstallationSelfTest {
         guard !resourceBundles.isEmpty else {
             throw failure("Packaged dependency resource bundles are unavailable.")
         }
+        guard let resources = Bundle.main.resourceURL,
+              FileManager.default.fileExists(
+                  atPath: resources.appendingPathComponent(".evee-resource-seal.sha256").path
+              ) else {
+            throw failure("The packaged resource seal is unavailable.")
+        }
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("evee-installation-self-test-\(UUID().uuidString)", isDirectory: true)

@@ -29,12 +29,28 @@ public enum WebhookEndpointError: LocalizedError, Sendable {
     case invalidURL
     case insecureTransport
     case embeddedCredentials
+    case sensitiveURLComponents
 
     public var errorDescription: String? {
         switch self {
         case .invalidURL: "Enter a valid webhook URL with a host."
         case .insecureTransport: "Meeting webhooks require HTTPS. HTTP is allowed only for localhost development."
         case .embeddedCredentials: "Webhook URLs cannot contain usernames or passwords. Use the signing secret instead."
+        case .sensitiveURLComponents: "Webhook URLs cannot contain query parameters or fragments. Use the signing secret instead."
+        }
+    }
+}
+
+public enum WebhookPayloadError: LocalizedError, Sendable {
+    case empty
+    case tooLarge
+    case invalidJSON
+
+    public var errorDescription: String? {
+        switch self {
+        case .empty: "The webhook payload is empty."
+        case .tooLarge: "The webhook payload is too large to queue safely."
+        case .invalidJSON: "The webhook payload is not valid JSON."
         }
     }
 }
@@ -45,6 +61,7 @@ public enum WebhookEndpointPolicy {
             throw WebhookEndpointError.invalidURL
         }
         guard destination.user == nil, destination.password == nil else { throw WebhookEndpointError.embeddedCredentials }
+        guard destination.query == nil, destination.fragment == nil else { throw WebhookEndpointError.sensitiveURLComponents }
         if scheme == "https" { return }
         let loopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
         guard scheme == "http", loopback else { throw WebhookEndpointError.insecureTransport }
@@ -52,6 +69,7 @@ public enum WebhookEndpointPolicy {
 }
 
 public struct MeetingWebhook: Sendable {
+    public static let maximumPayloadSize = 10 * 1_024 * 1_024
     private let session: URLSession
 
     public init(session: URLSession = .shared) {
@@ -81,6 +99,7 @@ public struct MeetingWebhook: Sendable {
         } else {
             body = try Self.payload(for: record)
         }
+        try Self.validatePayload(body)
         let attempts = max(1, min(maxAttempts, 5))
         var delivery = WebhookDelivery(
             id: deliveryID,
@@ -134,15 +153,21 @@ public struct MeetingWebhook: Sendable {
                 )
             } catch let failure as WebhookDeliveryFailure {
                 throw failure
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
-                delivery.lastError = error.localizedDescription
-                if attempt < attempts {
+                if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                    throw CancellationError()
+                }
+                let retryable = Self.isTransient(error: error)
+                delivery.lastError = Self.failureMessage(for: error)
+                if attempt < attempts, retryable {
                     try await backoff(after: attempt)
                     continue
                 }
                 delivery.state = .failed
-                delivery.retryable = true
-                delivery.nextAttemptAt = Self.nextAttempt(after: delivery.attemptCount)
+                delivery.retryable = retryable
+                delivery.nextAttemptAt = retryable ? Self.nextAttempt(after: delivery.attemptCount) : nil
                 throw WebhookDeliveryFailure(delivery: delivery)
             }
         }
@@ -169,8 +194,46 @@ public struct MeetingWebhook: Sendable {
         return try encoder.encode(stable)
     }
 
+    public static func validatePayload(_ body: Data) throws {
+        guard !body.isEmpty else { throw WebhookPayloadError.empty }
+        guard body.count <= maximumPayloadSize else { throw WebhookPayloadError.tooLarge }
+        guard let object = try? JSONSerialization.jsonObject(with: body),
+              JSONSerialization.isValidJSONObject(object) else {
+            throw WebhookPayloadError.invalidJSON
+        }
+    }
+
     private static func isTransient(statusCode: Int) -> Bool {
         statusCode == 408 || statusCode == 425 || statusCode == 429 || (500...599).contains(statusCode)
+    }
+
+    private static func isTransient(error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost, .networkConnectionLost,
+             .dnsLookupFailed, .notConnectedToInternet, .resourceUnavailable,
+             .internationalRoamingOff, .callIsActive, .dataNotAllowed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func failureMessage(for error: Error) -> String {
+        guard let urlError = error as? URLError else { return "Webhook delivery failed before a response was received." }
+        switch urlError.code {
+        case .timedOut: return "Webhook delivery timed out."
+        case .cancelled: return "Webhook delivery was cancelled."
+        case .notConnectedToInternet: return "Webhook delivery is waiting for a network connection."
+        case .cannotFindHost, .dnsLookupFailed: return "The webhook host could not be resolved."
+        case .cannotConnectToHost, .networkConnectionLost: return "The webhook host could not be reached."
+        case .secureConnectionFailed, .serverCertificateHasBadDate,
+             .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid, .clientCertificateRejected,
+             .clientCertificateRequired:
+            return "The webhook connection could not be secured."
+        default: return "Webhook delivery failed before a response was received."
+        }
     }
 
     private static func nextAttempt(after attemptCount: Int) -> Date {

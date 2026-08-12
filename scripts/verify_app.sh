@@ -11,11 +11,24 @@ test -x "$main_executable"
 test -x "$mcp_executable"
 test -f "$contents/Info.plist"
 test -f "$contents/Resources/Evee.icns"
+test -s "$contents/Resources/.evee-resource-seal.sha256"
 resource_count="$(find "$contents/Resources" -maxdepth 1 -type d -name '*.bundle' | wc -l | tr -d ' ')"
 test "$resource_count" -gt 0
+if find "$contents" -type l -print -quit | grep -q .; then
+  echo "The app bundle contains an unexpected symbolic link" >&2
+  exit 1
+fi
+(
+  cd "$contents/Resources"
+  shasum -a 256 -c .evee-resource-seal.sha256
+  sealed_count="$(wc -l <.evee-resource-seal.sha256 | tr -d ' ')"
+  actual_count="$(find . -type f ! -name '.evee-resource-seal.sha256' | wc -l | tr -d ' ')"
+  test "$sealed_count" = "$actual_count"
+)
 
 plutil -lint "$contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
+codesign --verify --strict --verbose=2 "$mcp_executable"
 entitlements_plist="$(mktemp)"
 codesign -d --entitlements :- --xml "$app_dir" >"$entitlements_plist" 2>/dev/null
 /usr/bin/plutil -lint "$entitlements_plist"
@@ -24,6 +37,12 @@ test "$audio_entitlement" = "true"
 
 bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$contents/Info.plist")"
 test "$bundle_identifier" = "com.tumcuctom.evee"
+minimum_system="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$contents/Info.plist")"
+test "$minimum_system" = "14.0"
+short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$contents/Info.plist")"
+build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$contents/Info.plist")"
+[[ "$short_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]
+[[ "$build_version" =~ ^[1-9][0-9]*$ ]]
 
 # Exercise a real MCP handshake, tool discovery and data-backed call from the
 # moved helper instead of treating EOF as proof of protocol correctness.

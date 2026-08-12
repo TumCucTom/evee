@@ -74,8 +74,9 @@ private final class CaptureOverlayController {
 
     private weak var store: AppStore?
     private var observation: AnyCancellable?
+    private var statusObservation: AnyCancellable?
     private var panel: CaptureHUDPanel?
-    private var announcedPhase: CaptureAnnouncementPhase?
+    private var announcedState: CaptureAnnouncementState?
 
     func install(store: AppStore) {
         guard self.store !== store else { return }
@@ -83,6 +84,21 @@ private final class CaptureOverlayController {
         observation = store.$captureState
             .receive(on: RunLoop.main)
             .sink { [weak self] state in self?.render(state) }
+        statusObservation = store.$statusMessage
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { message in
+                NSAccessibility.post(
+                    element: NSApplication.shared,
+                    notification: .announcementRequested,
+                    userInfo: [
+                        .announcement: message,
+                        .priority: NSAccessibilityPriorityLevel.high.rawValue
+                    ]
+                )
+            }
     }
 
     private func render(_ state: CaptureState) {
@@ -107,10 +123,13 @@ private final class CaptureOverlayController {
     }
 
     private func announceStateChange(_ state: CaptureState) {
-        let phase = CaptureAnnouncementPhase(state)
-        guard phase != announcedPhase else { return }
-        let previous = announcedPhase
-        announcedPhase = phase
+        let announcement = CaptureAnnouncementState(
+            state,
+            isSelectionTransform: store?.captureOperation == .selectionTransform
+        )
+        guard announcement != announcedState else { return }
+        let previous = announcedState
+        announcedState = announcement
 
         let message: String?
         switch state {
@@ -123,7 +142,9 @@ private final class CaptureOverlayController {
         case .transcribing:
             message = "Evee is transcribing locally."
         case .delivering:
-            message = "Evee is inserting the finished text."
+            message = store?.captureOperation == .selectionTransform
+                ? "Evee is verifying and replacing the selected text."
+                : "Evee is verifying and inserting the finished text."
         case .failed(let detail):
             message = "Evee capture failed. \(detail)"
         }
@@ -168,17 +189,17 @@ private final class CaptureOverlayController {
     }
 }
 
-private enum CaptureAnnouncementPhase: Equatable {
-    case idle, starting, recording, transcribing, delivering, failed
+private enum CaptureAnnouncementState: Equatable {
+    case idle, starting, recording, transcribing, delivering, deliveringSelection, failed(String)
 
-    init(_ state: CaptureState) {
+    init(_ state: CaptureState, isSelectionTransform: Bool) {
         switch state {
         case .idle: self = .idle
         case .starting: self = .starting
         case .recording: self = .recording
         case .transcribing: self = .transcribing
-        case .delivering: self = .delivering
-        case .failed: self = .failed
+        case .delivering: self = isSelectionTransform ? .deliveringSelection : .delivering
+        case .failed(let detail): self = .failed(detail)
         }
     }
 }

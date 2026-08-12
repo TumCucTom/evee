@@ -54,6 +54,18 @@ for bundle in "${resource_bundles[@]}"; do
 done
 shopt -u nullglob
 
+# Record every packaged resource before signing. Code signing seals these files
+# as well, while this portable digest makes omissions and post-build corruption
+# explicit during verification and installation self-test runs.
+resource_seal="$contents/Resources/.evee-resource-seal.sha256"
+(
+  cd "$contents/Resources"
+  while IFS= read -r resource; do
+    shasum -a 256 "$resource"
+  done < <(find . -type f ! -name '.evee-resource-seal.sha256' -print | LC_ALL=C sort)
+) >"$resource_seal"
+test -s "$resource_seal"
+
 cp /dev/stdin "$contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -55,6 +55,34 @@ public struct FocusedTargetContext: Equatable, Sendable {
     }
 }
 
+/// A fail-closed policy for deciding whether a synthetic paste changed the
+/// focused field exactly as expected before Return may be generated.
+public enum TextInsertionVerification {
+    public static func confirmsInsertion(
+        before: String,
+        after: String,
+        insertedText: String,
+        replacing selectedText: String? = nil
+    ) -> Bool {
+        guard !insertedText.isEmpty, before != after else { return false }
+        let removedLength = selectedText?.utf16.count ?? 0
+        guard after.utf16.count - before.utf16.count == insertedText.utf16.count - removedLength else {
+            return false
+        }
+        return occurrenceCount(of: insertedText, in: after) > occurrenceCount(of: insertedText, in: before)
+    }
+
+    private static func occurrenceCount(of needle: String, in value: String) -> Int {
+        var count = 0
+        var searchRange = value.startIndex..<value.endIndex
+        while let match = value.range(of: needle, range: searchRange) {
+            count += 1
+            searchRange = match.upperBound..<value.endIndex
+        }
+        return count
+    }
+}
+
 @MainActor
 public enum TextDelivery {
     public enum DeliveryError: LocalizedError {
@@ -192,8 +220,12 @@ public enum TextDelivery {
                 }
                 if let before = valueBeforePaste,
                    let after = focusedEditableValue(processIdentifier: target.processIdentifier),
-                   after != before,
-                   after.contains(text) {
+                   TextInsertionVerification.confirmsInsertion(
+                       before: before,
+                       after: after,
+                       insertedText: text,
+                       replacing: expectedSelectedText
+                   ) {
                     insertionVerified = true
                     break
                 }

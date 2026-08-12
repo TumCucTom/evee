@@ -22,7 +22,12 @@ final class AppStore: ObservableObject {
     @Published var route: Route = .library
     @Published var records: [WorkspaceRecord] = []
     @Published var settings = EveeSettings()
-    @Published var captureState: CaptureState = .idle
+    @Published var captureState: CaptureState = .idle {
+        didSet {
+            guard settings.audioCuesEnabled else { return }
+            CaptureAudioCuePlayer.playTransition(from: oldValue, to: captureState)
+        }
+    }
     @Published var search = ""
     @Published var selectedRecordID: UUID?
     @Published var modelProgress: ModelProgress?
@@ -38,6 +43,8 @@ final class AppStore: ObservableObject {
     @Published private(set) var captureKind: WorkspaceRecordKind?
     @Published private(set) var captureOperation: WorkspaceRecordOperation?
     @Published private(set) var isSystemAudioActive = false
+    @Published private(set) var isPreparingMeetingDiarization = false
+    @Published private(set) var meetingDiarizationReady = false
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
     @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
 
@@ -52,6 +59,7 @@ final class AppStore: ObservableObject {
     private let library = LibraryStore.shared
     private let cleanup = TextCleanupPipeline()
     private let selectionTransform = SelectionTransformPipeline()
+    private let meetingDiarizer = FluidOfflineMeetingDiarizer()
     private let api = LocalAPIServer()
     private let secretStore = KeychainSecretStore()
     private var transcriber: (any LocalTranscriber)?
@@ -306,6 +314,24 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func prepareMeetingDiarization() async {
+        guard captureLifecycle == .idle else {
+            statusMessage = "Finish the current capture before preparing speaker separation."
+            return
+        }
+        guard !isPreparingMeetingDiarization else { return }
+        isPreparingMeetingDiarization = true
+        defer { isPreparingMeetingDiarization = false }
+        do {
+            try await meetingDiarizer.prepareModels()
+            meetingDiarizationReady = true
+            statusMessage = "Anonymous speaker separation is ready for meetings."
+        } catch {
+            meetingDiarizationReady = false
+            statusMessage = "Speaker separation could not be prepared: \(error.localizedDescription)"
+        }
+    }
+
     func refreshPermissionState() {
         accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
         microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
@@ -540,20 +566,24 @@ final class AppStore: ObservableObject {
             if activeKind == .meeting,
                let systemURL = activeSystemAudioURL,
                FileManager.default.fileExists(atPath: systemURL.path) {
-                let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
-                guard captureLifecycle == .finishing(sessionID) else { return }
-                raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
-                let speakerIntervals = settings.meetingDiarizationEnabled
-                    ? try await FluidOfflineMeetingDiarizer().diarize(fileURL: systemURL)
-                    : []
-                segments = MeetingTranscriptAssembler().assemble(
-                    microphone: microphoneTranscript,
-                    system: systemTranscript,
-                    systemSpeakerIntervals: speakerIntervals,
-                    microphoneOffset: microphoneOffset,
-                    systemOffset: systemOffset
-                )
-                raw = chronologicalTranscript(segments)
+                do {
+                    let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
+                    guard captureLifecycle == .finishing(sessionID) else { return }
+                    let speakerIntervals = await speakerIntervalsIfAvailable(for: systemURL)
+                    segments = MeetingTranscriptAssembler().assemble(
+                        microphone: microphoneTranscript,
+                        system: systemTranscript,
+                        systemSpeakerIntervals: speakerIntervals,
+                        microphoneOffset: microphoneOffset,
+                        systemOffset: systemOffset
+                    )
+                    raw = chronologicalTranscript(segments)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard canCommitMicrophoneFallback(after: error) else { throw error }
+                    statusMessage = systemTrackFallbackMessage(error)
+                }
             }
             let polished: String
             if activeOperation == .selectionTransform {
@@ -855,22 +885,26 @@ final class AppStore: ObservableObject {
             if capture.kind == .meeting,
                let systemURL = activeSystemAudioURL,
                FileManager.default.fileExists(atPath: systemURL.path) {
-                let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
-                guard captureLifecycle == .finishing(sessionID) else { return }
-                raw = "You: \(microphoneTranscript.text)\n\nOthers: \(systemTranscript.text)"
-                let speakerIntervals = settings.meetingDiarizationEnabled
-                    ? try await FluidOfflineMeetingDiarizer().diarize(fileURL: systemURL)
-                    : []
-                let microphoneOffset = recoveryOffset(for: microphoneTrack, in: capture)
-                let systemOffset = capture.tracks.first(where: { $0.role == .system }).map { recoveryOffset(for: $0, in: capture) } ?? 0
-                segments = MeetingTranscriptAssembler().assemble(
-                    microphone: microphoneTranscript,
-                    system: systemTranscript,
-                    systemSpeakerIntervals: speakerIntervals,
-                    microphoneOffset: microphoneOffset,
-                    systemOffset: systemOffset
-                )
-                raw = chronologicalTranscript(segments)
+                do {
+                    let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
+                    guard captureLifecycle == .finishing(sessionID) else { return }
+                    let speakerIntervals = await speakerIntervalsIfAvailable(for: systemURL)
+                    let microphoneOffset = recoveryOffset(for: microphoneTrack, in: capture)
+                    let systemOffset = capture.tracks.first(where: { $0.role == .system }).map { recoveryOffset(for: $0, in: capture) } ?? 0
+                    segments = MeetingTranscriptAssembler().assemble(
+                        microphone: microphoneTranscript,
+                        system: systemTranscript,
+                        systemSpeakerIntervals: speakerIntervals,
+                        microphoneOffset: microphoneOffset,
+                        systemOffset: systemOffset
+                    )
+                    raw = chronologicalTranscript(segments)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    guard canCommitMicrophoneFallback(after: error) else { throw error }
+                    statusMessage = systemTrackFallbackMessage(error)
+                }
             }
 
             let polished = cleanup.clean(
@@ -1095,6 +1129,43 @@ final class AppStore: ObservableObject {
 
     private func recoveryOffset(for track: WorkspaceAudioTrack, in capture: CaptureRecoveryManifest) -> TimeInterval {
         max(0, track.createdAt.timeIntervalSince(capture.startedAt))
+    }
+
+    /// Diarization is optional enrichment. A missing/corrupt model must never
+    /// discard an otherwise complete dual-track transcript; the channel label
+    /// remains truthful and the user gets a recoverable warning instead.
+    private func speakerIntervalsIfAvailable(for fileURL: URL) async -> [SpeakerInterval] {
+        guard settings.meetingDiarizationEnabled else { return [] }
+        isPreparingMeetingDiarization = true
+        defer { isPreparingMeetingDiarization = false }
+        do {
+            let intervals = try await meetingDiarizer.diarize(fileURL: fileURL)
+            meetingDiarizationReady = true
+            return intervals
+        } catch {
+            meetingDiarizationReady = false
+            statusMessage = "The meeting was transcribed, but anonymous speaker separation was unavailable. The timeline uses microphone and system-audio labels instead. \(error.localizedDescription)"
+            return []
+        }
+    }
+
+    private func systemTrackFallbackMessage(_ error: Error) -> String {
+        if let transcriptionError = error as? TranscriptionError,
+           case .emptyResult = transcriptionError {
+            return "No speech was recognised in the system-audio track. The microphone transcript was saved."
+        }
+        return "The system-audio track could not be transcribed, so the meeting was saved from the microphone track. The retained audio is still available from the meeting record. \(error.localizedDescription)"
+    }
+
+    private func canCommitMicrophoneFallback(after error: Error) -> Bool {
+        if let transcriptionError = error as? TranscriptionError,
+           case .emptyResult = transcriptionError {
+            return true
+        }
+        // When retention is disabled, committing a partial record would purge
+        // the failed system track. Keep the recovery capture instead so the
+        // user can retry or explicitly discard the original audio.
+        return settings.retainMeetingAudio
     }
 
     private func chronologicalTranscript(_ segments: [TranscriptSegment]) -> String {

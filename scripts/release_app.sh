@@ -16,6 +16,9 @@ esac
 EVEE_CODESIGN_IDENTITY="$EVEE_CODESIGN_IDENTITY" scripts/package_app.sh release
 scripts/verify_app.sh dist/Evee.app
 codesign --verify --deep --strict --verbose=2 dist/Evee.app
+signature_details="$(codesign -d --verbose=4 dist/Evee.app 2>&1)"
+grep -q 'Authority=Developer ID Application:' <<<"$signature_details"
+grep -q 'flags=.*runtime' <<<"$signature_details"
 
 mkdir -p dist
 zip_path="dist/Evee-notarization.zip"
