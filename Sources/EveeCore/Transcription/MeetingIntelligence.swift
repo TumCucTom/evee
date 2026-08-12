@@ -423,9 +423,16 @@ public struct MeetingTranscriptAssembler: Sendable {
             evidence[interval.speakerID] = value
         }
 
-        let ordered = evidence.map { speakerID, value in
-            SpeakerMatch(speakerID: speakerID, confidence: value.confidence, overlap: value.overlap)
-        }.sorted { lhs, rhs in
+        var ordered: [SpeakerMatch] = []
+        ordered.reserveCapacity(evidence.count)
+        for (speakerID, value) in evidence {
+            ordered.append(SpeakerMatch(
+                speakerID: speakerID,
+                confidence: value.confidence,
+                overlap: value.overlap
+            ))
+        }
+        ordered.sort { lhs, rhs in
             lhs.overlap == rhs.overlap ? lhs.speakerID < rhs.speakerID : lhs.overlap > rhs.overlap
         }
         guard let best = ordered.first else { return nil }
