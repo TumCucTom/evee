@@ -7,6 +7,7 @@ import KeyboardShortcuts
 extension KeyboardShortcuts.Name {
     static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
     static let transformSelection = Self("transformSelection", default: .init(.space, modifiers: [.command, .option, .shift]))
+    static let toggleHandsFree = Self("toggleHandsFree")
 }
 
 @MainActor
@@ -59,6 +60,7 @@ final class AppStore: ObservableObject {
     private let library = LibraryStore.shared
     private let cleanup = TextCleanupPipeline()
     private let selectionTransform = SelectionTransformPipeline()
+    private let writingEnhancements = WritingEnhancementPipeline()
     private let meetingDiarizer = FluidOfflineMeetingDiarizer()
     private let api = LocalAPIServer()
     private let secretStore = KeychainSecretStore()
@@ -146,6 +148,9 @@ final class AppStore: ObservableObject {
         }
         KeyboardShortcuts.onKeyUp(for: .transformSelection) { [weak self] in
             self?.shortcutContinuation.yield(.transformUp)
+        }
+        KeyboardShortcuts.onKeyUp(for: .toggleHandsFree) { [weak self] in
+            Task { @MainActor in await self?.toggleHandsFreeDictation() }
         }
         shortcutTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -361,7 +366,7 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then hold the shortcut again."
             return
         }
-        activeApplication = TextDelivery.frontmostApplication()
+        activeApplication = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext)
         guard activeApplication != nil else {
             statusMessage = "Evee could not identify the app that should receive this dictation."
             return
@@ -387,7 +392,7 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then try the transform shortcut again."
             return
         }
-        guard let target = TextDelivery.frontmostApplication(),
+        guard let target = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext),
               let selectedText = target.focusedTarget?.selectedText,
               !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusMessage = SelectionTransformError.emptySelection.localizedDescription
@@ -423,6 +428,23 @@ final class AppStore: ObservableObject {
         await beginCapture(prefix: "memo")
     }
 
+    func toggleHandsFreeDictation() async {
+        switch captureLifecycle {
+        case .idle:
+            await beginDictation()
+        case .starting, .recording:
+            if activeKind == .dictation && activeOperation == .capture {
+                await finishCapture()
+            } else {
+                statusMessage = "Hands-free dictation cannot replace the capture already in progress."
+            }
+        case .finishing, .cancelling:
+            statusMessage = "Wait for the current capture to finish before toggling hands-free dictation."
+        default:
+            statusMessage = "Hands-free dictation cannot replace the capture already in progress."
+        }
+    }
+
     private func beginCapture(prefix: String) async {
         guard captureLifecycle == .idle else { return }
         let sessionID = UUID()
@@ -446,7 +468,11 @@ final class AppStore: ObservableObject {
             let url = directory.appendingPathComponent("microphone.caf")
             activeAudioURL = url
             microphoneTrackStartedAt = .now
-            try await recorder.start(at: url)
+            try await recorder.start(
+                at: url,
+                deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                lowLatency: settings.lowLatencyMode
+            )
 
             guard captureLifecycle == .starting(sessionID) else {
                 await cleanUpCancelledStart(sessionID: sessionID)
@@ -594,12 +620,19 @@ final class AppStore: ObservableObject {
                 )
             } else {
                 let style = styleForActiveApplication()
-                polished = cleanup.clean(
+                let cleaned = cleanup.clean(
                     raw,
                     terms: settings.dictionary,
                     tone: style?.tone ?? settings.defaultTone,
                     appendPeriod: style?.appendPeriod ?? true,
                     useParagraphs: style?.useParagraphs ?? true
+                )
+                polished = writingEnhancements.enhance(
+                    cleaned,
+                    smartLinks: settings.smartLinks,
+                    emailMode: settings.emailFormattingMode,
+                    emailSignOff: settings.emailSignOff,
+                    context: activeWorkspaceContext()
                 )
             }
             let intelligence = activeKind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
@@ -982,7 +1015,19 @@ final class AppStore: ObservableObject {
             var changed = record
             changed.updatedAt = .now
             try await library.upsert(changed)
-            if let index = records.firstIndex(where: { $0.id == changed.id }) { records[index] = changed }
+            if let index = records.firstIndex(where: { $0.id == changed.id }) {
+                let previous = records[index]
+                records[index] = changed
+                if settings.learnCorrections,
+                   previous.kind == .dictation,
+                   previous.operation == .capture,
+                   let term = CorrectionLearner().candidate(from: previous.text, edited: changed.text),
+                   !settings.dictionary.contains(where: { $0.spoken.caseInsensitiveCompare(term.spoken) == .orderedSame }) {
+                    settings.dictionary.append(term)
+                    try await library.save(settings)
+                    statusMessage = "Learned ‘\(term.spoken)’ → ‘\(term.replacement)’. You can review it in Dictionary."
+                }
+            }
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -1241,14 +1286,35 @@ final class AppStore: ObservableObject {
     private func persistedActiveContext() -> WorkspaceContext? {
         guard let application = activeApplication else { return nil }
         let target = application.focusedTarget
-        guard settings.retainContextMetadata || settings.retainSelectedText else { return nil }
+        guard settings.retainContextMetadata || settings.retainSelectedText || settings.captureVisibleContext else { return nil }
         return WorkspaceContext(
             bundleIdentifier: settings.retainContextMetadata ? application.bundleIdentifier : nil,
             applicationName: settings.retainContextMetadata ? application.name : nil,
             windowTitle: settings.retainContextMetadata ? target?.windowTitle : nil,
             document: settings.retainContextMetadata ? target?.document : nil,
             focusedRole: settings.retainContextMetadata ? target?.role : nil,
-            selectedText: settings.retainSelectedText ? activeSelectedText : nil
+            selectedText: settings.retainSelectedText ? activeSelectedText : nil,
+            url: settings.retainContextMetadata ? target?.url : nil,
+            codeFile: settings.retainContextMetadata ? target?.codeFile : nil,
+            recipient: settings.retainContextMetadata ? target?.recipient : nil,
+            visibleText: settings.captureVisibleContext ? target?.visibleText : nil
+        )
+    }
+
+    private func activeWorkspaceContext() -> WorkspaceContext? {
+        guard let application = activeApplication else { return nil }
+        let target = application.focusedTarget
+        return WorkspaceContext(
+            bundleIdentifier: application.bundleIdentifier,
+            applicationName: application.name,
+            windowTitle: target?.windowTitle,
+            document: target?.document,
+            focusedRole: target?.role,
+            selectedText: activeSelectedText,
+            url: target?.url,
+            codeFile: target?.codeFile,
+            recipient: target?.recipient,
+            visibleText: target?.visibleText
         )
     }
 }

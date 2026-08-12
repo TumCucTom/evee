@@ -11,11 +11,15 @@ struct SettingsView: View {
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
     @State private var integrationMessage: String?
+    @State private var inputDevices: [AudioInputDevice] = []
+    @State private var newLinkPhrase = ""
+    @State private var newLinkDestination = ""
 
     var body: some View {
         Form {
             Section("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
+                KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Transform selection:", name: .transformSelection)
                 Picker("Local model", selection: $store.settings.model) {
                     ForEach(SpeechModel.allCases, id: \.self) { model in Text(model.title).tag(model) }
@@ -34,12 +38,9 @@ struct SettingsView: View {
                     .disabled(selectedModelReady || store.modelProgress != nil)
                 }
                 Picker("Language", selection: $store.settings.languageCode) {
-                    Text("Automatic").tag("auto")
-                    Text("English").tag("en")
-                    Text("French").tag("fr")
-                    Text("German").tag("de")
-                    Text("Spanish").tag("es")
-                    Text("Japanese").tag("ja")
+                    ForEach(SupportedLanguage.all) { language in
+                        Text(language.name).tag(language.code)
+                    }
                 }
                 Picker("Default writing style", selection: $store.settings.defaultTone) {
                     ForEach(WritingTone.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
@@ -55,8 +56,48 @@ struct SettingsView: View {
                 Text("Selection transform is local and deterministic in this build: concise, clean up, case changes, lists, and ‘replace … with …’. Unsupported generative rewrites leave the selection unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                LabeledContent("Microphone", value: "System default")
-                Text("Input-device selection is not available in this build. Evee follows the macOS system input device.")
+                Picker("Microphone", selection: $store.settings.inputDeviceUID) {
+                    Text("System default").tag("")
+                    ForEach(inputDevices) { device in Text(device.name).tag(device.uid) }
+                }
+                Toggle("Low-latency microphone buffering", isOn: $store.settings.lowLatencyMode)
+                Text("The selected input and latency mode take effect on the next capture.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Writing enhancements") {
+                Picker("Email formatting", selection: $store.settings.emailFormattingMode) {
+                    ForEach(EmailFormattingMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
+                }
+                TextField("Email sign-off name (optional)", text: $store.settings.emailSignOff)
+                Toggle("Learn simple corrections from edited dictations", isOn: $store.settings.learnCorrections)
+                Text("Learning is opt-in and accepts only one-word substitutions. Learned terms appear in Dictionary where you can review or remove them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if !store.settings.smartLinks.isEmpty {
+                    ForEach(store.settings.smartLinks) { link in
+                        HStack {
+                            Text(link.phrase).font(.callout.weight(.medium))
+                            Image(systemName: "arrow.right")
+                            Text(link.destination).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            Spacer()
+                            Button(role: .destructive) {
+                                store.settings.smartLinks.removeAll { $0.id == link.id }
+                            } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Remove smart link for \(link.phrase)")
+                        }
+                    }
+                }
+                HStack {
+                    TextField("Spoken phrase", text: $newLinkPhrase)
+                    TextField("https://destination.example", text: $newLinkDestination)
+                    Button("Add", action: addSmartLink)
+                        .disabled(!validNewLink)
+                }
+                Text("Smart links replace an exact spoken phrase with its web address locally. Only HTTP and HTTPS destinations are accepted.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -128,7 +169,8 @@ struct SettingsView: View {
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
                 Toggle("Store app and window context with dictations", isOn: $store.settings.retainContextMetadata)
                 Toggle("Store original selected text for transforms", isOn: $store.settings.retainSelectedText)
-                Text("Context is captured in memory to guard delivery. Long-term app/window metadata and original selected text are off by default and controlled separately. Password and protected fields are never read.")
+                Toggle("Capture and store visible accessibility text", isOn: $store.settings.captureVisibleContext)
+                Text("Context is captured only as needed for guarded delivery and optional formatting. Long-term metadata, selected text and visible accessibility text are off by default and controlled separately. Password and protected fields are never read.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
@@ -216,7 +258,10 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .background(AnimaTheme.paper)
-        .task { refreshModelState() }
+        .task {
+            refreshModelState()
+            inputDevices = AudioInputDevices.available()
+        }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
     }
@@ -244,6 +289,23 @@ struct SettingsView: View {
 
     private func removeStyle(id: String) {
         store.settings.appStyles.removeAll { $0.id == id }
+    }
+
+    private var validNewLink: Bool {
+        guard !newLinkPhrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let url = URL(string: newLinkDestination.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "https" || scheme == "http"
+    }
+
+    private func addSmartLink() {
+        guard validNewLink else { return }
+        store.settings.smartLinks.append(SmartLink(
+            phrase: newLinkPhrase.trimmingCharacters(in: .whitespacesAndNewlines),
+            destination: newLinkDestination.trimmingCharacters(in: .whitespacesAndNewlines)
+        ))
+        newLinkPhrase = ""
+        newLinkDestination = ""
     }
 
     private func refreshModelState() {

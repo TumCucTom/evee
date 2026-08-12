@@ -156,6 +156,24 @@ struct RecordDetailView: View {
                 if let focusedRole = context.focusedRole {
                     LabeledContent("Focused control", value: focusedRole)
                 }
+                if let url = context.url {
+                    LabeledContent("Web address", value: url)
+                }
+                if let codeFile = context.codeFile {
+                    LabeledContent("Code file", value: codeFile)
+                }
+                if let recipient = context.recipient, !recipient.isEmpty {
+                    LabeledContent("Recipient field", value: recipient)
+                }
+                if let visibleText = context.visibleText {
+                    DisclosureGroup("Visible accessibility text") {
+                        Text(visibleText)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.top, 6)
+                    }
+                }
                 if let selectedText = context.selectedText {
                     DisclosureGroup("Original selected text") {
                         Text(selectedText)

@@ -17,6 +17,7 @@ public struct TextCleanupPipeline: Sendable {
         guard tone != .verbatim else { return text }
 
         text = removeFillers(text)
+        text = removeFalseStarts(text)
         text = applyVocabulary(text, terms: terms)
         text = spokenFormatting(text)
         text = sentenceCase(text)
@@ -79,6 +80,20 @@ public struct TextCleanupPipeline: Sendable {
             .replacingOccurrences(of: "\\s+([,.!?])", with: "$1", options: .regularExpression)
             .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func removeFalseStarts(_ input: String) -> String {
+        input
+            .replacingOccurrences(
+                of: #"(?i)\b([\p{L}\p{N}']+(?:\s+[\p{L}\p{N}']+){0,3})\s*(?:--|—|\.\.\.)\s*\1\b"#,
+                with: "$1",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?i)\b([\p{L}\p{N}']+)\s+\1\b"#,
+                with: "$1",
+                options: .regularExpression
+            )
     }
 
     private func applyVocabulary(_ input: String, terms: [DictionaryTerm]) -> String {

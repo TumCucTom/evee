@@ -22,6 +22,10 @@ public struct WorkspaceContext: Codable, Hashable, Sendable {
     public var document: String?
     public var focusedRole: String?
     public var selectedText: String?
+    public var url: String?
+    public var codeFile: String?
+    public var recipient: String?
+    public var visibleText: String?
 
     public init(
         bundleIdentifier: String? = nil,
@@ -29,7 +33,11 @@ public struct WorkspaceContext: Codable, Hashable, Sendable {
         windowTitle: String? = nil,
         document: String? = nil,
         focusedRole: String? = nil,
-        selectedText: String? = nil
+        selectedText: String? = nil,
+        url: String? = nil,
+        codeFile: String? = nil,
+        recipient: String? = nil,
+        visibleText: String? = nil
     ) {
         self.bundleIdentifier = bundleIdentifier
         self.applicationName = applicationName
@@ -37,6 +45,10 @@ public struct WorkspaceContext: Codable, Hashable, Sendable {
         self.document = document
         self.focusedRole = focusedRole
         self.selectedText = selectedText
+        self.url = url
+        self.codeFile = codeFile
+        self.recipient = recipient
+        self.visibleText = visibleText
     }
 }
 
@@ -403,6 +415,60 @@ public enum TextDeliveryMode: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public enum EmailFormattingMode: String, Codable, CaseIterable, Sendable {
+    case off
+    case automatic
+    case always
+
+    public var title: String {
+        switch self {
+        case .off: "Off"
+        case .automatic: "Automatic"
+        case .always: "Always"
+        }
+    }
+}
+
+public struct SmartLink: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var phrase: String
+    public var destination: String
+
+    public init(id: UUID = UUID(), phrase: String, destination: String) {
+        self.id = id
+        self.phrase = phrase
+        self.destination = destination
+    }
+}
+
+public struct SupportedLanguage: Identifiable, Hashable, Sendable {
+    public var id: String { code }
+    public var code: String
+    public var name: String
+
+    public init(_ code: String, _ name: String) {
+        self.code = code
+        self.name = name
+    }
+
+    public static let all: [SupportedLanguage] = [
+        .init("auto", "Automatic"), .init("en", "English"), .init("ar", "Arabic"),
+        .init("bg", "Bulgarian"), .init("ca", "Catalan"), .init("zh", "Chinese"),
+        .init("hr", "Croatian"), .init("cs", "Czech"), .init("da", "Danish"),
+        .init("nl", "Dutch"), .init("et", "Estonian"), .init("fi", "Finnish"),
+        .init("fr", "French"), .init("de", "German"), .init("el", "Greek"),
+        .init("he", "Hebrew"), .init("hi", "Hindi"), .init("hu", "Hungarian"),
+        .init("id", "Indonesian"), .init("it", "Italian"), .init("ja", "Japanese"),
+        .init("ko", "Korean"), .init("lv", "Latvian"), .init("lt", "Lithuanian"),
+        .init("ms", "Malay"), .init("no", "Norwegian"), .init("fa", "Persian"),
+        .init("pl", "Polish"), .init("pt", "Portuguese"), .init("ro", "Romanian"),
+        .init("ru", "Russian"), .init("sr", "Serbian"), .init("sk", "Slovak"),
+        .init("sl", "Slovenian"), .init("es", "Spanish"), .init("sv", "Swedish"),
+        .init("th", "Thai"), .init("tr", "Turkish"), .init("uk", "Ukrainian"),
+        .init("ur", "Urdu"), .init("vi", "Vietnamese")
+    ]
+}
+
 public struct EveeSettings: Codable, Equatable, Sendable {
     public var model: SpeechModel = .parakeet
     public var languageCode = "auto"
@@ -421,7 +487,14 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var textDeliveryMode: TextDeliveryMode = .paste
     public var retainContextMetadata = false
     public var retainSelectedText = false
+    public var captureVisibleContext = false
     public var audioCuesEnabled = false
+    public var inputDeviceUID = ""
+    public var lowLatencyMode = false
+    public var emailFormattingMode: EmailFormattingMode = .automatic
+    public var emailSignOff = ""
+    public var learnCorrections = false
+    public var smartLinks: [SmartLink] = []
     public var dictionary: [DictionaryTerm] = []
     public var appStyles: [AppWritingStyle] = []
 
@@ -430,7 +503,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled
         case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
-        case textDeliveryMode, retainContextMetadata, retainSelectedText, audioCuesEnabled
+        case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled
+        case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks
     }
 
     public init(from decoder: Decoder) throws {
@@ -450,7 +524,14 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         textDeliveryMode = try values.decodeIfPresent(TextDeliveryMode.self, forKey: .textDeliveryMode) ?? .paste
         retainContextMetadata = try values.decodeIfPresent(Bool.self, forKey: .retainContextMetadata) ?? false
         retainSelectedText = try values.decodeIfPresent(Bool.self, forKey: .retainSelectedText) ?? false
+        captureVisibleContext = try values.decodeIfPresent(Bool.self, forKey: .captureVisibleContext) ?? false
         audioCuesEnabled = try values.decodeIfPresent(Bool.self, forKey: .audioCuesEnabled) ?? false
+        inputDeviceUID = try values.decodeIfPresent(String.self, forKey: .inputDeviceUID) ?? ""
+        lowLatencyMode = try values.decodeIfPresent(Bool.self, forKey: .lowLatencyMode) ?? false
+        emailFormattingMode = try values.decodeIfPresent(EmailFormattingMode.self, forKey: .emailFormattingMode) ?? .automatic
+        emailSignOff = try values.decodeIfPresent(String.self, forKey: .emailSignOff) ?? ""
+        learnCorrections = try values.decodeIfPresent(Bool.self, forKey: .learnCorrections) ?? false
+        smartLinks = try values.decodeIfPresent([SmartLink].self, forKey: .smartLinks) ?? []
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
     }
@@ -471,7 +552,14 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(textDeliveryMode, forKey: .textDeliveryMode)
         try values.encode(retainContextMetadata, forKey: .retainContextMetadata)
         try values.encode(retainSelectedText, forKey: .retainSelectedText)
+        try values.encode(captureVisibleContext, forKey: .captureVisibleContext)
         try values.encode(audioCuesEnabled, forKey: .audioCuesEnabled)
+        try values.encode(inputDeviceUID, forKey: .inputDeviceUID)
+        try values.encode(lowLatencyMode, forKey: .lowLatencyMode)
+        try values.encode(emailFormattingMode, forKey: .emailFormattingMode)
+        try values.encode(emailSignOff, forKey: .emailSignOff)
+        try values.encode(learnCorrections, forKey: .learnCorrections)
+        try values.encode(smartLinks, forKey: .smartLinks)
         try values.encode(dictionary, forKey: .dictionary)
         try values.encode(appStyles, forKey: .appStyles)
         // webhookSecret is deliberately omitted. It exists in CodingKeys only so
