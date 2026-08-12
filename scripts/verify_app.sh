@@ -11,6 +11,8 @@ test -x "$main_executable"
 test -x "$mcp_executable"
 test -f "$contents/Info.plist"
 test -f "$contents/Resources/Evee.icns"
+root_resource_count="$(find "$app_dir" -maxdepth 1 -type d -name '*.bundle' | wc -l | tr -d ' ')"
+test "$root_resource_count" -gt 0
 
 plutil -lint "$contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_dir"

@@ -12,6 +12,13 @@ enum InstallationSelfTest {
               FileManager.default.isExecutableFile(atPath: helper.path) else {
             throw failure("The packaged MCP helper is missing or not executable.")
         }
+        let resourceBundles = ((try? FileManager.default.contentsOfDirectory(
+            at: Bundle.main.bundleURL,
+            includingPropertiesForKeys: nil
+        )) ?? []).filter { $0.pathExtension == "bundle" }
+        guard !resourceBundles.isEmpty else {
+            throw failure("Packaged dependency resource bundles are unavailable to Bundle.module accessors.")
+        }
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("evee-installation-self-test-\(UUID().uuidString)", isDirectory: true)
