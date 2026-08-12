@@ -21,9 +21,9 @@ a behavioural reference; no Resonant source files or product assets are copied.
 - Optional HMAC-SHA256 meeting webhooks
 - Privacy-safe defaults: no analytics, cloud processing or audio retention by default
 
-System-audio capture is represented by a dedicated capability boundary so it
-can be added with ScreenCaptureKit without weakening the microphone path or the
-privacy model.
+Meeting capture records the microphone and the Mac's system audio through
+separate local paths. If Screen Recording permission is unavailable, Evee says
+so explicitly and continues in microphone-only mode.
 
 ## Requirements
 

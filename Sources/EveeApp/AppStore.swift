@@ -25,11 +25,14 @@ final class AppStore: ObservableObject {
     @Published var meetingNotes = ""
 
     let recorder = MicrophoneRecorder()
+    private let systemAudioRecorder = SystemAudioRecorder()
     private let library = LibraryStore.shared
     private let cleanup = TextCleanupPipeline()
     private let api = LocalAPIServer()
     private var transcriber: (any LocalTranscriber)?
     private var activeAudioURL: URL?
+    private var activeSystemAudioURL: URL?
+    private var isCapturingSystemAudio = false
     private var activeApplication: FrontmostApplication?
     private var activeKind: WorkspaceRecordKind = .dictation
     private var captureStartedAt: Date?
@@ -133,6 +136,18 @@ final class AppStore: ObservableObject {
             let directory = await library.audioURL.appendingPathComponent("Recovery", isDirectory: true)
             let url = directory.appendingPathComponent("\(prefix)-\(UUID().uuidString).caf")
             try await recorder.start(at: url)
+            if activeKind == .meeting {
+                let systemURL = directory.appendingPathComponent("meeting-system-\(UUID().uuidString).m4a")
+                do {
+                    try await systemAudioRecorder.start(at: systemURL)
+                    activeSystemAudioURL = systemURL
+                    isCapturingSystemAudio = true
+                } catch {
+                    activeSystemAudioURL = nil
+                    isCapturingSystemAudio = false
+                    statusMessage = "Meeting capture is using your microphone only. Enable Screen Recording permission to include everyone else."
+                }
+            }
             activeAudioURL = url
             captureStartedAt = .now
             captureState = .recording(startedAt: .now, level: 0)
@@ -147,10 +162,20 @@ final class AppStore: ObservableObject {
         do {
             let audioURL = try recorder.stop()
             activeAudioURL = audioURL
+            if isCapturingSystemAudio { try await systemAudioRecorder.stop() }
             captureState = .transcribing
             let engine = try transcriber ?? TranscriberFactory.make(settings.model)
             transcriber = engine
-            let raw = try await engine.transcribe(fileURL: audioURL, languageCode: settings.languageCode)
+            let micText = try await engine.transcribe(fileURL: audioURL, languageCode: settings.languageCode)
+            var raw = micText
+            var segments = [TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: activeKind == .meeting ? "You" : nil, text: micText)]
+            if activeKind == .meeting,
+               let systemURL = activeSystemAudioURL,
+               FileManager.default.fileExists(atPath: systemURL.path),
+               let otherText = try? await engine.transcribe(fileURL: systemURL, languageCode: settings.languageCode) {
+                raw = "You: \(micText)\n\nOthers: \(otherText)"
+                segments.append(TranscriptSegment(start: 0, end: Date.now.timeIntervalSince(captureStartedAt ?? .now), speaker: "Others", text: otherText))
+            }
             let style = styleForActiveApplication()
             let polished = cleanup.clean(
                 raw,
@@ -159,14 +184,14 @@ final class AppStore: ObservableObject {
                 appendPeriod: style?.appendPeriod ?? true,
                 useParagraphs: style?.useParagraphs ?? true
             )
-            try await completeRecord(raw: raw, polished: polished, audioURL: audioURL)
+            try await completeRecord(raw: raw, polished: polished, audioURL: audioURL, segments: segments)
         } catch {
             captureState = .failed(error.localizedDescription)
             statusMessage = error.localizedDescription
         }
     }
 
-    private func completeRecord(raw: String, polished: String, audioURL: URL) async throws {
+    private func completeRecord(raw: String, polished: String, audioURL: URL, segments: [TranscriptSegment]) async throws {
         let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
         let keepAudio = activeKind == .meeting ? settings.retainMeetingAudio : settings.retainDictationAudio
         var relativeAudioPath: String?
@@ -194,9 +219,7 @@ final class AppStore: ObservableObject {
             duration: duration,
             notes: activeKind == .meeting ? meetingNotes : ""
         )
-        if activeKind == .meeting {
-            record.segments = [TranscriptSegment(start: 0, end: duration ?? 0, text: polished)]
-        }
+        if activeKind == .meeting { record.segments = segments }
 
         captureState = activeKind == .dictation ? .delivering : .idle
         if activeKind == .dictation { try await TextDelivery.paste(polished) }
@@ -206,6 +229,9 @@ final class AppStore: ObservableObject {
         captureState = .idle
         meetingTitle = ""
         meetingNotes = ""
+        if let systemURL = activeSystemAudioURL { try? FileManager.default.removeItem(at: systemURL) }
+        activeSystemAudioURL = nil
+        isCapturingSystemAudio = false
 
         if activeKind == .meeting,
            let destination = URL(string: settings.webhookURL),

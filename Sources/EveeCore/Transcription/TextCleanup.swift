@@ -34,7 +34,7 @@ public struct TextCleanupPipeline: Sendable {
         if appendPeriod, let last = text.last, !".!?…:;)\"'".contains(last) {
             text.append(".")
         }
-        return text
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func removeFillers(_ input: String) -> String {
@@ -42,6 +42,7 @@ public struct TextCleanupPipeline: Sendable {
             .replacingOccurrences(of: "(?i)(^|[ ,])(?:um+|uh+|erm+)(?=[ ,.]|$)", with: "$1", options: .regularExpression)
             .replacingOccurrences(of: "\\s+([,.!?])", with: "$1", options: .regularExpression)
             .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func applyVocabulary(_ input: String, terms: [DictionaryTerm]) -> String {
