@@ -68,7 +68,7 @@ struct MenuBarView: View {
 
     private var captureName: String {
         if store.captureOperation == .selectionTransform { return "a transform instruction" }
-        switch store.captureKind {
+        return switch store.captureKind {
         case .dictation: "a dictation"
         case .meeting: "a meeting"
         case .memo: "a memo"
