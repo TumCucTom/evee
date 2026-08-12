@@ -14,7 +14,9 @@ test -f "$contents/Resources/Evee.icns"
 
 plutil -lint "$contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app_dir"
-audio_entitlement="$(codesign -d --entitlements :- "$app_dir" 2>/dev/null | plutil -extract com.apple.security.device.audio-input raw -)"
+entitlements_plist="$(mktemp)"
+codesign -d --entitlements "$entitlements_plist" "$app_dir"
+audio_entitlement="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$entitlements_plist")"
 test "$audio_entitlement" = "true"
 
 bundle_identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$contents/Info.plist")"
@@ -23,7 +25,7 @@ test "$bundle_identifier" = "com.tumcuctom.evee"
 # Exercise a real MCP handshake, tool discovery and data-backed call from the
 # moved helper instead of treating EOF as proof of protocol correctness.
 mcp_output="$(mktemp)"
-cleanup_paths=("$mcp_output")
+cleanup_paths=("$mcp_output" "$entitlements_plist")
 trap 'rm -rf "${cleanup_paths[@]}"' EXIT
 tool_names=(search recent_activity ambient_timeline ambient_app_usage get_context get_journal get_dictation get_meeting get_memo get_stats get_config)
 {
