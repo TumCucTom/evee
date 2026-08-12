@@ -44,6 +44,8 @@ public actor WorkspaceIntelligenceStore {
         let normalized = WorkspaceIntelligencePreferences(
             isEnabled: proposed.isEnabled,
             includeWindowTitles: proposed.includeWindowTitles,
+            includeWebAddresses: proposed.includeWebAddresses == true,
+            includeFocusedText: proposed.includeFocusedText == true,
             journalEnabled: proposed.journalEnabled,
             retentionDays: proposed.retentionDays,
             minimumDwellSeconds: proposed.minimumDwellSeconds
@@ -54,6 +56,8 @@ public actor WorkspaceIntelligenceStore {
         try write(normalized, to: preferencesURL)
         try applyRetention(preferences: normalized, now: date)
         if !normalized.includeWindowTitles { try removeStoredWindowTitles() }
+        if normalized.includeWebAddresses != true { try removeStoredWebAddress() }
+        if normalized.includeFocusedText != true { try removeStoredFocusedText() }
         if !normalized.journalEnabled { try write([WorkspaceJournalEntry](), to: journalURL) }
         if !normalized.isEnabled { try removeIfPresent(contextURL) }
     }
@@ -64,7 +68,10 @@ public actor WorkspaceIntelligenceStore {
         let observation = WorkspaceApplicationObservation(
             bundleIdentifier: proposed.bundleIdentifier,
             applicationName: proposed.applicationName.trimmingCharacters(in: .whitespacesAndNewlines),
-            windowTitle: preferences.includeWindowTitles ? sanitize(proposed.windowTitle) : nil
+            windowTitle: preferences.includeWindowTitles ? sanitize(proposed.windowTitle) : nil,
+            webAddress: preferences.includeWebAddresses == true ? sanitizeWebAddress(proposed.webAddress) : nil,
+            selectedText: preferences.includeFocusedText == true ? sanitizeFocusedText(proposed.selectedText, limit: 10_000) : nil,
+            visibleText: preferences.includeFocusedText == true ? sanitizeFocusedText(proposed.visibleText, limit: 20_000) : nil
         )
         guard !observation.applicationName.isEmpty else { return }
 
@@ -84,7 +91,10 @@ public actor WorkspaceIntelligenceStore {
             capturedAt: date,
             bundleIdentifier: observation.bundleIdentifier,
             applicationName: observation.applicationName,
-            windowTitle: observation.windowTitle
+            windowTitle: observation.windowTitle,
+            webAddress: observation.webAddress,
+            selectedText: observation.selectedText,
+            visibleText: observation.visibleText
         )
         try write(snapshot, to: contextURL)
         try applyRetention(preferences: preferences, now: date)
@@ -238,7 +248,38 @@ public actor WorkspaceIntelligenceStore {
                 capturedAt: snapshot.capturedAt,
                 bundleIdentifier: snapshot.bundleIdentifier,
                 applicationName: snapshot.applicationName,
-                windowTitle: nil
+                windowTitle: nil,
+                webAddress: snapshot.webAddress,
+                selectedText: snapshot.selectedText,
+                visibleText: snapshot.visibleText
+            ), to: contextURL)
+        }
+    }
+
+    private func removeStoredWebAddress() throws {
+        if let snapshot = try read(WorkspaceContextSnapshot.self, from: contextURL) {
+            try write(WorkspaceContextSnapshot(
+                capturedAt: snapshot.capturedAt,
+                bundleIdentifier: snapshot.bundleIdentifier,
+                applicationName: snapshot.applicationName,
+                windowTitle: snapshot.windowTitle,
+                webAddress: nil,
+                selectedText: snapshot.selectedText,
+                visibleText: snapshot.visibleText
+            ), to: contextURL)
+        }
+    }
+
+    private func removeStoredFocusedText() throws {
+        if let snapshot = try read(WorkspaceContextSnapshot.self, from: contextURL) {
+            try write(WorkspaceContextSnapshot(
+                capturedAt: snapshot.capturedAt,
+                bundleIdentifier: snapshot.bundleIdentifier,
+                applicationName: snapshot.applicationName,
+                windowTitle: snapshot.windowTitle,
+                webAddress: snapshot.webAddress,
+                selectedText: nil,
+                visibleText: nil
             ), to: contextURL)
         }
     }
@@ -265,6 +306,21 @@ public actor WorkspaceIntelligenceStore {
     private func sanitize(_ value: String?) -> String? {
         guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
         return String(trimmed.prefix(500))
+    }
+
+    private func sanitizeWebAddress(_ value: String?) -> String? {
+        guard let value = sanitize(value), var components = URLComponents(string: value),
+              let scheme = components.scheme?.lowercased(), scheme == "https" || scheme == "http" else { return nil }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        return components.url?.absoluteString
+    }
+
+    private func sanitizeFocusedText(_ value: String?, limit: Int) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        return String(trimmed.prefix(limit))
     }
 
     private func prepare() throws {

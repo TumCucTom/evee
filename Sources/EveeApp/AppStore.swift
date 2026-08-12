@@ -3,10 +3,12 @@ import Combine
 import EveeCore
 import Foundation
 import KeyboardShortcuts
+import UniformTypeIdentifiers
 
 extension KeyboardShortcuts.Name {
     static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
     static let transformSelection = Self("transformSelection", default: .init(.space, modifiers: [.command, .option, .shift]))
+    static let toggleHandsFree = Self("toggleHandsFree")
 }
 
 @MainActor
@@ -47,6 +49,12 @@ final class AppStore: ObservableObject {
     @Published private(set) var meetingDiarizationReady = false
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
     @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
+    @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
+    @Published private(set) var liveMeetingStatus: String?
+    @Published private(set) var availableUpdate: EveeRelease?
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var microphoneHealthWarning: String?
+    @Published private(set) var hotMicActive = false
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
@@ -59,6 +67,7 @@ final class AppStore: ObservableObject {
     private let library = LibraryStore.shared
     private let cleanup = TextCleanupPipeline()
     private let selectionTransform = SelectionTransformPipeline()
+    private let writingEnhancements = WritingEnhancementPipeline()
     private let meetingDiarizer = FluidOfflineMeetingDiarizer()
     private let api = LocalAPIServer()
     private let secretStore = KeychainSecretStore()
@@ -83,6 +92,12 @@ final class AppStore: ObservableObject {
     private var meetingDraftCaptureID: UUID?
     private var didBootstrap = false
     private var webhookRetryTask: Task<Void, Never>?
+    private var liveMeetingTranscriber: LiveMeetingTranscriber?
+    private var liveMeetingUpdateTask: Task<Void, Never>?
+    private var microphoneHealthTask: Task<Void, Never>?
+    private var lastNonSilentAudioAt = Date.distantPast
+    private var wakePhraseListener: WakePhraseListener?
+    private var hotMicTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -114,6 +129,10 @@ final class AppStore: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] level in
                 guard let self, case .recording(let startedAt, _) = self.captureState else { return }
+                if level > 0.01 {
+                    self.lastNonSilentAudioAt = .now
+                    self.microphoneHealthWarning = nil
+                }
                 self.captureState = .recording(startedAt: startedAt, level: level)
             }
             .store(in: &cancellables)
@@ -146,6 +165,9 @@ final class AppStore: ObservableObject {
         }
         KeyboardShortcuts.onKeyUp(for: .transformSelection) { [weak self] in
             self?.shortcutContinuation.yield(.transformUp)
+        }
+        KeyboardShortcuts.onKeyUp(for: .toggleHandsFree) { [weak self] in
+            Task { @MainActor in await self?.toggleHandsFreeDictation() }
         }
         shortcutTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -228,6 +250,10 @@ final class AppStore: ObservableObject {
             try await library.prepare()
             settings = try await library.loadSettings()
             try await loadAndMigrateSecrets()
+            if settings.historyRetentionDays > 0 {
+                let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
+                _ = try await library.purgeRecords(olderThan: cutoff)
+            }
             records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
             try await library.reconcileAudioStorage()
             if let draft = try await library.loadMeetingDraft() {
@@ -247,6 +273,7 @@ final class AppStore: ObservableObject {
             } else {
                 await retryPendingWebhookDeliveries()
             }
+            await updateHotMicState()
         } catch {
             didBootstrap = false
             statusMessage = error.localizedDescription
@@ -269,6 +296,15 @@ final class AppStore: ObservableObject {
                 await cancelWebhookOutbox()
             }
             try await library.save(settings)
+            if settings.historyRetentionDays > 0 {
+                let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
+                let removed = try await library.purgeRecords(olderThan: cutoff)
+                if removed > 0 {
+                    records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
+                    if let selectedRecordID, !records.contains(where: { $0.id == selectedRecordID }) { self.selectedRecordID = nil }
+                    statusMessage = "Removed \(removed) \(removed == 1 ? "record" : "records") outside the retention window."
+                }
+            }
             transcriber?.unload()
             transcriber = try TranscriberFactory.make(settings.model)
             modelReady = transcriber?.isDownloaded == true
@@ -278,6 +314,7 @@ final class AppStore: ObservableObject {
                 api.stop()
                 localAPICredentials = nil
             }
+            await updateHotMicState()
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -361,7 +398,7 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then hold the shortcut again."
             return
         }
-        activeApplication = TextDelivery.frontmostApplication()
+        activeApplication = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext)
         guard activeApplication != nil else {
             statusMessage = "Evee could not identify the app that should receive this dictation."
             return
@@ -387,7 +424,7 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then try the transform shortcut again."
             return
         }
-        guard let target = TextDelivery.frontmostApplication(),
+        guard let target = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext),
               let selectedText = target.focusedTarget?.selectedText,
               !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusMessage = SelectionTransformError.emptySelection.localizedDescription
@@ -423,6 +460,23 @@ final class AppStore: ObservableObject {
         await beginCapture(prefix: "memo")
     }
 
+    func toggleHandsFreeDictation() async {
+        switch captureLifecycle {
+        case .idle:
+            await beginDictation()
+        case .starting, .recording:
+            if activeKind == .dictation && activeOperation == .capture {
+                await finishCapture()
+            } else {
+                statusMessage = "Hands-free dictation cannot replace the capture already in progress."
+            }
+        case .finishing, .cancelling:
+            statusMessage = "Wait for the current capture to finish before toggling hands-free dictation."
+        default:
+            statusMessage = "Hands-free dictation cannot replace the capture already in progress."
+        }
+    }
+
     private func beginCapture(prefix: String) async {
         guard captureLifecycle == .idle else { return }
         let sessionID = UUID()
@@ -438,6 +492,12 @@ final class AppStore: ObservableObject {
         }
 
         do {
+            await stopHotMic()
+            if activeKind == .meeting { await startLiveMeetingTranscription() }
+            guard captureLifecycle == .starting(sessionID) else {
+                await cleanUpCancelledStart(sessionID: sessionID)
+                return
+            }
             _ = try await library.beginRecoveryCapture(kind: activeKind, id: sessionID)
             let directory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
             activeRecoveryID = sessionID
@@ -446,7 +506,11 @@ final class AppStore: ObservableObject {
             let url = directory.appendingPathComponent("microphone.caf")
             activeAudioURL = url
             microphoneTrackStartedAt = .now
-            try await recorder.start(at: url)
+            try await recorder.start(
+                at: url,
+                deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                lowLatency: settings.lowLatencyMode
+            )
 
             guard captureLifecycle == .starting(sessionID) else {
                 await cleanUpCancelledStart(sessionID: sessionID)
@@ -484,6 +548,7 @@ final class AppStore: ObservableObject {
             captureStartedAt = startedAt
             captureLifecycle = .recording(sessionID)
             captureState = .recording(startedAt: startedAt, level: 0)
+            startMicrophoneHealthMonitor(sessionID: sessionID)
 
             if stopRequestedDuringStart == sessionID {
                 stopRequestedDuringStart = nil
@@ -522,6 +587,7 @@ final class AppStore: ObservableObject {
                 }
                 isSystemAudioActive = false
             }
+            if activeKind == .meeting { await stopLiveMeetingTranscription() }
 
             guard let recoveryID = activeRecoveryID else {
                 throw NSError(domain: "Evee.Recovery", code: 1, userInfo: [NSLocalizedDescriptionKey: "The capture recovery session is unavailable."])
@@ -594,12 +660,19 @@ final class AppStore: ObservableObject {
                 )
             } else {
                 let style = styleForActiveApplication()
-                polished = cleanup.clean(
+                let cleaned = cleanup.clean(
                     raw,
                     terms: settings.dictionary,
                     tone: style?.tone ?? settings.defaultTone,
                     appendPeriod: style?.appendPeriod ?? true,
                     useParagraphs: style?.useParagraphs ?? true
+                )
+                polished = writingEnhancements.enhance(
+                    cleaned,
+                    smartLinks: settings.smartLinks,
+                    emailMode: settings.emailFormattingMode,
+                    emailSignOff: settings.emailSignOff,
+                    context: activeWorkspaceContext()
                 )
             }
             let intelligence = activeKind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
@@ -632,6 +705,7 @@ final class AppStore: ObservableObject {
             try? await systemAudioRecorder.stop()
             isSystemAudioActive = false
         }
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -648,6 +722,9 @@ final class AppStore: ObservableObject {
     func dismissCaptureFailure() {
         guard captureLifecycle == .idle, case .failed = captureState else { return }
         captureState = .idle
+        if settings.hotMicEnabled {
+            Task { @MainActor [weak self] in await self?.updateHotMicState() }
+        }
     }
 
     private func completeRecord(
@@ -665,11 +742,12 @@ final class AppStore: ObservableObject {
         case .memo: settings.retainMemoAudio
         }
         let recordKind = activeKind
+        let memoIntelligence = activeKind == .memo ? MemoIntelligencePipeline().generate(from: polished) : nil
         let title: String = switch activeKind {
         case .dictation where activeOperation == .selectionTransform: "Transform · \(String(polished.prefix(60)))"
         case .dictation: String(polished.prefix(72))
         case .meeting: meetingTitle.isEmpty ? "Meeting · \(Date.now.formatted(date: .abbreviated, time: .shortened))" : meetingTitle
-        case .memo: String(polished.prefix(72))
+        case .memo: memoIntelligence?.title ?? String(polished.prefix(72))
         }
         var record = WorkspaceRecord(
             kind: activeKind,
@@ -679,6 +757,7 @@ final class AppStore: ObservableObject {
             sourceApplication: settings.retainContextMetadata ? activeApplication?.name : nil,
             duration: duration,
             meetingIntelligence: activeKind == .meeting ? meetingIntelligence : nil,
+            memoIntelligence: memoIntelligence,
             notes: activeKind == .meeting ? meetingNotes : "",
             operation: activeOperation,
             context: persistedActiveContext()
@@ -773,6 +852,7 @@ final class AppStore: ObservableObject {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -786,6 +866,7 @@ final class AppStore: ObservableObject {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
+        if activeKind == .meeting { await stopLiveMeetingTranscription() }
         isSystemAudioActive = false
 
         let recoveryPath = activeAudioURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil }
@@ -836,6 +917,14 @@ final class AppStore: ObservableObject {
         systemTrackStartedAt = nil
         isSystemAudioActive = false
         stopRequestedDuringStart = nil
+        recorder.setBufferHandler(nil)
+        systemAudioRecorder.setBufferHandler(nil)
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = nil
+        microphoneHealthWarning = nil
+        if state == .idle, settings.hotMicEnabled {
+            Task { @MainActor [weak self] in await self?.updateHotMicState() }
+        }
     }
 
     var hasMeetingDraft: Bool {
@@ -977,12 +1066,147 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func startLiveMeetingTranscription() async {
+        liveMeetingTranscript = []
+        liveMeetingStatus = nil
+        guard settings.liveMeetingTranscriptionEnabled else { return }
+        guard settings.model == .parakeet else {
+            liveMeetingStatus = "Live transcript preview requires the Parakeet model; the saved meeting will still be transcribed after recording."
+            return
+        }
+        let live = LiveMeetingTranscriber()
+        do {
+            try await live.start(includeSystem: settings.meetingCaptureEnabled)
+            liveMeetingTranscriber = live
+            recorder.setBufferHandler { [weak live] buffer in
+                Task { await live?.acceptMicrophone(buffer) }
+            }
+            systemAudioRecorder.setBufferHandler { [weak live] buffer in
+                Task { await live?.acceptSystem(buffer) }
+            }
+            liveMeetingStatus = "Live local transcript is active. Final text is rebuilt from the saved tracks after you stop."
+            liveMeetingUpdateTask = Task { @MainActor [weak self] in
+                for await update in live.updates {
+                    guard let self, !Task.isCancelled else { return }
+                    if update.isConfirmed {
+                        self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
+                    } else {
+                        self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
+                    }
+                    self.liveMeetingTranscript.append(update)
+                    if self.liveMeetingTranscript.count > 100 {
+                        self.liveMeetingTranscript.removeFirst(self.liveMeetingTranscript.count - 100)
+                    }
+                }
+            }
+        } catch {
+            liveMeetingStatus = "Live transcript preview is unavailable: \(error.localizedDescription). Recording and final transcription will continue."
+            await live.stop()
+        }
+    }
+
+    private func startMicrophoneHealthMonitor(sessionID: UUID) {
+        lastNonSilentAudioAt = .now
+        microphoneHealthWarning = nil
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, !Task.isCancelled, self.captureLifecycle == .recording(sessionID) else { return }
+                if Date.now.timeIntervalSince(self.lastNonSilentAudioAt) >= 15 {
+                    self.microphoneHealthWarning = "No microphone signal has been detected for 15 seconds. Check the selected input and its mute switch; the recording is still running."
+                }
+            }
+        }
+    }
+
+    func updateHotMicState() async {
+        let phrase = settings.wakePhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard settings.hotMicEnabled else {
+            await stopHotMic()
+            return
+        }
+        guard settings.model == .parakeet else {
+            await stopHotMic()
+            statusMessage = "Wake-phrase listening requires the Parakeet model."
+            return
+        }
+        guard phrase.count >= 3 else {
+            await stopHotMic()
+            statusMessage = "Choose a wake phrase containing at least three characters."
+            return
+        }
+        guard captureLifecycle == .idle, !hotMicActive else { return }
+        refreshPermissionState()
+        guard microphonePermissionGranted else {
+            statusMessage = "Grant Microphone permission before enabling wake-phrase listening."
+            return
+        }
+
+        let listener = WakePhraseListener()
+        do {
+            try await listener.start(
+                deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                lowLatency: true
+            )
+            wakePhraseListener = listener
+            hotMicActive = true
+            hotMicTask = Task { @MainActor [weak self] in
+                for await transcript in listener.transcripts {
+                    guard let self, !Task.isCancelled else { return }
+                    let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                    if normalized.contains(phrase.lowercased()) {
+                        self.hotMicTask = nil
+                        self.hotMicActive = false
+                        await listener.stop()
+                        self.wakePhraseListener = nil
+                        await self.beginDictation()
+                        return
+                    }
+                }
+            }
+        } catch {
+            hotMicActive = false
+            wakePhraseListener = nil
+            statusMessage = "Wake-phrase listening could not start: \(error.localizedDescription)"
+        }
+    }
+
+    private func stopHotMic() async {
+        hotMicTask?.cancel()
+        hotMicTask = nil
+        if let wakePhraseListener { await wakePhraseListener.stop() }
+        wakePhraseListener = nil
+        hotMicActive = false
+    }
+
+    private func stopLiveMeetingTranscription() async {
+        recorder.setBufferHandler(nil)
+        systemAudioRecorder.setBufferHandler(nil)
+        if let liveMeetingTranscriber { await liveMeetingTranscriber.stop() }
+        liveMeetingUpdateTask?.cancel()
+        liveMeetingUpdateTask = nil
+        liveMeetingTranscriber = nil
+    }
+
     func update(_ record: WorkspaceRecord) async {
         do {
             var changed = record
             changed.updatedAt = .now
             try await library.upsert(changed)
-            if let index = records.firstIndex(where: { $0.id == changed.id }) { records[index] = changed }
+            if let index = records.firstIndex(where: { $0.id == changed.id }) {
+                let previous = records[index]
+                records[index] = changed
+                if settings.learnCorrections,
+                   previous.kind == .dictation,
+                   previous.operation == .capture,
+                   let term = CorrectionLearner().candidate(from: previous.text, edited: changed.text),
+                   !settings.dictionary.contains(where: { $0.spoken.caseInsensitiveCompare(term.spoken) == .orderedSame }) {
+                    settings.dictionary.append(term)
+                    try await library.save(settings)
+                    statusMessage = "Learned ‘\(term.spoken)’ → ‘\(term.replacement)’. You can review it in Dictionary."
+                }
+            }
         } catch { statusMessage = error.localizedDescription }
     }
 
@@ -992,6 +1216,67 @@ final class AppStore: ObservableObject {
             records.removeAll { $0.id == record.id }
             if selectedRecordID == record.id { selectedRecordID = nil }
         } catch { statusMessage = error.localizedDescription }
+    }
+
+    func exportWorkspace(format: WorkspaceExportFormat) async {
+        let panel = NSSavePanel()
+        panel.title = "Export Evee workspace"
+        panel.nameFieldStringValue = "Evee Workspace.\(format.fileExtension)"
+        panel.allowedContentTypes = format == .json ? [.json] : [.plainText]
+        panel.canCreateDirectories = true
+        guard await panel.begin() == .OK, let destination = panel.url else { return }
+        do {
+            let data = try WorkspaceExporter.data(for: records, format: format)
+            try data.write(to: destination, options: .atomic)
+            statusMessage = "Exported \(records.count) \(records.count == 1 ? "record" : "records") as \(format.title)."
+        } catch {
+            statusMessage = "The workspace could not be exported: \(error.localizedDescription)"
+        }
+    }
+
+    func exportDiagnostics() async {
+        let panel = NSSavePanel()
+        panel.title = "Export Evee diagnostics"
+        panel.nameFieldStringValue = "Evee Diagnostics.txt"
+        panel.allowedContentTypes = [.plainText]
+        guard await panel.begin() == .OK, let destination = panel.url else { return }
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
+        let report = DiagnosticsReport(
+            appVersion: version,
+            operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
+            model: settings.model.title,
+            language: settings.languageCode,
+            recordCount: records.count,
+            recoveryCount: recoverableCaptures.count,
+            microphonePermission: microphonePermissionGranted,
+            accessibilityPermission: accessibilityPermissionGranted,
+            systemAudioEnabled: settings.meetingCaptureEnabled,
+            liveMeetingEnabled: settings.liveMeetingTranscriptionEnabled,
+            localAPIEnabled: settings.localAPIEnabled,
+            webhookConfigured: !settings.webhookURL.isEmpty,
+            inputDeviceSelected: !settings.inputDeviceUID.isEmpty
+        )
+        do {
+            try Data(report.rendered().utf8).write(to: destination, options: .atomic)
+            statusMessage = "Exported a redacted diagnostics report."
+        } catch { statusMessage = "Diagnostics could not be exported: \(error.localizedDescription)" }
+    }
+
+    func checkForUpdates() async {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        defer { isCheckingForUpdates = false }
+        do {
+            let release = try await UpdateChecker().latestRelease()
+            let installed = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+            if UpdateChecker().isNewer(release.version, than: installed) {
+                availableUpdate = release
+                statusMessage = "Evee \(release.version) is available. Open its release page to download it."
+            } else {
+                availableUpdate = nil
+                statusMessage = "Evee is up to date."
+            }
+        } catch { statusMessage = "Update check failed: \(error.localizedDescription)" }
     }
 
     private func loadAndMigrateSecrets() async throws {
@@ -1241,14 +1526,35 @@ final class AppStore: ObservableObject {
     private func persistedActiveContext() -> WorkspaceContext? {
         guard let application = activeApplication else { return nil }
         let target = application.focusedTarget
-        guard settings.retainContextMetadata || settings.retainSelectedText else { return nil }
+        guard settings.retainContextMetadata || settings.retainSelectedText || settings.captureVisibleContext else { return nil }
         return WorkspaceContext(
             bundleIdentifier: settings.retainContextMetadata ? application.bundleIdentifier : nil,
             applicationName: settings.retainContextMetadata ? application.name : nil,
             windowTitle: settings.retainContextMetadata ? target?.windowTitle : nil,
             document: settings.retainContextMetadata ? target?.document : nil,
             focusedRole: settings.retainContextMetadata ? target?.role : nil,
-            selectedText: settings.retainSelectedText ? activeSelectedText : nil
+            selectedText: settings.retainSelectedText ? activeSelectedText : nil,
+            url: settings.retainContextMetadata ? target?.url : nil,
+            codeFile: settings.retainContextMetadata ? target?.codeFile : nil,
+            recipient: settings.retainContextMetadata ? target?.recipient : nil,
+            visibleText: settings.captureVisibleContext ? target?.visibleText : nil
+        )
+    }
+
+    private func activeWorkspaceContext() -> WorkspaceContext? {
+        guard let application = activeApplication else { return nil }
+        let target = application.focusedTarget
+        return WorkspaceContext(
+            bundleIdentifier: application.bundleIdentifier,
+            applicationName: application.name,
+            windowTitle: target?.windowTitle,
+            document: target?.document,
+            focusedRole: target?.role,
+            selectedText: activeSelectedText,
+            url: target?.url,
+            codeFile: target?.codeFile,
+            recipient: target?.recipient,
+            visibleText: target?.visibleText
         )
     }
 }

@@ -221,6 +221,22 @@ public struct MeetingInsight: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+public struct MeetingTopic: Identifiable, Codable, Hashable, Sendable {
+    public var id: UUID
+    public var title: String
+    public var start: TimeInterval
+    public var end: TimeInterval
+    public var sourceSegmentIDs: [UUID]
+
+    public init(id: UUID = UUID(), title: String, start: TimeInterval, end: TimeInterval, sourceSegmentIDs: [UUID]) {
+        self.id = id
+        self.title = title
+        self.start = start
+        self.end = end
+        self.sourceSegmentIDs = sourceSegmentIDs
+    }
+}
+
 public enum MeetingIntelligenceMethod: String, Codable, Sendable {
     /// Deterministic, local extraction from transcript evidence. This is not a generative summary.
     case localExtractive
@@ -230,6 +246,8 @@ public struct MeetingIntelligence: Codable, Hashable, Sendable {
     public var summary: [String]
     public var decisions: [MeetingInsight]
     public var actionItems: [MeetingInsight]
+    /// Optional for backward compatibility with records written before topic sections.
+    public var topics: [MeetingTopic]?
     public var method: MeetingIntelligenceMethod
     public var generatedAt: Date
 
@@ -237,17 +255,19 @@ public struct MeetingIntelligence: Codable, Hashable, Sendable {
         summary: [String] = [],
         decisions: [MeetingInsight] = [],
         actionItems: [MeetingInsight] = [],
+        topics: [MeetingTopic]? = nil,
         method: MeetingIntelligenceMethod = .localExtractive,
         generatedAt: Date = .now
     ) {
         self.summary = summary
         self.decisions = decisions
         self.actionItems = actionItems
+        self.topics = topics
         self.method = method
         self.generatedAt = generatedAt
     }
 
-    public var isEmpty: Bool { summary.isEmpty && decisions.isEmpty && actionItems.isEmpty }
+    public var isEmpty: Bool { summary.isEmpty && decisions.isEmpty && actionItems.isEmpty && (topics?.isEmpty ?? true) }
 }
 
 /// Runs FluidAudio's offline segmentation + embedding + clustering pipeline.
@@ -357,11 +377,37 @@ public struct MeetingTranscriptAssembler: Sendable {
             })
         }
 
+        let systemSegments = result.filter { $0.channel == .system }
         return result
             .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .filter { segment in
+                guard segment.channel == .microphone else { return true }
+                return !systemSegments.contains { isLikelyPlaybackEcho(microphone: segment, system: $0) }
+            }
             .sorted { lhs, rhs in
                 lhs.start == rhs.start ? lhs.end < rhs.end : lhs.start < rhs.start
             }
+    }
+
+    private func isLikelyPlaybackEcho(microphone: TranscriptSegment, system: TranscriptSegment) -> Bool {
+        guard microphone.timingSource != .trackEstimate,
+              system.timingSource != .trackEstimate else { return false }
+        let microphoneDuration = microphone.end - microphone.start
+        let systemDuration = system.end - system.start
+        guard microphoneDuration > 0, systemDuration > 0,
+              microphoneDuration <= 30, systemDuration <= 30 else { return false }
+        let overlap = max(0, min(microphone.end, system.end) - max(microphone.start, system.start))
+        guard overlap / min(microphoneDuration, systemDuration) >= 0.6 else { return false }
+        let microphoneWords = comparableWords(microphone.text)
+        let systemWords = comparableWords(system.text)
+        guard microphoneWords.count >= 4, systemWords.count >= 4 else { return false }
+        let union = microphoneWords.union(systemWords)
+        guard !union.isEmpty else { return false }
+        return Double(microphoneWords.intersection(systemWords).count) / Double(union.count) >= 0.75
+    }
+
+    private func comparableWords(_ text: String) -> Set<String> {
+        Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
     }
 
     private func anonymousSpeakerLabels(_ intervals: [SpeakerInterval]) -> [String: String] {
@@ -476,18 +522,61 @@ public struct MeetingIntelligencePipeline: Sendable {
         let decisions = uniqueInsights(ordered.compactMap(decision))
         let actions = uniqueInsights(ordered.compactMap(actionItem))
         let summary = extractSummary(from: ordered, decisions: decisions, actions: actions)
+        let topics = topicSections(from: ordered)
         return MeetingIntelligence(
             summary: summary,
             decisions: decisions,
             actionItems: actions,
+            topics: topics,
             generatedAt: generatedAt
         )
+    }
+
+    private func topicSections(from segments: [TranscriptSegment]) -> [MeetingTopic] {
+        guard !segments.isEmpty else { return [] }
+        var groups: [[TranscriptSegment]] = []
+        var current: [TranscriptSegment] = []
+        var accumulatedKeywords = Set<String>()
+        for segment in segments {
+            let words = keywords(segment.text)
+            let gap = max(0, segment.start - (current.last?.end ?? segment.start))
+            let semanticShift = current.count >= 3 && words.count >= 4 && accumulatedKeywords.isDisjoint(with: words)
+            if !current.isEmpty && (gap >= 20 || semanticShift || segment.end - (current.first?.start ?? segment.start) >= 300) {
+                groups.append(current)
+                current = []
+                accumulatedKeywords = []
+            }
+            current.append(segment)
+            accumulatedKeywords.formUnion(words)
+        }
+        if !current.isEmpty { groups.append(current) }
+        return groups.compactMap { group in
+            guard let first = group.first, let last = group.last else { return nil }
+            let words = first.text.split(whereSeparator: \.isWhitespace).prefix(8).joined(separator: " ")
+            let title = words.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            return MeetingTopic(
+                title: title.isEmpty ? "Discussion" : title,
+                start: first.start,
+                end: last.end,
+                sourceSegmentIDs: group.map(\.id)
+            )
+        }
+    }
+
+    private func keywords(_ text: String) -> Set<String> {
+        let stop = Set(["about", "after", "again", "also", "and", "are", "but", "for", "from", "have", "into", "just", "that", "the", "their", "then", "there", "they", "this", "was", "were", "what", "when", "where", "which", "will", "with", "would", "you", "your"])
+        return Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count >= 4 && !stop.contains($0) })
     }
 
     private func decision(_ segment: TranscriptSegment) -> MeetingInsight? {
         let text = normalized(segment.text)
         let lower = text.lowercased()
-        let markers = ["we decided", "we agreed", "the decision is", "decision:", "agreed to", "we committed to"]
+        let markers = [
+            "we decided", "we agreed", "the decision is", "decision:", "agreed to", "we committed to",
+            "decidimos", "acordamos", "la decisión es", "décidé", "nous avons convenu", "la décision est",
+            "wir haben entschieden", "wir haben vereinbart", "die entscheidung ist",
+            "decidimos", "a decisão é", "abbiamo deciso", "la decisione è"
+        ]
         guard !isQuestion(text), markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
             kind: .decision,
@@ -500,8 +589,15 @@ public struct MeetingIntelligencePipeline: Sendable {
     private func actionItem(_ segment: TranscriptSegment) -> MeetingInsight? {
         let text = normalized(segment.text)
         let lower = text.lowercased()
-        let markers = ["action item", "todo", "to-do", "follow up", "i will", "i'll", "you will", "you'll", "needs to", "need to"]
-        let negations = ["will not", "won't", "do not need to", "don't need to", "does not need to", "doesn't need to", "no action item"]
+        let markers = [
+            "action item", "todo", "to-do", "follow up", "i will", "i'll", "you will", "you'll", "needs to", "need to",
+            "acción", "tengo que", "necesita", "suivi", "je vais", "doit", "aufgabe", "ich werde", "muss",
+            "ação", "precisa", "vou ", "azione", "devo", "bisogna"
+        ]
+        let negations = [
+            "will not", "won't", "do not need to", "don't need to", "does not need to", "doesn't need to", "no action item",
+            "no necesito", "no necesita", "ne dois pas", "ne doit pas", "muss nicht", "não precisa", "non devo"
+        ]
         guard !isQuestion(text),
               !negations.contains(where: lower.contains),
               markers.contains(where: lower.contains) else { return nil }

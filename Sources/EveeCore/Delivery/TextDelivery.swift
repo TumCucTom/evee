@@ -33,6 +33,10 @@ public struct FocusedTargetContext: Equatable, Sendable {
     public var role: String?
     public var subrole: String?
     public var selectedText: String?
+    public var url: String?
+    public var codeFile: String?
+    public var recipient: String?
+    public var visibleText: String?
 
     public init(
         windowFingerprint: Int?,
@@ -42,7 +46,11 @@ public struct FocusedTargetContext: Equatable, Sendable {
         elementIdentifier: String?,
         role: String?,
         subrole: String?,
-        selectedText: String? = nil
+        selectedText: String? = nil,
+        url: String? = nil,
+        codeFile: String? = nil,
+        recipient: String? = nil,
+        visibleText: String? = nil
     ) {
         self.windowFingerprint = windowFingerprint
         self.windowTitle = windowTitle
@@ -52,6 +60,10 @@ public struct FocusedTargetContext: Equatable, Sendable {
         self.role = role
         self.subrole = subrole
         self.selectedText = selectedText
+        self.url = url
+        self.codeFile = codeFile
+        self.recipient = recipient
+        self.visibleText = visibleText
     }
 }
 
@@ -146,9 +158,9 @@ public enum TextDelivery {
         }
     }
 
-    public static func frontmostApplication() -> FrontmostApplication? {
+    public static func frontmostApplication(includeVisibleText: Bool = false) -> FrontmostApplication? {
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier) else { return nil }
+              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier, includeVisibleText: includeVisibleText) else { return nil }
         return FrontmostApplication(
             bundleIdentifier: app.bundleIdentifier ?? "unknown",
             name: app.localizedName ?? "App",
@@ -308,20 +320,28 @@ public enum TextDelivery {
         }
     }
 
-    private static func focusedTarget(processIdentifier: pid_t) -> FocusedTargetContext? {
+    private static func focusedTarget(processIdentifier: pid_t, includeVisibleText: Bool = false) -> FocusedTargetContext? {
         let application = AXUIElementCreateApplication(processIdentifier)
         guard let element = copyElement(kAXFocusedUIElementAttribute as CFString, from: application) else { return nil }
         let window = copyElement(kAXWindowAttribute as CFString, from: element)
             ?? copyElement(kAXFocusedWindowAttribute as CFString, from: application)
+        let document = window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) }
+        let url = copyURLString("AXURL" as CFString, from: element)
+            ?? window.flatMap { copyURLString("AXURL" as CFString, from: $0) }
+            ?? document.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
         return FocusedTargetContext(
             windowFingerprint: window.map { Int(CFHash($0)) },
             windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) },
-            document: window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) },
+            document: document,
             elementFingerprint: Int(CFHash(element)),
             elementIdentifier: copyString(kAXIdentifierAttribute as CFString, from: element),
             role: copyString(kAXRoleAttribute as CFString, from: element),
             subrole: copyString(kAXSubroleAttribute as CFString, from: element),
-            selectedText: selectedText(from: element)
+            selectedText: selectedText(from: element),
+            url: url,
+            codeFile: codeFile(from: document, windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) }),
+            recipient: recipient(from: element),
+            visibleText: includeVisibleText ? window.flatMap { visibleText(from: $0) } : nil
         )
     }
 
@@ -351,6 +371,65 @@ public enum TextDelivery {
         return value as? String
     }
 
+    private static func copyURLString(_ attribute: CFString, from element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success, let value else { return nil }
+        if let string = value as? String { return string }
+        if let url = value as? URL { return url.absoluteString }
+        return nil
+    }
+
+    private static func recipient(from element: AXUIElement) -> String? {
+        guard !isProtected(element) else { return nil }
+        for attribute in [kAXDescriptionAttribute as CFString, kAXTitleAttribute as CFString, kAXHelpAttribute as CFString] {
+            if let value = copyString(attribute, from: element)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !value.isEmpty, value.count <= 120,
+               value.localizedCaseInsensitiveContains("recipient") || value.localizedCaseInsensitiveContains("to:") {
+                return value
+                    .replacingOccurrences(of: "recipient", with: "", options: .caseInsensitive)
+                    .replacingOccurrences(of: "to:", with: "", options: .caseInsensitive)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    private static func codeFile(from document: String?, windowTitle: String?) -> String? {
+        let extensions = Set(["c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "jsx", "kt", "m", "mm", "php", "py", "rb", "rs", "sh", "sql", "swift", "ts", "tsx", "vue"])
+        for candidate in [document, windowTitle].compactMap({ $0 }) {
+            let path = candidate.components(separatedBy: " — ").first ?? candidate
+            if extensions.contains(URL(fileURLWithPath: path).pathExtension.lowercased()) { return path }
+        }
+        return nil
+    }
+
+    private static func visibleText(from root: AXUIElement) -> String? {
+        var queue = [root]
+        var pieces: [String] = []
+        var characterCount = 0
+        var visited = 0
+        while !queue.isEmpty, visited < 120, characterCount < 20_000 {
+            let element = queue.removeFirst()
+            visited += 1
+            if !isProtected(element) {
+                for attribute in [kAXTitleAttribute as CFString, kAXDescriptionAttribute as CFString, kAXValueAttribute as CFString] {
+                    guard let value = copyString(attribute, from: element)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !value.isEmpty, value.count <= 2_000 else { continue }
+                    pieces.append(value)
+                    characterCount += value.count
+                    break
+                }
+            }
+            var childrenValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue) == .success,
+               let children = childrenValue as? [AXUIElement] {
+                queue.append(contentsOf: children.prefix(40))
+            }
+        }
+        let result = pieces.joined(separator: "\n")
+        return result.isEmpty ? nil : String(result.prefix(20_000))
+    }
+
     private static func selectedText(from element: AXUIElement) -> String? {
         // Secure fields and protected web inputs must never enter the context
         // snapshot, even transiently.
@@ -363,6 +442,12 @@ public enum TextDelivery {
               !value.isEmpty,
               value.count <= 100_000 else { return nil }
         return value
+    }
+
+    private static func isProtected(_ element: AXUIElement) -> Bool {
+        copyBoolean("AXProtectedContent" as CFString, from: element) == true
+            || copyString(kAXRoleAttribute as CFString, from: element) == "AXSecureTextField"
+            || copyString(kAXSubroleAttribute as CFString, from: element) == "AXSecureTextField"
     }
 
     private static func copyBoolean(_ attribute: CFString, from element: AXUIElement) -> Bool? {

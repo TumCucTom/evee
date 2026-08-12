@@ -2,6 +2,53 @@ import XCTest
 @testable import EveeCore
 
 final class WorkspaceIntelligenceTests: XCTestCase {
+    func testWebAddressCollectionIsOptInAndRedactsSensitiveComponents() async throws {
+        let (store, root) = makeStore()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.savePreferences(.init(isEnabled: true, includeWebAddresses: true), at: start)
+        try await store.record(.init(
+            bundleIdentifier: "test.browser",
+            applicationName: "Browser",
+            webAddress: "https://user:password@example.test/project?token=secret#private"
+        ), at: start)
+
+        var context = try await store.currentContext()
+        XCTAssertEqual(context.value?.webAddress, "https://example.test/project")
+
+        try await store.savePreferences(.init(isEnabled: true, includeWebAddresses: false), at: start.addingTimeInterval(1))
+        context = try await store.currentContext()
+        XCTAssertNil(context.value?.webAddress)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testOlderPreferencesDecodeWithoutWebAddressOption() throws {
+        let data = Data(#"{"isEnabled":true,"includeWindowTitles":false,"journalEnabled":false,"retentionDays":7,"minimumDwellSeconds":5}"#.utf8)
+        let preferences = try JSONDecoder().decode(WorkspaceIntelligencePreferences.self, from: data)
+        XCTAssertNil(preferences.includeWebAddresses)
+        XCTAssertNil(preferences.includeFocusedText)
+    }
+
+    func testFocusedTextSnapshotIsBoundedAndRemovedWhenDisabled() async throws {
+        let (store, root) = makeStore()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.savePreferences(.init(isEnabled: true, includeFocusedText: true), at: start)
+        try await store.record(.init(
+            bundleIdentifier: "test.editor",
+            applicationName: "Editor",
+            selectedText: String(repeating: "s", count: 12_000),
+            visibleText: String(repeating: "v", count: 25_000)
+        ), at: start)
+        var context = try await store.currentContext()
+        XCTAssertEqual(context.value?.selectedText?.count, 10_000)
+        XCTAssertEqual(context.value?.visibleText?.count, 20_000)
+
+        try await store.savePreferences(.init(isEnabled: true, includeFocusedText: false), at: start.addingTimeInterval(1))
+        context = try await store.currentContext()
+        XCTAssertNil(context.value?.selectedText)
+        XCTAssertNil(context.value?.visibleText)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func testCollectionIsOffByDefault() async throws {
         let (store, root) = makeStore()
         try await store.record(.init(bundleIdentifier: "test.editor", applicationName: "Editor"))

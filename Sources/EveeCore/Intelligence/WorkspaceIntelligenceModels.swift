@@ -3,6 +3,9 @@ import Foundation
 public struct WorkspaceIntelligencePreferences: Codable, Equatable, Sendable {
     public var isEnabled: Bool
     public var includeWindowTitles: Bool
+    /// Optional so preferences written before web-address capture decode safely.
+    public var includeWebAddresses: Bool?
+    public var includeFocusedText: Bool?
     public var journalEnabled: Bool
     public var retentionDays: Int
     public var minimumDwellSeconds: TimeInterval
@@ -10,12 +13,16 @@ public struct WorkspaceIntelligencePreferences: Codable, Equatable, Sendable {
     public init(
         isEnabled: Bool = false,
         includeWindowTitles: Bool = false,
+        includeWebAddresses: Bool = false,
+        includeFocusedText: Bool = false,
         journalEnabled: Bool = false,
         retentionDays: Int = 7,
         minimumDwellSeconds: TimeInterval = 5
     ) {
         self.isEnabled = isEnabled
         self.includeWindowTitles = includeWindowTitles
+        self.includeWebAddresses = includeWebAddresses
+        self.includeFocusedText = includeFocusedText
         self.journalEnabled = journalEnabled
         self.retentionDays = max(1, min(retentionDays, 90))
         self.minimumDwellSeconds = max(1, min(minimumDwellSeconds, 300))
@@ -26,11 +33,24 @@ public struct WorkspaceApplicationObservation: Codable, Equatable, Sendable {
     public var bundleIdentifier: String?
     public var applicationName: String
     public var windowTitle: String?
+    public var webAddress: String?
+    public var selectedText: String?
+    public var visibleText: String?
 
-    public init(bundleIdentifier: String?, applicationName: String, windowTitle: String? = nil) {
+    public init(
+        bundleIdentifier: String?,
+        applicationName: String,
+        windowTitle: String? = nil,
+        webAddress: String? = nil,
+        selectedText: String? = nil,
+        visibleText: String? = nil
+    ) {
         self.bundleIdentifier = bundleIdentifier
         self.applicationName = applicationName
         self.windowTitle = windowTitle
+        self.webAddress = webAddress
+        self.selectedText = selectedText
+        self.visibleText = visibleText
     }
 }
 
@@ -66,12 +86,26 @@ public struct WorkspaceContextSnapshot: Codable, Equatable, Sendable {
     public var bundleIdentifier: String?
     public var applicationName: String
     public var windowTitle: String?
+    public var webAddress: String?
+    public var selectedText: String?
+    public var visibleText: String?
 
-    public init(capturedAt: Date, bundleIdentifier: String?, applicationName: String, windowTitle: String?) {
+    public init(
+        capturedAt: Date,
+        bundleIdentifier: String?,
+        applicationName: String,
+        windowTitle: String?,
+        webAddress: String? = nil,
+        selectedText: String? = nil,
+        visibleText: String? = nil
+    ) {
         self.capturedAt = capturedAt
         self.bundleIdentifier = bundleIdentifier
         self.applicationName = applicationName
         self.windowTitle = windowTitle
+        self.webAddress = webAddress
+        self.selectedText = selectedText
+        self.visibleText = visibleText
     }
 }
 

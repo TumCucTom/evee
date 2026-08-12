@@ -2,6 +2,40 @@ import XCTest
 @testable import EveeCore
 
 final class MeetingIntelligenceTests: XCTestCase {
+    func testTranscriptAssemblerSuppressesStrongTimedSystemEchoFromMicrophone() {
+        let microphone = LocalTranscript(text: "The release is ready for final review", duration: 5, segments: [
+            LocalTranscriptSegment(start: 0, end: 5, text: "The release is ready for final review", timingSource: .audioChunk)
+        ])
+        let system = LocalTranscript(text: "The release is ready for final review", duration: 5, segments: [
+            LocalTranscriptSegment(start: 0.1, end: 5.1, text: "The release is ready for final review", timingSource: .audioChunk)
+        ])
+        let result = MeetingTranscriptAssembler().assemble(microphone: microphone, system: system)
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result.first?.channel, .system)
+    }
+
+    func testTranscriptAssemblerKeepsUntimedChannelEstimates() {
+        let microphone = LocalTranscript(text: "The release is ready for final review", duration: 5, segments: [
+            LocalTranscriptSegment(start: 0, end: 5, text: "The release is ready for final review", timingSource: .trackEstimate)
+        ])
+        let system = LocalTranscript(text: "The release is ready for final review", duration: 5, segments: [
+            LocalTranscriptSegment(start: 0, end: 5, text: "The release is ready for final review", timingSource: .trackEstimate)
+        ])
+        XCTAssertEqual(MeetingTranscriptAssembler().assemble(microphone: microphone, system: system).count, 2)
+    }
+
+    func testTopicSectionsSplitOnLongSilence() {
+        let segments = [
+            TranscriptSegment(start: 0, end: 5, speaker: "You", text: "Launch planning and milestones for the mobile release"),
+            TranscriptSegment(start: 6, end: 10, speaker: "Other participant", text: "The launch timeline needs a final review"),
+            TranscriptSegment(start: 40, end: 46, speaker: "You", text: "Hiring interviews and candidate feedback are next")
+        ]
+        let topics = MeetingIntelligencePipeline().generate(from: segments).topics
+        XCTAssertEqual(topics?.count, 2)
+        XCTAssertEqual(topics?.first?.start, 0)
+        XCTAssertEqual(topics?.last?.start, 40)
+    }
+
     func testTokenTimingsCreateRealUtteranceBoundaries() throws {
         let timings = [
             TranscriptTokenTiming(token: "▁Hello", start: 0.10, end: 0.40, confidence: 0.9),

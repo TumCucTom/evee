@@ -5,7 +5,7 @@ speak, and release to insert polished text into any app. Record a meeting
 without a bot, keep searchable dictations, meetings and memos on your Mac, and
 let local agents query the workspace through MCP or the loopback API.
 
-The current draft PR is a hardened alpha, not yet a production-ready release.
+The current draft PR is a release candidate under automated and packaged-app validation, not yet a signed public release.
 The exact acceptance gates and remaining product work are tracked in
 [`docs/PRODUCT_RELEASE_GATES.md`](docs/PRODUCT_RELEASE_GATES.md); compiling or
 matching a tool name is not treated as functional completeness.
@@ -15,11 +15,14 @@ matching a tool name is not treated as functional completeness.
 - System-wide push-to-talk dictation and paste
 - Local Parakeet v3 and Qwen3-ASR transcription through FluidAudio
 - Deterministic punctuation, filler removal, vocabulary and per-app formatting
-- Microphone meeting recording, live notes and local transcription
+- Dual-channel meeting recording, live transcript preview, timed final transcripts, optional anonymous speaker separation, topic sections, notes and local extractive insights
 - FTS5-indexed local library for dictations, meetings and memos
 - Personal dictionary and per-application writing styles
 - Loopback JSON API with bearer authentication
 - MCP helper exposing search and record lookup tools
+- Hands-free capture, opt-in local wake-phrase listening, configurable microphone input and low-latency buffering
+- Email formatting, smart links, opt-in correction learning and contextual formatting
+- Automatic retention, JSON/Markdown export, diagnostics and a user-initiated release checker
 - Optional HMAC-SHA256 meeting webhooks
 - Privacy-safe defaults: no analytics or cloud processing; dictation and meeting
   audio retention is off by default, while memo audio is retained for playback
@@ -80,7 +83,8 @@ configuring the `EVEE_CERTIFICATE_P12`, `EVEE_CERTIFICATE_PASSWORD`,
 Evee stores content under `~/Library/Application Support/Evee/`. Long-term
 audio retention, the local API, MCP registration and webhooks are opt-in.
 Downloaded models stay in FluidAudio's local cache. No hosted service,
-authentication system, analytics SDK or updater is configured.
+authentication system or analytics SDK is configured. Update checks occur only
+when the user presses the button in Settings and read public release metadata.
 
 ## Design
 

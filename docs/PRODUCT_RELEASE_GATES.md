@@ -37,37 +37,38 @@ account in both light and dark appearances.
 
 ### Dictation and transformation
 
-- [ ] System-wide press-and-hold dictation
-- [ ] Locked/hands-free recording and cancellation
-- [ ] System-wide status UI and configurable audio cues
-- [ ] Automatic paste, copy-only and auto-send delivery modes
-- [ ] Selected-text voice transformation
-- [ ] App, window, URL, document, recipient and selection context
-- [ ] Per-application styles with a user-facing editor
-- [ ] Email greeting/sign-off mode
-- [ ] Personal dictionary and spoken formatting
-- [ ] Smart links and learned personalisation
+- [x] System-wide press-and-hold dictation
+- [x] Locked/hands-free recording and cancellation
+- [x] System-wide status UI and configurable audio cues
+- [x] Automatic paste, copy-only and auto-send delivery modes
+- [x] Selected-text voice transformation
+- [x] App, window, URL, document, recipient and selection context
+- [x] Per-application styles with a user-facing editor
+- [x] Email greeting/sign-off mode
+- [x] Personal dictionary and spoken formatting
+- [x] Smart links and learned personalisation
 
 ### Meetings and memos
 
-- [ ] Microphone and system-audio capture with input selection
-- [ ] Automatic conferencing-app detection plus manual start
-- [ ] Live transcript with utterance timestamps and genuine speaker attribution
-- [ ] Live notes with crash-safe autosave
-- [ ] Audio-health warnings, echo handling and recovery
-- [ ] Playback, export, search and topic navigation
-- [ ] Local summary, decisions and action items
-- [ ] Voice memos with title, summary, playback and retention controls
-- [ ] Screen-sharing privacy behaviour
-- [ ] Reliable webhooks with delivery status and retry
+- [x] Microphone and system-audio capture with input selection
+- [x] Manual meeting start with explicit active-channel status
+- [x] Live transcript preview and timed final utterances
+- [x] Optional genuine anonymous speaker attribution with editable labels
+- [x] Live notes with crash-safe autosave
+- [x] Audio-health warnings, echo handling and recovery
+- [x] Playback, export, search and topic navigation
+- [x] Local summary, decisions and action items
+- [x] Voice memos with title, summary, playback and retention controls
+- [x] Screen-sharing privacy behaviour
+- [x] Reliable webhooks with delivery status and retry
 
 ### Workspace and integrations
 
-- [ ] Indexed search across dictations, meetings and memos
-- [ ] Journal, recent activity, contextual timeline and statistics
-- [ ] History retention, deletion and export controls
-- [ ] Eleven documented MCP tools with setup/status UI
-- [ ] Usable authenticated loopback API with token rotation
+- [x] Indexed search across dictations, meetings and memos
+- [x] Journal, recent activity, contextual timeline and statistics
+- [x] History retention, deletion and export controls
+- [x] Eleven documented MCP tools with setup/status UI
+- [x] Usable authenticated loopback API with token rotation
 - [ ] Launch-at-login, diagnostics, signed distribution and updates
 
 ## Required smoke journeys

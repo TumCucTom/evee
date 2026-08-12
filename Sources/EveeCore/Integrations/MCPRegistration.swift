@@ -12,6 +12,17 @@ public struct MCPRegistrationResult: Equatable, Sendable {
     }
 }
 
+public struct MCPClientConfiguration: Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    public var name: String
+    public var configurationURL: URL
+
+    public init(name: String, configurationURL: URL) {
+        self.name = name
+        self.configurationURL = configurationURL
+    }
+}
+
 public enum MCPRegistrationError: LocalizedError, Sendable {
     case executableMissing(URL)
     case executableNotRunnable(URL)
@@ -33,6 +44,34 @@ public enum MCPRegistration {
 
     public static func configuration(executablePath: String) -> [String: Any] {
         ["mcpServers": ["evee": ["command": URL(fileURLWithPath: executablePath).standardizedFileURL.path, "args": []]]]
+    }
+
+    public static func detectedClients(fileManager: FileManager = .default) -> [MCPClientConfiguration] {
+        let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let home = fileManager.homeDirectoryForCurrentUser
+        let candidates = [
+            MCPClientConfiguration(name: "Claude Desktop", configurationURL: support.appendingPathComponent("Claude/claude_desktop_config.json")),
+            MCPClientConfiguration(name: "Cursor", configurationURL: home.appendingPathComponent(".cursor/mcp.json")),
+            MCPClientConfiguration(name: "Windsurf", configurationURL: home.appendingPathComponent(".codeium/windsurf/mcp_config.json"))
+        ]
+        return candidates.filter { client in
+            fileManager.fileExists(atPath: client.configurationURL.path)
+                || fileManager.fileExists(atPath: client.configurationURL.deletingLastPathComponent().path)
+        }
+    }
+
+    @discardableResult
+    public static func writeDetectedClientConfigurations(bundle: Bundle = .main) throws -> [MCPRegistrationResult] {
+        let executable = bundledExecutableURL(bundle: bundle)
+        let clients = detectedClients()
+        let targets = clients.isEmpty
+            ? [MCPClientConfiguration(
+                name: "Claude Desktop",
+                configurationURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("Claude/claude_desktop_config.json")
+            )]
+            : clients
+        return try targets.map { try writeConfiguration(at: $0.configurationURL, executableURL: executable) }
     }
 
     @discardableResult

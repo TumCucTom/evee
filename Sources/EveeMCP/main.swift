@@ -16,6 +16,25 @@ private struct WorkspaceStats: Codable {
     var totalWords: Int
     var firstActivityAt: Date?
     var lastActivityAt: Date?
+    var activeDays: Int
+    var currentDailyStreak: Int
+    var longestDailyStreak: Int
+}
+
+private struct SearchHit: Codable {
+    var record: WorkspaceRecord
+    var snippet: String
+}
+
+private struct JournalReportEntry: Codable {
+    var activity: WorkspaceJournalEntry
+    var voiceRecordCount: Int
+    var dictationCount: Int
+    var meetingCount: Int
+    var memoCount: Int
+    var meetingDecisions: [MeetingInsight]
+    var meetingActionItems: [MeetingInsight]
+    var memoActionItems: [String]
 }
 
 private struct PublicConfiguration: Codable {
@@ -33,8 +52,18 @@ private struct PublicConfiguration: Codable {
     var appStyleCount: Int
     var activityTrackingEnabled: Bool
     var activityWindowTitlesEnabled: Bool
+    var activityWebAddressesEnabled: Bool
+    var activityFocusedTextEnabled: Bool
     var activityJournalEnabled: Bool
     var activityRetentionDays: Int
+    var textDeliveryMode: TextDeliveryMode
+    var emailFormattingMode: EmailFormattingMode
+    var correctionLearningEnabled: Bool
+    var smartLinkCount: Int
+    var workspaceRetentionDays: Int
+    var selectedInputDevice: Bool
+    var lowLatencyMode: Bool
+    var wakePhraseListeningEnabled: Bool
 }
 
 @main
@@ -99,7 +128,9 @@ enum EveeMCP {
             let query = arguments["query"] as? String ?? ""
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
             let records = try await store.search(query, kind: kind, limit: limit)
-            return try encode(records.map(publicRecord))
+            return try encode(records.map { record in
+                SearchHit(record: publicRecord(record), snippet: searchSnippet(for: record, query: query))
+            })
 
         case "recent_activity":
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
@@ -123,7 +154,22 @@ enum EveeMCP {
 
         case "get_journal":
             let journal = try await WorkspaceIntelligenceStore.shared.journal(limit: limit)
-            return try encode(journal)
+            let records = try await store.loadRecords()
+            let calendar = Calendar.current
+            let enriched = journal.value.map { entry in
+                let matching = records.filter { calendar.isDate($0.createdAt, inSameDayAs: entry.day) }
+                return JournalReportEntry(
+                    activity: entry,
+                    voiceRecordCount: matching.count,
+                    dictationCount: matching.filter { $0.kind == .dictation }.count,
+                    meetingCount: matching.filter { $0.kind == .meeting }.count,
+                    memoCount: matching.filter { $0.kind == .memo }.count,
+                    meetingDecisions: matching.compactMap(\.meetingIntelligence).flatMap(\.decisions),
+                    meetingActionItems: matching.compactMap(\.meetingIntelligence).flatMap(\.actionItems),
+                    memoActionItems: matching.compactMap(\.memoIntelligence).flatMap(\.actionItems)
+                )
+            }
+            return try encode(WorkspaceIntelligenceStatus(enabled: journal.enabled, collectedAt: journal.collectedAt, value: enriched))
 
         case "get_dictation":
             return try await encodeRecord(kind: .dictation, arguments: arguments, store: store)
@@ -135,6 +181,7 @@ enum EveeMCP {
         case "get_stats":
             let records = try await store.loadRecords()
             let orderedDates = records.map(\.createdAt).sorted()
+            let streaks = activityStreaks(records.map(\.createdAt))
             return try encode(WorkspaceStats(
                 totalRecords: records.count,
                 dictations: records.filter { $0.kind == .dictation }.count,
@@ -143,7 +190,10 @@ enum EveeMCP {
                 totalDuration: records.compactMap(\.duration).reduce(0, +),
                 totalWords: records.reduce(0) { $0 + $1.text.split(whereSeparator: \.isWhitespace).count },
                 firstActivityAt: orderedDates.first,
-                lastActivityAt: orderedDates.last
+                lastActivityAt: orderedDates.last,
+                activeDays: streaks.activeDays,
+                currentDailyStreak: streaks.current,
+                longestDailyStreak: streaks.longest
             ))
 
         case "get_config":
@@ -164,8 +214,18 @@ enum EveeMCP {
                 appStyleCount: settings.appStyles.count,
                 activityTrackingEnabled: intelligence.isEnabled,
                 activityWindowTitlesEnabled: intelligence.includeWindowTitles,
+                activityWebAddressesEnabled: intelligence.includeWebAddresses == true,
+                activityFocusedTextEnabled: intelligence.includeFocusedText == true,
                 activityJournalEnabled: intelligence.journalEnabled,
-                activityRetentionDays: intelligence.retentionDays
+                activityRetentionDays: intelligence.retentionDays,
+                textDeliveryMode: settings.textDeliveryMode,
+                emailFormattingMode: settings.emailFormattingMode,
+                correctionLearningEnabled: settings.learnCorrections,
+                smartLinkCount: settings.smartLinks.count,
+                workspaceRetentionDays: settings.historyRetentionDays,
+                selectedInputDevice: !settings.inputDeviceUID.isEmpty,
+                lowLatencyMode: settings.lowLatencyMode,
+                wakePhraseListeningEnabled: settings.hotMicEnabled
             ))
 
         default:
@@ -200,6 +260,34 @@ enum EveeMCP {
     static func parseDate(_ value: String?) -> Date? {
         guard let value else { return nil }
         return ISO8601DateFormatter().date(from: value)
+    }
+
+    static func searchSnippet(for record: WorkspaceRecord, query: String) -> String {
+        let source = [record.title, record.text, record.notes, record.tags.joined(separator: " ")].joined(separator: "\n")
+        guard let range = source.range(of: query, options: .caseInsensitive) else { return String(source.prefix(240)) }
+        let start = source.index(range.lowerBound, offsetBy: -90, limitedBy: source.startIndex) ?? source.startIndex
+        let end = source.index(range.upperBound, offsetBy: 150, limitedBy: source.endIndex) ?? source.endIndex
+        return String(source[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func activityStreaks(_ dates: [Date], calendar: Calendar = .current) -> (activeDays: Int, current: Int, longest: Int) {
+        let days = Set(dates.map { calendar.startOfDay(for: $0) }).sorted()
+        guard !days.isEmpty else { return (0, 0, 0) }
+        var longest = 1
+        var run = 1
+        for index in 1..<days.count {
+            if calendar.dateComponents([.day], from: days[index - 1], to: days[index]).day == 1 {
+                run += 1
+                longest = max(longest, run)
+            } else {
+                run = 1
+            }
+        }
+        let today = calendar.startOfDay(for: .now)
+        guard let last = days.last else { return (0, 0, 0) }
+        let distance = calendar.dateComponents([.day], from: last, to: today).day ?? Int.max
+        let current = (distance == 0 || distance == 1) ? run : 0
+        return (days.count, current, longest)
     }
 
     static var toolDefinitions: [[String: Any]] {

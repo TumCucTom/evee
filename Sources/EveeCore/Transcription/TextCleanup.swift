@@ -17,6 +17,7 @@ public struct TextCleanupPipeline: Sendable {
         guard tone != .verbatim else { return text }
 
         text = removeFillers(text)
+        text = removeFalseStarts(text)
         text = applyVocabulary(text, terms: terms)
         text = spokenFormatting(text)
         text = sentenceCase(text)
@@ -81,6 +82,20 @@ public struct TextCleanupPipeline: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func removeFalseStarts(_ input: String) -> String {
+        input
+            .replacingOccurrences(
+                of: #"(?i)\b([\p{L}\p{N}']+(?:\s+[\p{L}\p{N}']+){0,3})\s*(?:--|—|\.\.\.)\s*\1\b"#,
+                with: "$1",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"(?i)\b([\p{L}\p{N}']+)\s+\1\b"#,
+                with: "$1",
+                options: .regularExpression
+            )
+    }
+
     private func applyVocabulary(_ input: String, terms: [DictionaryTerm]) -> String {
         terms.reduce(input) { text, term in
             let escaped = NSRegularExpression.escapedPattern(for: term.spoken)
@@ -94,6 +109,11 @@ public struct TextCleanupPipeline: Sendable {
             " comma": ",", " full stop": ".", " period": ".", " question mark": "?",
             " exclamation mark": "!", " colon": ":", " semicolon": ";", " new line ": "\n",
             " open bracket ": " (", " close bracket": ")",
+            " coma": ",", " punto": ".", " signo de interrogación": "?", " nueva línea ": "\n",
+            " virgule": ",", " point final": ".", " point d'interrogation": "?", " nouvelle ligne ": "\n",
+            " komma": ",", " punkt": ".", " fragezeichen": "?", " neue zeile ": "\n",
+            " vírgula": ",", " ponto final": ".", " ponto de interrogação": "?", " nova linha ": "\n",
+            " virgola": ",", " punto fermo": ".", " punto interrogativo": "?", " nuova riga ": "\n",
         ]
         return replacements.reduce(input) { $0.replacingOccurrences(of: $1.key, with: $1.value, options: .caseInsensitive) }
     }

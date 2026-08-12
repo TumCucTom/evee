@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import AudioToolbox
 import Foundation
 
 public enum AudioCaptureError: LocalizedError {
@@ -28,8 +29,13 @@ public final class MicrophoneRecorder: ObservableObject {
     private let writeErrors = AudioWriteErrorState()
     private var file: AVAudioFile?
     private var outputURL: URL?
+    private let bufferRelay = AudioBufferRelay()
 
     public init() {}
+
+    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        bufferRelay.set(handler)
+    }
 
     public static var isPermissionGranted: Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
@@ -42,19 +48,33 @@ public final class MicrophoneRecorder: ObservableObject {
         return false
     }
 
-    public func start(at url: URL) async throws {
+    public func start(at url: URL, deviceUID: String? = nil, lowLatency: Bool = false) async throws {
         guard !isRecording else { throw AudioCaptureError.alreadyRecording }
         guard await requestPermission() else { throw AudioCaptureError.microphoneDenied }
 
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let input = engine.inputNode
+        if let deviceUID, !deviceUID.isEmpty, let deviceID = AudioInputDevices.deviceID(forUID: deviceUID) {
+            guard let audioUnit = input.audioUnit else { throw AudioCaptureError.invalidFormat }
+            var selected = deviceID
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &selected,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+            guard status == noErr else { throw AudioCaptureError.invalidFormat }
+        }
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioCaptureError.invalidFormat }
 
         let output = try AVAudioFile(forWriting: url, settings: format.settings)
         writeErrors.reset()
         let writeErrors = self.writeErrors
-        input.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
+        let bufferRelay = self.bufferRelay
+        input.installTap(onBus: 0, bufferSize: lowLatency ? 256 : 1_024, format: format) { [weak self] buffer, _ in
             do {
                 try output.write(from: buffer)
             } catch {
@@ -67,6 +87,7 @@ public final class MicrophoneRecorder: ObservableObject {
             for index in 0..<count { sum += channel[index] * channel[index] }
             let rms = sqrt(sum / Float(count))
             Task { @MainActor in self?.level = min(1, rms * 14) }
+            bufferRelay.publishCopy(of: buffer)
         }
 
         do {

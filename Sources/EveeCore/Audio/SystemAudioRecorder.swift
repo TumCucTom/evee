@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
+import FluidAudio
 
 public enum SystemAudioRecorderError: LocalizedError, Sendable {
     case alreadyRecording
@@ -70,8 +71,14 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
     private var droppedSampleCount = 0
     private var terminalError: Error?
     private var state: State = .idle
+    private let bufferRelay = AudioBufferRelay()
+    private let audioConverter = AudioConverter()
 
     public override init() {}
+
+    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+        bufferRelay.set(handler)
+    }
 
     public func start(at url: URL) async throws {
         let canStart = lock.withLock { () -> Bool in
@@ -221,25 +228,30 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer) else { return }
-        lock.withLock {
-            guard case .recording = state, terminalError == nil, let writer, let input else { return }
+        let appended = lock.withLock { () -> Bool in
+            guard case .recording = state, terminalError == nil, let writer, let input else { return false }
             if !startedSession {
                 guard writer.startWriting() else {
                     terminalError = SystemAudioRecorderError.appendFailed(writer.error?.localizedDescription ?? "The encoder did not start.")
-                    return
+                    return false
                 }
                 writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
                 startedSession = true
             }
             guard input.isReadyForMoreMediaData else {
                 droppedSampleCount += 1
-                return
+                return false
             }
             if input.append(sampleBuffer) {
                 sampleCount += 1
+                return true
             } else {
                 terminalError = SystemAudioRecorderError.appendFailed(writer.error?.localizedDescription ?? "The encoder rejected an audio sample.")
+                return false
             }
+        }
+        if appended, let pcm = try? audioConverter.extractAVAudioPCMBuffer(from: sampleBuffer) {
+            bufferRelay.publishCopy(of: pcm)
         }
     }
 
