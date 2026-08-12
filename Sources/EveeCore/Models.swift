@@ -267,6 +267,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     public var duration: TimeInterval?
     public var segments: [TranscriptSegment]
     public var meetingIntelligence: MeetingIntelligence?
+    public var memoIntelligence: MemoIntelligence?
     public var notes: String
     public var tags: [String]
     public var webhookDeliveries: [WebhookDelivery]
@@ -288,6 +289,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         duration: TimeInterval? = nil,
         segments: [TranscriptSegment] = [],
         meetingIntelligence: MeetingIntelligence? = nil,
+        memoIntelligence: MemoIntelligence? = nil,
         notes: String = "",
         tags: [String] = [],
         webhookDeliveries: [WebhookDelivery] = [],
@@ -308,6 +310,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         self.duration = duration
         self.segments = segments
         self.meetingIntelligence = meetingIntelligence
+        self.memoIntelligence = memoIntelligence
         self.notes = notes
         self.tags = tags
         self.webhookDeliveries = webhookDeliveries
@@ -318,7 +321,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, createdAt, updatedAt, title, text, rawText, sourceApplication
-        case audioRelativePath, audioTracks, duration, segments, meetingIntelligence, notes, tags, webhookDeliveries, recoverySourceID
+        case audioRelativePath, audioTracks, duration, segments, meetingIntelligence, memoIntelligence, notes, tags, webhookDeliveries, recoverySourceID
         case operation, context
     }
 
@@ -337,6 +340,7 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         duration = try values.decodeIfPresent(TimeInterval.self, forKey: .duration)
         segments = try values.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
         meetingIntelligence = try values.decodeIfPresent(MeetingIntelligence.self, forKey: .meetingIntelligence)
+        memoIntelligence = try values.decodeIfPresent(MemoIntelligence.self, forKey: .memoIntelligence)
         notes = try values.decodeIfPresent(String.self, forKey: .notes) ?? ""
         tags = try values.decodeIfPresent([String].self, forKey: .tags) ?? []
         webhookDeliveries = try values.decodeIfPresent([WebhookDelivery].self, forKey: .webhookDeliveries) ?? []

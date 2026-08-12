@@ -89,6 +89,13 @@ struct MeetingWorkspaceView: View {
                         .accessibilityLabel(liveMeetingStatus)
                 }
 
+                if let warning = store.microphoneHealthWarning {
+                    Label(warning, systemImage: "mic.slash.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("Microphone warning: \(warning)")
+                }
+
                 if !store.liveMeetingTranscript.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Live transcript").font(.system(size: 12, weight: .semibold))

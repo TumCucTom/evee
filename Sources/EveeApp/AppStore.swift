@@ -50,6 +50,9 @@ final class AppStore: ObservableObject {
     @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
     @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
     @Published private(set) var liveMeetingStatus: String?
+    @Published private(set) var availableUpdate: EveeRelease?
+    @Published private(set) var isCheckingForUpdates = false
+    @Published private(set) var microphoneHealthWarning: String?
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
@@ -89,6 +92,8 @@ final class AppStore: ObservableObject {
     private var webhookRetryTask: Task<Void, Never>?
     private var liveMeetingTranscriber: LiveMeetingTranscriber?
     private var liveMeetingUpdateTask: Task<Void, Never>?
+    private var microphoneHealthTask: Task<Void, Never>?
+    private var lastNonSilentAudioAt = Date.distantPast
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -120,6 +125,10 @@ final class AppStore: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] level in
                 guard let self, case .recording(let startedAt, _) = self.captureState else { return }
+                if level > 0.01 {
+                    self.lastNonSilentAudioAt = .now
+                    self.microphoneHealthWarning = nil
+                }
                 self.captureState = .recording(startedAt: startedAt, level: level)
             }
             .store(in: &cancellables)
@@ -528,6 +537,7 @@ final class AppStore: ObservableObject {
             captureStartedAt = startedAt
             captureLifecycle = .recording(sessionID)
             captureState = .recording(startedAt: startedAt, level: 0)
+            startMicrophoneHealthMonitor(sessionID: sessionID)
 
             if stopRequestedDuringStart == sessionID {
                 stopRequestedDuringStart = nil
@@ -718,11 +728,12 @@ final class AppStore: ObservableObject {
         case .memo: settings.retainMemoAudio
         }
         let recordKind = activeKind
+        let memoIntelligence = activeKind == .memo ? MemoIntelligencePipeline().generate(from: polished) : nil
         let title: String = switch activeKind {
         case .dictation where activeOperation == .selectionTransform: "Transform · \(String(polished.prefix(60)))"
         case .dictation: String(polished.prefix(72))
         case .meeting: meetingTitle.isEmpty ? "Meeting · \(Date.now.formatted(date: .abbreviated, time: .shortened))" : meetingTitle
-        case .memo: String(polished.prefix(72))
+        case .memo: memoIntelligence?.title ?? String(polished.prefix(72))
         }
         var record = WorkspaceRecord(
             kind: activeKind,
@@ -732,6 +743,7 @@ final class AppStore: ObservableObject {
             sourceApplication: settings.retainContextMetadata ? activeApplication?.name : nil,
             duration: duration,
             meetingIntelligence: activeKind == .meeting ? meetingIntelligence : nil,
+            memoIntelligence: memoIntelligence,
             notes: activeKind == .meeting ? meetingNotes : "",
             operation: activeOperation,
             context: persistedActiveContext()
@@ -893,6 +905,9 @@ final class AppStore: ObservableObject {
         stopRequestedDuringStart = nil
         recorder.setBufferHandler(nil)
         systemAudioRecorder.setBufferHandler(nil)
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = nil
+        microphoneHealthWarning = nil
     }
 
     var hasMeetingDraft: Bool {
@@ -1073,6 +1088,21 @@ final class AppStore: ObservableObject {
         }
     }
 
+    private func startMicrophoneHealthMonitor(sessionID: UUID) {
+        lastNonSilentAudioAt = .now
+        microphoneHealthWarning = nil
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, !Task.isCancelled, self.captureLifecycle == .recording(sessionID) else { return }
+                if Date.now.timeIntervalSince(self.lastNonSilentAudioAt) >= 15 {
+                    self.microphoneHealthWarning = "No microphone signal has been detected for 15 seconds. Check the selected input and its mute switch; the recording is still running."
+                }
+            }
+        }
+    }
+
     private func stopLiveMeetingTranscription() async {
         recorder.setBufferHandler(nil)
         systemAudioRecorder.setBufferHandler(nil)
@@ -1125,6 +1155,51 @@ final class AppStore: ObservableObject {
         } catch {
             statusMessage = "The workspace could not be exported: \(error.localizedDescription)"
         }
+    }
+
+    func exportDiagnostics() async {
+        let panel = NSSavePanel()
+        panel.title = "Export Evee diagnostics"
+        panel.nameFieldStringValue = "Evee Diagnostics.txt"
+        panel.allowedFileTypes = ["txt"]
+        guard await panel.begin() == .OK, let destination = panel.url else { return }
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "development"
+        let report = DiagnosticsReport(
+            appVersion: version,
+            operatingSystem: ProcessInfo.processInfo.operatingSystemVersionString,
+            model: settings.model.title,
+            language: settings.languageCode,
+            recordCount: records.count,
+            recoveryCount: recoverableCaptures.count,
+            microphonePermission: microphonePermissionGranted,
+            accessibilityPermission: accessibilityPermissionGranted,
+            systemAudioEnabled: settings.meetingCaptureEnabled,
+            liveMeetingEnabled: settings.liveMeetingTranscriptionEnabled,
+            localAPIEnabled: settings.localAPIEnabled,
+            webhookConfigured: !settings.webhookURL.isEmpty,
+            inputDeviceSelected: !settings.inputDeviceUID.isEmpty
+        )
+        do {
+            try Data(report.rendered().utf8).write(to: destination, options: .atomic)
+            statusMessage = "Exported a redacted diagnostics report."
+        } catch { statusMessage = "Diagnostics could not be exported: \(error.localizedDescription)" }
+    }
+
+    func checkForUpdates() async {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        defer { isCheckingForUpdates = false }
+        do {
+            let release = try await UpdateChecker().latestRelease()
+            let installed = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+            if UpdateChecker().isNewer(release.version, than: installed) {
+                availableUpdate = release
+                statusMessage = "Evee \(release.version) is available. Open its release page to download it."
+            } else {
+                availableUpdate = nil
+                statusMessage = "Evee is up to date."
+            }
+        } catch { statusMessage = "Update check failed: \(error.localizedDescription)" }
     }
 
     private func loadAndMigrateSecrets() async throws {

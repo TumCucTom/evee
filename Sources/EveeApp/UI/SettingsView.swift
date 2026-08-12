@@ -259,6 +259,16 @@ struct SettingsView: View {
                 Text("Audio cues mark recording start, processing, completion and errors. Wake-word mode is not available in this build.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                HStack {
+                    Button(store.isCheckingForUpdates ? "Checking…" : "Check for updates") {
+                        Task { await store.checkForUpdates() }
+                    }
+                    .disabled(store.isCheckingForUpdates)
+                    if let update = store.availableUpdate {
+                        Link("Open Evee \(update.version) release", destination: update.pageURL)
+                    }
+                    Button("Export diagnostics") { Task { await store.exportDiagnostics() } }
+                }
             }
 
             HStack {

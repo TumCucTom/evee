@@ -52,6 +52,12 @@ struct RecordDetailView: View {
                     meetingIntelligenceSection(intelligence)
                 }
 
+                if draft.kind == .memo,
+                   let intelligence = draft.memoIntelligence,
+                   !intelligence.isEmpty {
+                    memoIntelligenceSection(intelligence)
+                }
+
                 if draft.kind == .meeting {
                     section("Notes", subtitle: "Your notes stay distinct from the transcript") {
                         TextEditor(text: $draft.notes)
@@ -79,16 +85,21 @@ struct RecordDetailView: View {
                 if !draft.segments.isEmpty {
                     section("Speaker timeline", subtitle: "Participant numbers are anonymous local speaker clusters, not identified people") {
                         VStack(alignment: .leading, spacing: 12) {
-                            ForEach(draft.segments) { segment in
+                            ForEach($draft.segments) { $segment in
                                 HStack(alignment: .top, spacing: 10) {
                                     Text(timestamp(segment.start))
                                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                         .frame(width: 44, alignment: .leading)
                                     VStack(alignment: .leading, spacing: 3) {
-                                        if let speaker = segment.speaker {
-                                            Text(speaker).font(.caption.weight(.semibold)).foregroundStyle(AnimaTheme.violet)
-                                        }
+                                        TextField("Speaker label", text: Binding(
+                                            get: { segment.speaker ?? "" },
+                                            set: { segment.speaker = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                                        ))
+                                        .textFieldStyle(.plain)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(AnimaTheme.violet)
+                                        .help("Correct this anonymous speaker label, then Save")
                                         if let provenance = segmentProvenance(segment) {
                                             Text(provenance)
                                                 .font(.system(size: 9, weight: .medium))
@@ -198,6 +209,18 @@ struct RecordDetailView: View {
                         }
                     }
                 }
+                if let topics = intelligence.topics, !topics.isEmpty {
+                    insightGroup("Topic sections", icon: "list.bullet.rectangle") {
+                        ForEach(topics) { topic in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(timestamp(topic.start))
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                Text(topic.title).font(.system(size: 12)).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
                 if !intelligence.decisions.isEmpty {
                     insightGroup("Decisions", icon: "checkmark.seal") {
                         ForEach(intelligence.decisions) { item in
@@ -222,6 +245,23 @@ struct RecordDetailView: View {
                                 .foregroundStyle(.secondary)
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    private func memoIntelligenceSection(_ intelligence: MemoIntelligence) -> some View {
+        section("Memo overview", subtitle: "Extracted locally from the memo; verify before acting") {
+            VStack(alignment: .leading, spacing: 14) {
+                if !intelligence.highlights.isEmpty {
+                    insightGroup("Highlights", icon: "text.alignleft") {
+                        ForEach(intelligence.highlights, id: \.self) { insightRow($0) }
+                    }
+                }
+                if !intelligence.actionItems.isEmpty {
+                    insightGroup("Possible actions", icon: "checklist") {
+                        ForEach(intelligence.actionItems, id: \.self) { insightRow($0) }
                     }
                 }
             }
