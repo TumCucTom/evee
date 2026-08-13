@@ -216,10 +216,31 @@ final class EveeCoreTests: XCTestCase {
     }
 
     func testWebhookSignatureIsStableAndHexEncoded() {
-        let signature = MeetingWebhook.signature(for: Data("payload".utf8), secret: "secret")
+        let body = Data("payload".utf8)
+        let deliveryID = UUID(uuidString: "48B2B47F-9D39-43C7-8B22-9DD0E5C0E1AD")!
+        let timestamp = "2026-08-13T10:15:00Z"
+        let signature = MeetingWebhook.signature(
+            body: body,
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        )
         XCTAssertEqual(signature.count, 64)
-        XCTAssertEqual(signature, MeetingWebhook.signature(for: Data("payload".utf8), secret: "secret"))
-        XCTAssertNotEqual(signature, MeetingWebhook.signature(for: Data("different".utf8), secret: "secret"))
+        XCTAssertEqual(signature, MeetingWebhook.signature(
+            body: body,
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        ))
+        XCTAssertNotEqual(signature, MeetingWebhook.signature(
+            body: Data("different".utf8),
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        ))
     }
 
     func testMeetingDraftRoundTripsAndCanBeCleared() async throws {

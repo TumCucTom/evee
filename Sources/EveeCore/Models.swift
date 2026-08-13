@@ -140,6 +140,7 @@ public enum WebhookDeliveryState: String, Codable, Sendable {
     case pending
     case delivered
     case failed
+    case cancelled
 }
 
 public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {

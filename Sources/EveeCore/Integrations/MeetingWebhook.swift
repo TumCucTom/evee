@@ -70,6 +70,7 @@ public enum WebhookEndpointPolicy {
 
 public struct MeetingWebhook: Sendable {
     public static let maximumPayloadSize = 10 * 1_024 * 1_024
+    public static let eventName = "meeting.completed"
     private let session: URLSession
 
     public init(session: URLSession = .shared) {
@@ -119,13 +120,20 @@ public struct MeetingWebhook: Sendable {
                 request.timeoutInterval = 15
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.setValue("application/json", forHTTPHeaderField: "Accept")
-                request.setValue("meeting.completed", forHTTPHeaderField: "X-Evee-Event")
+                request.setValue(Self.eventName, forHTTPHeaderField: "X-Evee-Event")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "X-Evee-Delivery-ID")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "Idempotency-Key")
-                request.setValue(ISO8601DateFormatter().string(from: attemptDate), forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
+                let timestamp = ISO8601DateFormatter().string(from: attemptDate)
+                request.setValue(timestamp, forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
 
                 if !secret.isEmpty {
-                    request.setValue(Self.signature(for: body, secret: secret), forHTTPHeaderField: "X-Evee-Signature-256")
+                    request.setValue(Self.signature(
+                        body: body,
+                        secret: secret,
+                        event: Self.eventName,
+                        deliveryID: deliveryID,
+                        timestamp: timestamp
+                    ), forHTTPHeaderField: "X-Evee-Signature-256")
                 }
 
                 let (_, response) = try await session.data(for: request, delegate: SafeWebhookRedirectDelegate())
@@ -183,6 +191,48 @@ public struct MeetingWebhook: Sendable {
         let key = SymmetricKey(data: Data(secret.utf8))
         let signature = HMAC<SHA256>.authenticationCode(for: body, using: key)
         return Data(signature).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func signature(
+        body: Data,
+        secret: String,
+        event: String,
+        deliveryID: UUID,
+        timestamp: String
+    ) -> String {
+        let input = canonicalSignatureInput(
+            body: body,
+            event: event,
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        )
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let signature = HMAC<SHA256>.authenticationCode(for: input, using: key)
+        return Data(signature).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func canonicalSignatureInput(
+        body: Data,
+        event: String,
+        deliveryID: UUID,
+        timestamp: String
+    ) -> Data {
+        let bodyDigest = SHA256.hash(data: body)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let fields = [
+            ("event", event),
+            ("timestamp", timestamp),
+            ("delivery-id", deliveryID.uuidString),
+            ("body-sha256", bodyDigest),
+        ]
+        var input = Data("evee-webhook-v1\n".utf8)
+        for (name, value) in fields {
+            input.append(Data("\(name):\(value.utf8.count)\n".utf8))
+            input.append(Data(value.utf8))
+            input.append(0x0A)
+        }
+        return input
     }
 
     public static func payload(for record: WorkspaceRecord) throws -> Data {

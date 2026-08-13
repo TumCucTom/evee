@@ -74,8 +74,225 @@ private final class MemorySecretStore: LocalAPISecretStore, @unchecked Sendable 
     }
 }
 
+private final class SuspendedCoreCheckURLProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var suspended: SuspendedCoreCheckURLProtocol?
+    private static var capturedRequest: URLRequest?
+    private static var startedHandler: (@Sendable (URLRequest) -> Void)?
+
+    static func prepare(started: @escaping @Sendable (URLRequest) -> Void) {
+        lock.lock()
+        suspended = nil
+        capturedRequest = nil
+        startedHandler = started
+        lock.unlock()
+    }
+
+    static func release() {
+        lock.lock()
+        let current = suspended
+        suspended = nil
+        capturedRequest = nil
+        startedHandler = nil
+        lock.unlock()
+        guard let current,
+              let response = HTTPURLResponse(
+                url: current.request.url!,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+              ) else { return }
+        current.client?.urlProtocol(current, didReceive: response, cacheStoragePolicy: .notAllowed)
+        current.client?.urlProtocol(current, didLoad: Data("{}".utf8))
+        current.client?.urlProtocolDidFinishLoading(current)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        lock.lock()
+        capturedRequest = requestWithReadableBody(request)
+        lock.unlock()
+        return true
+    }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.lock()
+        Self.suspended = self
+        let handler = Self.startedHandler
+        let captured = Self.capturedRequest ?? request
+        Self.lock.unlock()
+        handler?(captured)
+    }
+
+    override func stopLoading() {
+        // The response is released after task cancellation to exercise a stale
+        // local transport callback without opening an external connection.
+    }
+
+    private static func requestWithReadableBody(_ request: URLRequest) -> URLRequest {
+        guard request.httpBody == nil, let stream = request.httpBodyStream else { return request }
+        stream.open()
+        defer { stream.close() }
+        var body = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count > 0 else { break }
+            body.append(contentsOf: buffer.prefix(count))
+        }
+        var captured = request
+        captured.httpBody = body
+        return captured
+    }
+}
+
 private func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw CoreCheckError.assertionFailed(message) }
+}
+
+private func checkWebhookGeneration() async throws {
+    let deliveryID = UUID(uuidString: "75B09B72-BC3F-4939-9F81-E6B7C814A552")!
+    let coordinator = WebhookOutboxCoordinator()
+    let token = await coordinator.begin(deliveryID: deliveryID)
+    let task = Task<Void, Never> {
+        try? await Task.sleep(for: .seconds(30))
+    }
+    await coordinator.register(task, for: token)
+
+    let activeBeforeCancellation = await coordinator.mayCommit(token)
+    let cancelled = await coordinator.cancelAll()
+    let activeAfterCancellation = await coordinator.mayCommit(token)
+
+    try require(activeBeforeCancellation, "registered webhook dispatch was not allowed to commit")
+    try require(cancelled == [deliveryID], "webhook cancellation did not return the active delivery")
+    try require(!activeAfterCancellation, "cancelled webhook dispatch remained able to commit")
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    let body = Data("{\"meeting\":\"synthetic\"}".utf8)
+    let suspendedDeliveryID = UUID(uuidString: "19CF6CE4-3841-4CF7-9888-679CC63B3364")!
+    let destination = URL(string: "https://example.invalid/webhook")!
+    var storedRecord = WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Local test")
+    storedRecord.webhookDeliveries = [WebhookDelivery(
+        id: suspendedDeliveryID,
+        destination: destination.absoluteString,
+        payloadBody: body,
+        nextAttemptAt: Date(timeIntervalSince1970: 1_786_616_100)
+    )]
+    try await store.upsert(storedRecord)
+
+    let started = AsyncStream<URLRequest>.makeStream()
+    SuspendedCoreCheckURLProtocol.prepare { request in
+        started.continuation.yield(request)
+        started.continuation.finish()
+    }
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [SuspendedCoreCheckURLProtocol.self]
+    let session = URLSession(configuration: configuration)
+    defer { session.invalidateAndCancel() }
+    let suspendedCoordinator = WebhookOutboxCoordinator()
+    let suspendedToken = await suspendedCoordinator.begin(deliveryID: suspendedDeliveryID)
+    let suspendedTask = Task<Void, Never> {
+        do {
+            _ = try await MeetingWebhook(session: session).sendWithStatus(
+                record: storedRecord,
+                destination: destination,
+                secret: "synthetic-secret",
+                deliveryID: suspendedDeliveryID,
+                maxAttempts: 1,
+                payloadBody: body
+            )
+            if await suspendedCoordinator.mayCommit(suspendedToken),
+               var current = try await store.record(id: storedRecord.id),
+               let index = current.webhookDeliveries.firstIndex(where: { $0.id == suspendedDeliveryID }) {
+                current.webhookDeliveries[index].state = .delivered
+                try await store.upsert(current)
+            }
+        } catch {
+            if await suspendedCoordinator.mayCommit(suspendedToken),
+               var current = try? await store.record(id: storedRecord.id),
+               let index = current.webhookDeliveries.firstIndex(where: { $0.id == suspendedDeliveryID }) {
+                current.webhookDeliveries[index].state = .failed
+                try? await store.upsert(current)
+            }
+        }
+        await suspendedCoordinator.finish(suspendedToken)
+    }
+    await suspendedCoordinator.register(suspendedTask, for: suspendedToken)
+
+    let request = try await withTimeout(seconds: 2, onTimeout: { session.invalidateAndCancel() }) {
+        var iterator = started.stream.makeAsyncIterator()
+        guard let request = await iterator.next() else { throw CoreCheckError.timedOut }
+        return request
+    }
+    try require(request.httpBody == body, "webhook transport did not send the stored payload bytes")
+
+    _ = await suspendedCoordinator.cancelAll()
+    let persistedBeforeCancellation = try await store.record(id: storedRecord.id)
+    guard var cancelledRecord = persistedBeforeCancellation,
+          let cancelledIndex = cancelledRecord.webhookDeliveries.firstIndex(where: { $0.id == suspendedDeliveryID }) else {
+        throw CoreCheckError.assertionFailed("synthetic webhook row was not stored")
+    }
+    cancelledRecord.webhookDeliveries[cancelledIndex].state = .cancelled
+    cancelledRecord.webhookDeliveries[cancelledIndex].retryable = false
+    cancelledRecord.webhookDeliveries[cancelledIndex].nextAttemptAt = nil
+    cancelledRecord.webhookDeliveries[cancelledIndex].payloadBody = nil
+    try await store.upsert(cancelledRecord)
+    SuspendedCoreCheckURLProtocol.release()
+    await suspendedTask.value
+
+    let persistedAfterLateResponse = try await store.record(id: storedRecord.id)
+    guard let final = persistedAfterLateResponse?.webhookDeliveries.first(where: { $0.id == suspendedDeliveryID }) else {
+        throw CoreCheckError.assertionFailed("synthetic webhook row disappeared")
+    }
+    try require(final.state == .cancelled, "late webhook response replaced terminal cancellation")
+    try require(!final.retryable && final.nextAttemptAt == nil, "cancelled webhook remained retryable")
+    try require(final.payloadBody == nil, "cancelled webhook retained payload bytes")
+    print("webhook-generation: passed")
+}
+
+private func checkWebhookSignature() throws {
+    let body = Data("{\"meeting\":\"synthetic\"}".utf8)
+    let deliveryID = UUID(uuidString: "D5881780-29A4-4D3A-84A6-3FB7DD77CA94")!
+    let timestamp = "2026-08-13T10:15:00Z"
+    let first = MeetingWebhook.signature(
+        body: body,
+        secret: "synthetic-secret",
+        event: "meeting.completed",
+        deliveryID: deliveryID,
+        timestamp: timestamp
+    )
+
+    try require(first != MeetingWebhook.signature(
+        body: body,
+        secret: "synthetic-secret",
+        event: "meeting.completed",
+        deliveryID: UUID(uuidString: "3E165D7B-D650-420D-9537-B86CB074074C")!,
+        timestamp: timestamp
+    ), "webhook signature omitted the delivery identifier")
+    try require(first != MeetingWebhook.signature(
+        body: body,
+        secret: "synthetic-secret",
+        event: "meeting.updated",
+        deliveryID: deliveryID,
+        timestamp: timestamp
+    ), "webhook signature omitted the event")
+    try require(first != MeetingWebhook.signature(
+        body: body,
+        secret: "synthetic-secret",
+        event: "meeting.completed",
+        deliveryID: deliveryID,
+        timestamp: "2026-08-13T10:15:01Z"
+    ), "webhook signature omitted the timestamp")
+    try require(first != MeetingWebhook.signature(
+        body: Data("{\"meeting\":\"changed\"}".utf8),
+        secret: "synthetic-secret",
+        event: "meeting.completed",
+        deliveryID: deliveryID,
+        timestamp: timestamp
+    ), "webhook signature omitted the body")
+    print("webhook-signature: passed")
 }
 
 private func withTimeout<T: Sendable>(
@@ -556,7 +773,11 @@ if arguments == ["--filter", "context-policy"] {
     try await checkAPIPublicErrors()
 } else if arguments == ["--filter", "mcp-public-output"] {
     try await checkMCPPublicOutput()
+} else if arguments == ["--filter", "webhook-generation"] {
+    try await checkWebhookGeneration()
+} else if arguments == ["--filter", "webhook-signature"] {
+    try checkWebhookSignature()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|webhook-generation|webhook-signature>\n", stderr)
     exit(EXIT_FAILURE)
 }
