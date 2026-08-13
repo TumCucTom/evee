@@ -398,7 +398,12 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then hold the shortcut again."
             return
         }
-        activeApplication = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext)
+        activeApplication = TextDelivery.frontmostApplication(
+            policy: .ordinaryDictation(
+                retainMetadata: settings.retainContextMetadata,
+                captureVisibleText: settings.captureVisibleContext
+            )
+        )
         guard activeApplication != nil else {
             statusMessage = "Evee could not identify the app that should receive this dictation."
             return
@@ -424,7 +429,12 @@ final class AppStore: ObservableObject {
             statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then try the transform shortcut again."
             return
         }
-        guard let target = TextDelivery.frontmostApplication(includeVisibleText: settings.captureVisibleContext),
+        guard let target = TextDelivery.frontmostApplication(
+            policy: .selectionTransformation(
+                retainMetadata: settings.retainContextMetadata,
+                captureVisibleText: settings.captureVisibleContext
+            )
+        ),
               let selectedText = target.focusedTarget?.selectedText,
               !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             statusMessage = SelectionTransformError.emptySelection.localizedDescription

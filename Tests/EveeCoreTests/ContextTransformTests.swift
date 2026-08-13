@@ -2,6 +2,26 @@ import XCTest
 @testable import EveeCore
 
 final class ContextTransformTests: XCTestCase {
+    func testOrdinaryDictationWithoutRetentionCollectsOnlyDeliveryIdentity() {
+        let policy = ContextCollectionPolicy.ordinaryDictation(
+            retainMetadata: false,
+            captureVisibleText: false
+        )
+
+        XCTAssertTrue(policy.collectsDeliveryIdentity)
+        XCTAssertFalse(policy.collectsSelectedText)
+        XCTAssertFalse(policy.collectsWindowMetadata)
+        XCTAssertFalse(policy.collectsWebAndFileMetadata)
+        XCTAssertFalse(policy.collectsRecipientMetadata)
+        XCTAssertFalse(policy.collectsVisibleText)
+    }
+
+    func testSelectionTransformationAlwaysCollectsSelectedText() {
+        let policy = ContextCollectionPolicy.selectionTransformation(retainMetadata: false)
+
+        XCTAssertTrue(policy.collectsSelectedText)
+    }
+
     func testWorkspaceContextRoundTripsWithSelection() throws {
         let record = WorkspaceRecord(
             kind: .dictation,

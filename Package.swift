@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "EveeCore", targets: ["EveeCore"]),
         .executable(name: "Evee", targets: ["EveeApp"]),
         .executable(name: "evee-mcp", targets: ["EveeMCP"]),
+        .executable(name: "evee-core-checks", targets: ["EveeCoreChecks"]),
     ],
     dependencies: [
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.14.8"),
@@ -29,6 +30,11 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "EveeMCP", dependencies: ["EveeCore"]),
+        .executableTarget(
+            name: "EveeCoreChecks",
+            dependencies: ["EveeCore"],
+            path: "Tests/EveeCoreChecks"
+        ),
         .testTarget(name: "EveeCoreTests", dependencies: ["EveeCore"]),
     ]
 )

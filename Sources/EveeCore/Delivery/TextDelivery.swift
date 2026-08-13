@@ -158,9 +158,9 @@ public enum TextDelivery {
         }
     }
 
-    public static func frontmostApplication(includeVisibleText: Bool = false) -> FrontmostApplication? {
+    public static func frontmostApplication(policy: ContextCollectionPolicy) -> FrontmostApplication? {
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier, includeVisibleText: includeVisibleText) else { return nil }
+              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier, policy: policy) else { return nil }
         return FrontmostApplication(
             bundleIdentifier: app.bundleIdentifier ?? "unknown",
             name: app.localizedName ?? "App",
@@ -304,7 +304,15 @@ public enum TextDelivery {
 
 
         guard let expected = target.focusedTarget else { throw DeliveryError.targetContextChanged(target.name) }
-        guard let actual = focusedTarget(processIdentifier: target.processIdentifier),
+        let verificationPolicy = ContextCollectionPolicy(
+            collectsDeliveryIdentity: true,
+            collectsSelectedText: expectedSelectedText != nil,
+            collectsWindowMetadata: expected.windowFingerprint != nil || expected.windowTitle != nil,
+            collectsWebAndFileMetadata: expected.document != nil,
+            collectsRecipientMetadata: false,
+            collectsVisibleText: false
+        )
+        guard let actual = focusedTarget(processIdentifier: target.processIdentifier, policy: verificationPolicy),
               actual.elementFingerprint == expected.elementFingerprint,
               actual.windowFingerprint == expected.windowFingerprint,
               equivalent(actual.document, expected.document),
@@ -320,28 +328,46 @@ public enum TextDelivery {
         }
     }
 
-    private static func focusedTarget(processIdentifier: pid_t, includeVisibleText: Bool = false) -> FocusedTargetContext? {
+    private static func focusedTarget(
+        processIdentifier: pid_t,
+        policy: ContextCollectionPolicy
+    ) -> FocusedTargetContext? {
+        guard policy.collectsDeliveryIdentity else { return nil }
         let application = AXUIElementCreateApplication(processIdentifier)
         guard let element = copyElement(kAXFocusedUIElementAttribute as CFString, from: application) else { return nil }
-        let window = copyElement(kAXWindowAttribute as CFString, from: element)
-            ?? copyElement(kAXFocusedWindowAttribute as CFString, from: application)
-        let document = window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) }
-        let url = copyURLString("AXURL" as CFString, from: element)
-            ?? window.flatMap { copyURLString("AXURL" as CFString, from: $0) }
-            ?? document.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+        let needsWindow = policy.collectsWindowMetadata
+            || policy.collectsWebAndFileMetadata
+            || policy.collectsVisibleText
+        let window = needsWindow
+            ? copyElement(kAXWindowAttribute as CFString, from: element)
+                ?? copyElement(kAXFocusedWindowAttribute as CFString, from: application)
+            : nil
+        let document = policy.collectsWebAndFileMetadata
+            ? window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) }
+            : nil
+        let windowTitle = policy.collectsWindowMetadata || policy.collectsWebAndFileMetadata
+            ? window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) }
+            : nil
+        let url = policy.collectsWebAndFileMetadata
+            ? copyURLString("AXURL" as CFString, from: element)
+                ?? window.flatMap { copyURLString("AXURL" as CFString, from: $0) }
+                ?? document.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+            : nil
         return FocusedTargetContext(
-            windowFingerprint: window.map { Int(CFHash($0)) },
-            windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) },
+            windowFingerprint: policy.collectsWindowMetadata ? window.map { Int(CFHash($0)) } : nil,
+            windowTitle: policy.collectsWindowMetadata ? windowTitle : nil,
             document: document,
             elementFingerprint: Int(CFHash(element)),
             elementIdentifier: copyString(kAXIdentifierAttribute as CFString, from: element),
             role: copyString(kAXRoleAttribute as CFString, from: element),
             subrole: copyString(kAXSubroleAttribute as CFString, from: element),
-            selectedText: selectedText(from: element),
+            selectedText: policy.collectsSelectedText ? selectedText(from: element) : nil,
             url: url,
-            codeFile: codeFile(from: document, windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) }),
-            recipient: recipient(from: element),
-            visibleText: includeVisibleText ? window.flatMap { visibleText(from: $0) } : nil
+            codeFile: policy.collectsWebAndFileMetadata
+                ? codeFile(from: document, windowTitle: windowTitle)
+                : nil,
+            recipient: policy.collectsRecipientMetadata ? recipient(from: element) : nil,
+            visibleText: policy.collectsVisibleText ? window.flatMap { visibleText(from: $0) } : nil
         )
     }
 
@@ -362,7 +388,7 @@ public enum TextDelivery {
         guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
               let value,
               CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return value as! AXUIElement
+        return (value as! AXUIElement)
     }
 
     private static func copyString(_ attribute: CFString, from element: AXUIElement) -> String? {

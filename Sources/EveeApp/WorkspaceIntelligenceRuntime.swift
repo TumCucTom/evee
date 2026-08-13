@@ -51,7 +51,16 @@ final class WorkspaceIntelligenceRuntime {
                 ? frontmostWindowTitle(processIdentifier: processIdentifier)
                 : nil
             let accessibilityContext = preferences.includeWebAddresses == true || preferences.includeFocusedText == true
-                ? TextDelivery.frontmostApplication(includeVisibleText: preferences.includeFocusedText == true)?.focusedTarget
+                ? TextDelivery.frontmostApplication(
+                    policy: ContextCollectionPolicy(
+                        collectsDeliveryIdentity: true,
+                        collectsSelectedText: preferences.includeFocusedText == true,
+                        collectsWindowMetadata: false,
+                        collectsWebAndFileMetadata: preferences.includeWebAddresses == true,
+                        collectsRecipientMetadata: false,
+                        collectsVisibleText: preferences.includeFocusedText == true
+                    )
+                )?.focusedTarget
                 : nil
             let webAddress = preferences.includeWebAddresses == true ? accessibilityContext?.url : nil
             let observation = WorkspaceApplicationObservation(
