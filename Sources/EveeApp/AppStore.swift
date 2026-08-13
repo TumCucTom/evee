@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import EveeCore
 import Foundation
@@ -9,6 +10,20 @@ extension KeyboardShortcuts.Name {
     static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
     static let transformSelection = Self("transformSelection", default: .init(.space, modifiers: [.command, .option, .shift]))
     static let toggleHandsFree = Self("toggleHandsFree")
+}
+
+private enum CaptureTerminationCheckpointError: LocalizedError {
+    case invalidAudio(URL)
+    case missingTrack(AudioTrackRole)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidAudio(let url):
+            "The captured audio at \(url.lastPathComponent) is not playable. Evee kept the source file and stayed open."
+        case .missingTrack(let role):
+            "The \(role.rawValue) capture was written but could not be added to its recovery manifest."
+        }
+    }
 }
 
 @MainActor
@@ -131,6 +146,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var hotMicStateMachine = HotMicStateMachine()
     private var hotMicTranscriptTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
+    private var terminationCheckpointRecoveryID: UUID?
+    private var isApplicationTerminationCheckpointing = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
     private enum PushToTalkEvent: Sendable {
@@ -151,6 +168,43 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private var captureLifecycle: CaptureLifecycle = .idle
+
+    var captureShutdownPlan: CaptureShutdownPlan {
+        let snapshot: CaptureLifecycleSnapshot
+        if case .delivering = captureState {
+            snapshot = .delivering
+        } else {
+            snapshot = switch captureLifecycle {
+            case .idle:
+                if case .failed = captureState { .failed } else { .idle }
+            case .starting:
+                .starting(kind: activeKind, recoveryID: activeRecoveryID)
+            case .recording(let id):
+                .recording(kind: activeKind, recoveryID: activeRecoveryID ?? id)
+            case .finishing(let id):
+                .finishing(recoveryID: activeRecoveryID ?? id)
+            case .cancelling:
+                if let terminationCheckpointRecoveryID {
+                    .finishing(recoveryID: terminationCheckpointRecoveryID)
+                } else {
+                    .cancelling
+                }
+            }
+        }
+
+        let plan = CaptureShutdownPlan.make(for: snapshot)
+        guard plan == .terminateImmediately else { return plan }
+        let hasRunningApplicationService = localAPICredentials != nil ||
+            hotMicState != .disabled ||
+            webhookRetryTask != nil ||
+            !pendingWebhookTerminationRecords.isEmpty ||
+            records.contains { record in
+                record.webhookDeliveries.contains {
+                    $0.state != .delivered && $0.state != .cancelled
+                }
+            }
+        return hasRunningApplicationService ? .invalidateDeliveryAndAwaitCommit : .terminateImmediately
+    }
 
     init(
         modelDownloaderFactory: @escaping ModelDownloaderFactory = { try TranscriberFactory.make($0) },
@@ -1099,11 +1153,14 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func cleanUpCancelledStart(sessionID: UUID) async {
+        let preservesRecovery = terminationCheckpointRecoveryID == sessionID
         if recorder.isRecording, let stoppedURL = try? recorder.stop() {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
+        isSystemAudioActive = false
         if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
+        if preservesRecovery { return }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -1173,7 +1230,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         microphoneHealthTask?.cancel()
         microphoneHealthTask = nil
         microphoneHealthWarning = nil
-        if state == .idle, settings.hotMicEnabled {
+        if state == .idle, settings.hotMicEnabled, !isApplicationTerminationCheckpointing {
             Task { @MainActor [weak self] in await self?.updateHotMicState() }
         }
     }
@@ -1967,13 +2024,202 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
     }
 
+    func checkpointForTermination() async throws {
+        isApplicationTerminationCheckpointing = true
+        let plan = captureShutdownPlan
+        invalidateForApplicationTermination(plan: plan)
+
+        do {
+            await stopHotMic()
+            api.stop()
+            localAPICredentials = nil
+
+            if recorder.isRecording {
+                do {
+                    activeAudioURL = try recorder.stop()
+                } catch {
+                    guard activeAudioURL.map({ FileManager.default.fileExists(atPath: $0.path) }) == true else {
+                        throw error
+                    }
+                }
+            }
+            if isSystemAudioActive {
+                do {
+                    try await systemAudioRecorder.stop()
+                } catch {
+                    statusMessage = "System audio could not be finalised cleanly. Evee will checkpoint the microphone track and retain any system-audio prefix for recovery. \(error.localizedDescription)"
+                }
+                isSystemAudioActive = false
+            }
+            if activeKind == .meeting {
+                await stopLiveMeetingTranscription(discardPendingAudio: true)
+            }
+
+            switch plan {
+            case .cancelStartAndCheckpoint:
+                if let captureID = terminationCheckpointRecoveryID ?? activeRecoveryID {
+                    try await persistCaptureTerminationCheckpoint(captureID: captureID, kind: activeKind)
+                }
+            case .stopWritersAndCheckpoint(let kind, let recoveryID):
+                try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: kind)
+            case .awaitDurableCommitOrCheckpoint(let recoveryID):
+                try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: activeKind)
+            case .awaitCancellationCleanup:
+                removeActiveRecoveryFiles()
+                if activeKind == .meeting {
+                    try await library.saveMeetingDraft(nil)
+                }
+                resetSession(state: .idle)
+            case .terminateImmediately,
+                 .invalidateDeliveryAndAwaitCommit:
+                break
+            case .cancelTermination(let message):
+                throw ApplicationTerminationPlanError(message: message)
+            }
+
+            try await persistWebhookOutboxTerminationCancellation()
+            await refreshRecoverableCaptures()
+        } catch {
+            if let recoveryID = terminationCheckpointRecoveryID ?? activeRecoveryID {
+                try? await library.updateRecoveryCapture(
+                    id: recoveryID,
+                    status: .failed,
+                    failureReason: error.localizedDescription
+                )
+            }
+            captureState = .failed("Quit checkpoint failed: \(error.localizedDescription)")
+            statusMessage = "Quit was cancelled because Evee could not finish the recovery checkpoint. The app stayed open and retained any completed audio. Check available disk space and permissions, then quit again. \(error.localizedDescription)"
+            await refreshRecoverableCaptures()
+            throw error
+        }
+    }
+
     func checkpointForApplicationTermination() async throws {
-        invalidateWebhookOutboxForTermination()
-        try await persistWebhookOutboxTerminationCancellation()
+        try await checkpointForTermination()
     }
 
     func reportApplicationTerminationCheckpointFailure(_ error: Error) {
-        statusMessage = "Quit was cancelled because Evee could not durably cancel its webhook outbox. Check available disk space and file permissions, then quit again. \(error.localizedDescription)"
+        statusMessage = "Quit was cancelled while Evee protected the active capture. The app stayed open and retained completed audio and notes. Check available disk space and permissions, then quit again. \(error.localizedDescription)"
+    }
+
+    private func invalidateForApplicationTermination(plan: CaptureShutdownPlan) {
+        pushToTalkHeld = false
+        transformShortcutHeld = false
+        activeShortcut = nil
+        stopRequestedDuringStart = nil
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = nil
+        pendingDelivery = nil
+        invalidateWebhookOutboxForTermination()
+
+        switch plan {
+        case .cancelStartAndCheckpoint:
+            if case .starting(let sessionID) = captureLifecycle {
+                terminationCheckpointRecoveryID = activeRecoveryID ?? sessionID
+                captureLifecycle = .cancelling(sessionID)
+            }
+        case .stopWritersAndCheckpoint(_, let recoveryID),
+             .awaitDurableCommitOrCheckpoint(let recoveryID):
+            terminationCheckpointRecoveryID = recoveryID
+            captureLifecycle = .cancelling(recoveryID)
+        case .invalidateDeliveryAndAwaitCommit:
+            if case .finishing(let sessionID) = captureLifecycle {
+                captureLifecycle = .cancelling(sessionID)
+            }
+        case .terminateImmediately, .awaitCancellationCleanup, .cancelTermination:
+            break
+        }
+    }
+
+    private func persistCaptureTerminationCheckpoint(
+        captureID: UUID,
+        kind: WorkspaceRecordKind
+    ) async throws {
+        activeRecoveryID = captureID
+        activeRecoveryDirectory = await library.recoveryURL.appendingPathComponent(captureID.uuidString, isDirectory: true)
+        var manifest = try await library.beginRecoveryCapture(kind: kind, id: captureID)
+
+        if kind == .meeting {
+            meetingDraftCaptureID = captureID
+            try await library.saveMeetingDraft(MeetingDraft(
+                captureID: captureID,
+                title: meetingTitle,
+                notes: meetingNotes
+            ))
+        }
+
+        manifest = try await checkpointTrack(
+            role: .microphone,
+            sourceURL: activeAudioURL,
+            startedAt: microphoneTrackStartedAt,
+            captureID: captureID,
+            kind: kind,
+            manifest: manifest
+        )
+        do {
+            manifest = try await checkpointTrack(
+                role: .system,
+                sourceURL: activeSystemAudioURL,
+                startedAt: systemTrackStartedAt,
+                captureID: captureID,
+                kind: kind,
+                manifest: manifest
+            )
+        } catch {
+            statusMessage = "Evee checkpointed the microphone track, but the system-audio track is not playable. The original file was retained for recovery. \(error.localizedDescription)"
+        }
+        try await library.updateRecoveryCapture(id: captureID, status: .captured)
+    }
+
+    private func checkpointTrack(
+        role: AudioTrackRole,
+        sourceURL: URL?,
+        startedAt: Date?,
+        captureID: UUID,
+        kind: WorkspaceRecordKind,
+        manifest: CaptureRecoveryManifest
+    ) async throws -> CaptureRecoveryManifest {
+        if let existing = manifest.tracks.first(where: { $0.role == role }) {
+            do {
+                let existingURL = try await library.safeURL(forRelativePath: existing.relativePath)
+                try await validateCheckpointAudio(at: existingURL)
+                if role == .microphone { activeAudioURL = existingURL }
+                if role == .system { activeSystemAudioURL = existingURL }
+                return manifest
+            } catch {
+                guard sourceURL.map({ FileManager.default.fileExists(atPath: $0.path) }) == true else {
+                    throw error
+                }
+            }
+        }
+        guard let sourceURL, FileManager.default.fileExists(atPath: sourceURL.path) else { return manifest }
+        try await validateCheckpointAudio(at: sourceURL)
+        let updated = try await library.addRecoveryTrack(
+            captureID: captureID,
+            kind: kind,
+            role: role,
+            sourceURL: sourceURL,
+            startedAt: startedAt
+        )
+        guard let stored = updated.tracks.first(where: { $0.role == role }) else {
+            throw CaptureTerminationCheckpointError.missingTrack(role)
+        }
+        let storedURL = try await library.safeURL(forRelativePath: stored.relativePath)
+        if role == .microphone { activeAudioURL = storedURL }
+        if role == .system { activeSystemAudioURL = storedURL }
+        return updated
+    }
+
+    private func validateCheckpointAudio(at url: URL) async throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let byteCount = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard byteCount > 0 else { throw CaptureTerminationCheckpointError.invalidAudio(url) }
+        let asset = AVURLAsset(url: url)
+        let playable = try await asset.load(.isPlayable)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard playable, !tracks.isEmpty else {
+            throw CaptureTerminationCheckpointError.invalidAudio(url)
+        }
     }
 
     private func invalidateWebhookOutboxForTermination() {

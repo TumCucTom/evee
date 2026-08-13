@@ -278,6 +278,10 @@ public actor LibraryStore {
         try prepare()
         let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
         try createPrivateDirectory(directory)
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        if FileManager.default.fileExists(atPath: manifestURL.path) {
+            return try readRecoveryManifest(directory: directory)
+        }
         let manifest = CaptureRecoveryManifest(id: id, kind: kind)
         try writeRecoveryManifest(manifest, directory: directory)
         return manifest
@@ -299,31 +303,50 @@ public actor LibraryStore {
         let directory = recoveryURL.appendingPathComponent(captureID.uuidString, isDirectory: true)
         try createPrivateDirectory(directory)
         let destination = directory.appendingPathComponent("\(role.rawValue)-\(UUID().uuidString).\(sourceURL.pathExtension.isEmpty ? "audio" : sourceURL.pathExtension)")
-        if moveSource {
-            try FileManager.default.moveItem(at: sourceURL, to: destination)
-        } else {
+        do {
+            // Keep the recorder's source path intact until both the copied bytes
+            // and their manifest entry are durable. A normal write failure can
+            // therefore retry without reconstructing an already-stopped writer.
             try FileManager.default.copyItem(at: sourceURL, to: destination)
-        }
-        try makePrivate(destination)
+            try makePrivate(destination)
+            try synchronizeFile(at: destination)
 
-        var manifest = (try? readRecoveryManifest(directory: directory))
-            ?? CaptureRecoveryManifest(id: captureID, kind: kind)
-        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
-        let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
-        let relativePath = relativePath(for: destination)
-        manifest.tracks.removeAll { $0.role == role }
-        manifest.tracks.append(WorkspaceAudioTrack(
-            role: role,
-            relativePath: relativePath,
-            createdAt: startedAt ?? .now,
-            duration: duration,
-            byteCount: byteCount
-        ))
-        manifest.status = .captured
-        manifest.updatedAt = .now
-        manifest.failureReason = nil
-        try writeRecoveryManifest(manifest, directory: directory)
-        return manifest
+            var manifest = (try? readRecoveryManifest(directory: directory))
+                ?? CaptureRecoveryManifest(id: captureID, kind: kind)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+            let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
+            let relativePath = relativePath(for: destination)
+            manifest.tracks.removeAll { $0.role == role }
+            manifest.tracks.append(WorkspaceAudioTrack(
+                role: role,
+                relativePath: relativePath,
+                createdAt: startedAt ?? .now,
+                duration: duration,
+                byteCount: byteCount
+            ))
+            manifest.status = .captured
+            manifest.updatedAt = .now
+            manifest.failureReason = nil
+            try writeRecoveryManifest(manifest, directory: directory)
+            if moveSource {
+                do {
+                    try FileManager.default.removeItem(at: sourceURL)
+                } catch {
+                    // The manifest and copied track are already durable. Leaving
+                    // the recorder source as an orphan is safer than reporting a
+                    // retryable checkpoint failure that could duplicate tracks.
+                }
+            }
+            return manifest
+        } catch {
+            let durableManifestOwnsDestination = (try? readRecoveryManifest(directory: directory))?
+                .tracks
+                .contains(where: { $0.relativePath == relativePath(for: destination) }) == true
+            if !durableManifestOwnsDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
+            throw error
+        }
     }
 
     public func updateRecoveryCapture(id: UUID, status: CaptureRecoveryStatus, failureReason: String? = nil) throws {
@@ -602,6 +625,13 @@ public actor LibraryStore {
 
     private func makePrivate(_ url: URL) throws {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func synchronizeFile(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     private func preserveCorruptFile(_ url: URL) throws -> URL {

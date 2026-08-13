@@ -29,7 +29,7 @@ struct EveeApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 920, minHeight: 620)
                 .background(CaptureOverlayInstaller().environmentObject(store))
-                .onAppear { applicationDelegate.checkpoint = store }
+                .onAppear { applicationDelegate.install(checkpoint: store) }
                 .task {
                     WorkspaceIntelligenceRuntime.shared.start()
                     await store.bootstrap()
@@ -59,25 +59,35 @@ struct EveeApp: App {
 
 @MainActor
 private final class EveeApplicationDelegate: NSObject, NSApplicationDelegate {
-    weak var checkpoint: (any ApplicationTerminationCheckpoint)?
+    weak var checkpoint: (any CaptureCheckpointing)?
     private let termination = ApplicationTerminationCoordinator()
 
+    func install(checkpoint: any CaptureCheckpointing) {
+        guard self.checkpoint == nil else { return }
+        self.checkpoint = checkpoint
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let checkpoint else {
+        guard let checkpoint, let store = checkpoint as? AppStore else {
             presentFailure("Evee is still preparing its shutdown checkpoint. Wait a moment, then quit again.")
             return .terminateCancel
         }
-        _ = termination.requestTermination(
+        let decision = termination.requestTermination(
+            plan: store.captureShutdownPlan,
             checkpoint: checkpoint,
             reply: { shouldTerminate in
                 sender.reply(toApplicationShouldTerminate: shouldTerminate)
             },
-            reportFailure: { [weak self, weak checkpoint] error in
-                (checkpoint as? AppStore)?.reportApplicationTerminationCheckpointFailure(error)
-                self?.presentFailure("Evee could not save its webhook cancellation state. Check available disk space and file permissions, then quit again.\n\n\(error.localizedDescription)")
+            reportFailure: { [weak self] error in
+                store.reportApplicationTerminationCheckpointFailure(error)
+                self?.presentFailure("Evee could not finish its recovery checkpoint. The app stayed open and retained completed audio and notes. Check available disk space and permissions, then quit again.\n\n\(error.localizedDescription)")
             }
         )
-        return .terminateLater
+        switch decision {
+        case .terminateNow: return .terminateNow
+        case .terminateLater: return .terminateLater
+        case .terminateCancel: return .terminateCancel
+        }
     }
 
     private func presentFailure(_ message: String) {

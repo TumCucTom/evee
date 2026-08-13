@@ -26,7 +26,7 @@ private enum SyntheticMCPPersistenceError: Error {
 }
 
 @MainActor
-private final class SyntheticTerminationCheckpoint: ApplicationTerminationCheckpoint {
+private final class SyntheticTerminationCheckpoint: CaptureCheckpointing {
     private let operation: @MainActor () async throws -> Void
     private(set) var callCount = 0
 
@@ -34,7 +34,7 @@ private final class SyntheticTerminationCheckpoint: ApplicationTerminationCheckp
         self.operation = operation
     }
 
-    func checkpointForApplicationTermination() async throws {
+    func checkpointForTermination() async throws {
         callCount += 1
         try await operation()
     }
@@ -565,59 +565,68 @@ private func checkWebhookLegacyRows() async throws {
 
 @MainActor
 private func checkTerminationCheckpoint() async throws {
-    let gate = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
-    let successfulCheckpoint = SyntheticTerminationCheckpoint {
-        var iterator = gate.stream.makeAsyncIterator()
-        _ = await iterator.next()
+    let successfulCheckpoint = SyntheticTerminationCheckpoint {}
+    let coordinator = TerminationCheckpointCoordinator(checkpointer: successfulCheckpoint)
+    async let first: Void = coordinator.checkpoint()
+    async let repeated: Void = coordinator.checkpoint()
+    _ = try await (first, repeated)
+    try require(successfulCheckpoint.callCount == 1, "successful checkpoint ran more than once")
+
+    var shouldFail = true
+    let persistenceFailure = SyntheticTerminationCheckpoint {
+        if shouldFail { throw SyntheticWebhookPersistenceError.rejected }
+    }
+    let failedCoordinator = TerminationCheckpointCoordinator(checkpointer: persistenceFailure)
+    do {
+        try await failedCoordinator.checkpoint()
+        throw CoreCheckError.assertionFailed("failing persistence checkpoint succeeded")
+    } catch is SyntheticWebhookPersistenceError {}
+    do {
+        try await failedCoordinator.checkpoint()
+        throw CoreCheckError.assertionFailed("cached persistence failure succeeded")
+    } catch is SyntheticWebhookPersistenceError {}
+    try require(persistenceFailure.callCount == 1, "failing persistence checkpoint ran more than once")
+    shouldFail = false
+    try await failedCoordinator.retry()
+    try require(persistenceFailure.callCount == 2, "explicit retry did not start exactly one new checkpoint")
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("evee-termination-manifest-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    let capture = try await store.beginRecoveryCapture(kind: .meeting)
+    let microphone = root.appendingPathComponent("synthetic-microphone.caf")
+    try Data("synthetic audio".utf8).write(to: microphone)
+    _ = try await store.addRecoveryTrack(
+        captureID: capture.id,
+        kind: .meeting,
+        role: .microphone,
+        sourceURL: microphone
+    )
+    let repeatedCapture = try await store.beginRecoveryCapture(kind: .meeting, id: capture.id)
+    try require(repeatedCapture.tracks.map(\.role) == [.microphone], "repeated recovery begin erased a checkpointed track")
+    try require(repeatedCapture.status == .captured, "repeated recovery begin reset checkpoint status")
+
+    let delayedCheckpoint = SyntheticTerminationCheckpoint {
+        try await Task.sleep(for: .milliseconds(100))
     }
     let replies = LockedValues<Bool>()
-    let failures = LockedValues<String>()
-    let coordinator = ApplicationTerminationCoordinator()
-
-    let first = coordinator.requestTermination(
-        checkpoint: successfulCheckpoint,
-        reply: { value in replies.append(value) },
-        reportFailure: { error in failures.append(error.localizedDescription) }
+    let deadlineFailures = LockedValues<String>()
+    let applicationCoordinator = ApplicationTerminationCoordinator(deadline: .milliseconds(20))
+    let decision = applicationCoordinator.requestTermination(
+        plan: .stopWritersAndCheckpoint(kind: .meeting, recoveryID: capture.id),
+        checkpoint: delayedCheckpoint,
+        reply: { replies.append($0) },
+        reportFailure: { deadlineFailures.append($0.localizedDescription) }
     )
-    let repeated = coordinator.requestTermination(
-        checkpoint: successfulCheckpoint,
-        reply: { value in replies.append(value) },
-        reportFailure: { error in failures.append(error.localizedDescription) }
-    )
-    try require(first == .terminateLater && repeated == .terminateLater, "quit did not wait for the durable checkpoint")
-    await Task.yield()
-    try require(successfulCheckpoint.callCount == 1, "repeated quit started more than one checkpoint")
-    gate.continuation.yield(())
-    gate.continuation.finish()
-    let replyDeadline = Date().addingTimeInterval(1)
-    while replies.values.isEmpty, Date() < replyDeadline {
-        try await Task.sleep(for: .milliseconds(10))
+    try require(decision == .terminateLater, "active capture did not return terminate-later")
+    let deadline = Date().addingTimeInterval(1)
+    while replies.values.isEmpty, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(5))
     }
-    try await Task.sleep(for: .milliseconds(20))
-    try require(replies.values == [true], "successful persistence checkpoint did not reply exactly once")
-    try require(successfulCheckpoint.callCount == 1, "successful checkpoint ran more than once")
-    try require(failures.values.isEmpty, "successful checkpoint reported a failure")
-
-    let persistenceFailure = SyntheticTerminationCheckpoint {
-        throw SyntheticWebhookPersistenceError.rejected
-    }
-    let failedReplies = LockedValues<Bool>()
-    let reportedFailures = LockedValues<String>()
-    let failedCoordinator = ApplicationTerminationCoordinator()
-    let failedDecision = failedCoordinator.requestTermination(
-        checkpoint: persistenceFailure,
-        reply: { value in failedReplies.append(value) },
-        reportFailure: { error in reportedFailures.append(error.localizedDescription) }
-    )
-    try require(failedDecision == .terminateLater, "failing persistence checkpoint did not hold termination")
-    let failedReplyDeadline = Date().addingTimeInterval(1)
-    while failedReplies.values.isEmpty, Date() < failedReplyDeadline {
-        try await Task.sleep(for: .milliseconds(10))
-    }
-    try await Task.sleep(for: .milliseconds(20))
-    try require(failedReplies.values == [false], "persistence failure did not cancel termination exactly once")
-    try require(persistenceFailure.callCount == 1, "failing persistence checkpoint ran more than once")
-    try require(reportedFailures.values.count == 1, "persistence failure was not surfaced exactly once")
+    try require(replies.values == [false], "checkpoint deadline did not cancel termination exactly once")
+    try require(deadlineFailures.values.count == 1, "checkpoint deadline was not surfaced")
+    try await Task.sleep(for: .milliseconds(120))
+    try require(replies.values == [false], "late durability completion replied to AppKit twice")
 
     print("termination-checkpoint: passed")
 }
