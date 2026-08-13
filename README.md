@@ -82,9 +82,14 @@ configuring the `EVEE_CERTIFICATE_P12`, `EVEE_CERTIFICATE_PASSWORD`,
 
 Evee stores content under `~/Library/Application Support/Evee/`. Long-term
 audio retention, the local API, MCP registration and webhooks are opt-in.
-Downloaded models stay in FluidAudio's local cache. No hosted service,
-authentication system or analytics SDK is configured. Update checks occur only
-when the user presses the button in Settings and read public release metadata.
+Optional delivery context is collected only when its corresponding setting is
+enabled. Disabling the local API closes its active clients; disabling or
+changing a webhook terminally cancels outstanding delivery; and MCP
+registration can be removed, after which the helper rejects workspace reads
+until local helper access is enabled again. Downloaded models stay in
+FluidAudio's local cache. No hosted service, authentication system or analytics
+SDK is configured. Update checks occur only when the user presses the button in
+Settings and read public release metadata.
 
 ## Design
 

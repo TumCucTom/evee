@@ -71,6 +71,15 @@ account in both light and dark appearances.
 - [x] Usable authenticated loopback API with token rotation
 - [ ] Launch-at-login, diagnostics, signed distribution and updates
 
+### Local-integration privacy hardening
+
+Command Line Tools checks cover the following code-level guarantees: optional
+context is collected only when enabled; disabling the loopback API closes
+active clients; webhook cancellation is terminal for outstanding delivery; and
+managed MCP registrations are revocable, with disabled helper access rejected.
+These checks do not satisfy the packaged-app, clean-client, accessibility or
+physical-device release gates above.
+
 ## Required smoke journeys
 
 The release checklist records time to first significant issue. A significant

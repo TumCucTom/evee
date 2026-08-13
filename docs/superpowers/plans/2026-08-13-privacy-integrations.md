@@ -351,13 +351,21 @@ git commit -m "Add revocable local helper access"
 - Consumes: all Task 1–4 behavior.
 - Produces: accurate privacy/integration wording and checked plan steps backed by evidence.
 
-- [ ] **Step 1: Run the complete Command Line Tools-compatible checks**
+- [x] **Step 1: Run the complete Command Line Tools-compatible checks**
 
 Run: `swift run evee-core-checks`
 
 Expected: every named core check passes.
 
-- [ ] **Step 2: Run compiler and protocol validation**
+Result (2026-08-13): the no-argument invocation exits with usage because the
+runner requires `--filter`; every listed filter was then run on the exact
+workstream head and passed: `context-policy`, `public-record`, `api-revoke`,
+`api-rotate`, `api-limits`, `api-start-races`, `api-revoke-persistence`,
+`api-public-errors`, `mcp-public-output`, `mcp-revocation`,
+`webhook-generation`, `webhook-signature`, and `webhook-transactions`. See the
+Task 5 report for command output.
+
+- [x] **Step 2: Run compiler and protocol validation**
 
 Run: `swift build --target EveeCore && swift build --target EveeMCP`
 
@@ -367,7 +375,10 @@ Run: `bash scripts/smoke_mcp.sh`
 
 Expected: protocol smoke passes using isolated synthetic data.
 
-- [ ] **Step 3: Update wording and mark only evidenced plan steps**
+Result (2026-08-13): `EveeCore` and `EveeMCP` built successfully, and the
+script's isolated synthetic-data smoke passed all 11 advertised tools.
+
+- [x] **Step 3: Update wording and mark only evidenced plan steps**
 
 Document that optional content is collected only when enabled, API disable closes active clients, webhook cancellation is terminal, and helper registration is revocable. Do not claim complete packaged or physical validation yet.
 
@@ -379,7 +390,11 @@ Run the owner-held restricted-reference policy against the complete tree and pro
 
 Expected: no diff errors and no matches.
 
-- [ ] **Step 5: Commit**
+Controller pre-integration gate: the owner-held restricted-reference scan and
+proposed commit-metadata review remain outside this repository and are not
+checked here.
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md docs/PRODUCT_RELEASE_GATES.md docs/superpowers/plans/2026-08-13-privacy-integrations.md
