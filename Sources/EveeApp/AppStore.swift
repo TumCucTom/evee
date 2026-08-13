@@ -1340,17 +1340,34 @@ final class AppStore: ObservableObject {
         queued.webhookDeliveries.append(delivery)
         let transaction = await persistWebhookPreparation(preparation, records: [queued])
         switch transaction.decision {
-        case .commit:
-            guard transaction.preparation.didPersist(recordID: queued.id) else {
-                statusMessage = WebhookOutboxPersistenceBatchError(failures: transaction.preparation.failures).localizedDescription
-                return
-            }
-            replaceRecord(queued)
-            await deliverWebhook(
-                recordID: queued.id,
-                deliveryID: delivery.id,
-                requiringGeneration: preparation.generation
+        case .commit(let queuedRecords):
+            let installation = webhookOutboxTransactions.claimInstallation(
+                transaction.installationToken,
+                records: queuedRecords
             )
+            switch installation {
+            case .commit:
+                guard transaction.preparation.didPersist(recordID: queued.id) else {
+                    statusMessage = WebhookOutboxPersistenceBatchError(
+                        failures: transaction.preparation.failures
+                    ).localizedDescription
+                    return
+                }
+                replaceRecord(queued)
+                await deliverWebhook(
+                    recordID: queued.id,
+                    deliveryID: delivery.id,
+                    requiringGeneration: preparation.generation
+                )
+            case .cancel(let cancelledRecords):
+                replaceWebhookRecords(cancelledRecords)
+                let cancellation = await persistWebhookRecords(cancelledRecords)
+                if !cancellation.failures.isEmpty {
+                    statusMessage = WebhookOutboxPersistenceBatchError(
+                        failures: cancellation.failures
+                    ).localizedDescription
+                }
+            }
         case .cancel(let cancelledRecords):
             replaceWebhookRecords(cancelledRecords)
             if let cancellation = transaction.cancellation, !cancellation.failures.isEmpty {
@@ -1594,25 +1611,40 @@ final class AppStore: ObservableObject {
             let transaction = await persistWebhookPreparation(token, records: preparation.records)
             switch transaction.decision {
             case .commit(let preparedRecords):
-                let persistedRecords = preparedRecords.filter {
-                    transaction.preparation.didPersist(recordID: $0.id)
-                }
-                replaceWebhookRecords(persistedRecords)
-                let persistedIDs = Set(transaction.preparation.persistedRecordIDs)
-                let queued = preparation.deliveries.filter { persistedIDs.contains($0.recordID) }
-                for delivery in queued {
-                    await deliverWebhook(
-                        recordID: delivery.recordID,
-                        deliveryID: delivery.deliveryID,
-                        requiringGeneration: token.generation
-                    )
-                }
-                if queued.isEmpty && transaction.preparation.failures.isEmpty {
-                    statusMessage = "The webhook outbox is already clear."
-                } else if !transaction.preparation.failures.isEmpty {
-                    statusMessage = WebhookOutboxPersistenceBatchError(
-                        failures: transaction.preparation.failures
-                    ).localizedDescription
+                let installation = webhookOutboxTransactions.claimInstallation(
+                    transaction.installationToken,
+                    records: preparedRecords
+                )
+                switch installation {
+                case .commit(let installableRecords):
+                    let persistedRecords = installableRecords.filter {
+                        transaction.preparation.didPersist(recordID: $0.id)
+                    }
+                    replaceWebhookRecords(persistedRecords)
+                    let persistedIDs = Set(transaction.preparation.persistedRecordIDs)
+                    let queued = preparation.deliveries.filter { persistedIDs.contains($0.recordID) }
+                    for delivery in queued {
+                        await deliverWebhook(
+                            recordID: delivery.recordID,
+                            deliveryID: delivery.deliveryID,
+                            requiringGeneration: token.generation
+                        )
+                    }
+                    if queued.isEmpty && transaction.preparation.failures.isEmpty {
+                        statusMessage = "The webhook outbox is already clear."
+                    } else if !transaction.preparation.failures.isEmpty {
+                        statusMessage = WebhookOutboxPersistenceBatchError(
+                            failures: transaction.preparation.failures
+                        ).localizedDescription
+                    }
+                case .cancel(let cancelledRecords):
+                    replaceWebhookRecords(cancelledRecords)
+                    let cancellation = await persistWebhookRecords(cancelledRecords)
+                    if !cancellation.failures.isEmpty {
+                        statusMessage = WebhookOutboxPersistenceBatchError(
+                            failures: cancellation.failures
+                        ).localizedDescription
+                    }
                 }
             case .cancel(let cancelledRecords):
                 replaceWebhookRecords(cancelledRecords)

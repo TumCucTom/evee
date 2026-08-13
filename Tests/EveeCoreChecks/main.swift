@@ -348,6 +348,38 @@ private func checkWebhookTransactions() async throws {
     try require(storedQueueDelivery?.state == .cancelled, "queue race left a pending delivery")
     try require(storedQueueDelivery?.payloadBody == nil, "queue race retained payload bytes")
 
+    let queueInstallRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: queueInstallRoot) }
+    let queueInstallStore = LibraryStore(rootURL: queueInstallRoot)
+    let queueInstallTransactions = WebhookOutboxTransactions()
+    let queueInstallToken = queueInstallTransactions.beginPreparation()
+    let queueInstallTransaction = await queueInstallTransactions.persistPreparation(
+        queueInstallToken,
+        records: [queuedRecord]
+    ) { record in
+        try await queueInstallStore.upsert(record)
+    }
+    guard case .commit = queueInstallTransaction.decision else {
+        throw CoreCheckError.assertionFailed("current queue preparation did not commit")
+    }
+    _ = queueInstallTransactions.invalidate()
+    let queueInstallation = queueInstallTransactions.claimInstallation(
+        queueInstallTransaction.installationToken,
+        records: [queuedRecord]
+    )
+    guard case .cancel(let cancelledQueueInstallation) = queueInstallation else {
+        throw CoreCheckError.assertionFailed("invalidated queue installation was accepted")
+    }
+    _ = await queueInstallTransactions.persistAll(cancelledQueueInstallation) { record in
+        try await queueInstallStore.upsert(record)
+    }
+    let storedQueueInstallation = try await queueInstallStore.record(id: queuedRecord.id)
+    let storedQueueInstallationDelivery = storedQueueInstallation?.webhookDeliveries.first
+    try require(storedQueueInstallationDelivery?.state == .cancelled, "queue installation race left a pending delivery")
+    try require(storedQueueInstallationDelivery?.payloadBody == nil, "queue installation race retained payload bytes")
+    try require(storedQueueInstallationDelivery?.retryable == false, "queue installation race remained retryable")
+    try require(storedQueueInstallationDelivery?.nextAttemptAt == nil, "queue installation race retained retry timing")
+
     let retryRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: retryRoot) }
     let retryStore = LibraryStore(rootURL: retryRoot)
@@ -389,6 +421,43 @@ private func checkWebhookTransactions() async throws {
     let storedRetryDelivery = storedRetry?.webhookDeliveries.first(where: { $0.id == retryDeliveryID })
     try require(storedRetryDelivery?.state == .cancelled, "manual retry race revived a cancelled delivery")
     try require(storedRetryDelivery?.payloadBody == nil, "manual retry race retained payload bytes")
+
+    let retryInstallRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: retryInstallRoot) }
+    let retryInstallStore = LibraryStore(rootURL: retryInstallRoot)
+    try await retryInstallStore.upsert(failedRecord)
+    let retryInstallTransactions = WebhookOutboxTransactions()
+    let retryInstallToken = retryInstallTransactions.beginPreparation()
+    let retryInstallPreparation = retryInstallTransactions.prepareManualRetry(
+        records: [failedRecord],
+        destination: destination
+    )
+    let retryInstallTransaction = await retryInstallTransactions.persistPreparation(
+        retryInstallToken,
+        records: retryInstallPreparation.records
+    ) { record in
+        try await retryInstallStore.upsert(record)
+    }
+    guard case .commit = retryInstallTransaction.decision else {
+        throw CoreCheckError.assertionFailed("current manual retry preparation did not commit")
+    }
+    _ = retryInstallTransactions.invalidate()
+    let retryInstallation = retryInstallTransactions.claimInstallation(
+        retryInstallTransaction.installationToken,
+        records: retryInstallPreparation.records
+    )
+    guard case .cancel(let cancelledRetryInstallation) = retryInstallation else {
+        throw CoreCheckError.assertionFailed("invalidated manual retry installation was accepted")
+    }
+    _ = await retryInstallTransactions.persistAll(cancelledRetryInstallation) { record in
+        try await retryInstallStore.upsert(record)
+    }
+    let storedRetryInstallation = try await retryInstallStore.record(id: failedRecord.id)
+    let storedRetryInstallationDelivery = storedRetryInstallation?.webhookDeliveries.first
+    try require(storedRetryInstallationDelivery?.state == .cancelled, "manual retry installation race revived a pending delivery")
+    try require(storedRetryInstallationDelivery?.payloadBody == nil, "manual retry installation race retained payload bytes")
+    try require(storedRetryInstallationDelivery?.retryable == false, "manual retry installation race remained retryable")
+    try require(storedRetryInstallationDelivery?.nextAttemptAt == nil, "manual retry installation race retained retry timing")
 
     let partialTransactions = WebhookOutboxTransactions()
     let partialRecords = [

@@ -147,6 +147,97 @@ final class WebhookOutboxTests: XCTestCase {
         XCTAssertFalse(persistedDelivery.retryable)
     }
 
+    func testQueueCommitInvalidatedBeforeInstallationClaimBecomesTerminal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let transactions = WebhookOutboxTransactions()
+        var record = WorkspaceRecord(kind: .meeting, title: "Queue install race", text: "Synthetic")
+        record.webhookDeliveries = [WebhookDelivery(
+            destination: "https://example.invalid/webhook",
+            payloadBody: Data("{\"queued\":true}".utf8)
+        )]
+        let preparation = transactions.beginPreparation()
+        let transaction = await transactions.persistPreparation(
+            preparation,
+            records: [record]
+        ) { proposed in
+            try await store.upsert(proposed)
+        }
+        guard case .commit = transaction.decision else {
+            return XCTFail("Current queue preparation did not commit")
+        }
+
+        _ = transactions.invalidate()
+        let installation = transactions.claimInstallation(
+            transaction.installationToken,
+            records: [record]
+        )
+        guard case .cancel(let cancelled) = installation else {
+            return XCTFail("Invalidated queue installation was accepted")
+        }
+        _ = await transactions.persistAll(cancelled) { proposed in
+            try await store.upsert(proposed)
+        }
+
+        let loaded = try await store.record(id: record.id)
+        let stored = try XCTUnwrap(loaded)
+        let delivery = try XCTUnwrap(stored.webhookDeliveries.first)
+        XCTAssertEqual(delivery.state, .cancelled)
+        XCTAssertNil(delivery.payloadBody)
+        XCTAssertFalse(delivery.retryable)
+        XCTAssertNil(delivery.nextAttemptAt)
+    }
+
+    func testManualRetryCommitInvalidatedBeforeInstallationClaimBecomesTerminal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let transactions = WebhookOutboxTransactions()
+        let destination = "https://example.invalid/webhook"
+        var record = WorkspaceRecord(kind: .meeting, title: "Retry install race", text: "Synthetic")
+        record.webhookDeliveries = [WebhookDelivery(
+            destination: destination,
+            state: .failed,
+            attemptCount: 1,
+            payloadBody: Data("{\"retry\":true}".utf8),
+            retryable: true,
+            nextAttemptAt: .now
+        )]
+        try await store.upsert(record)
+        let preparation = transactions.beginPreparation()
+        let retry = transactions.prepareManualRetry(records: [record], destination: destination)
+        let transaction = await transactions.persistPreparation(
+            preparation,
+            records: retry.records
+        ) { proposed in
+            try await store.upsert(proposed)
+        }
+        guard case .commit = transaction.decision else {
+            return XCTFail("Current manual retry preparation did not commit")
+        }
+
+        _ = transactions.invalidate()
+        let installation = transactions.claimInstallation(
+            transaction.installationToken,
+            records: retry.records
+        )
+        guard case .cancel(let cancelled) = installation else {
+            return XCTFail("Invalidated manual retry installation was accepted")
+        }
+        _ = await transactions.persistAll(cancelled) { proposed in
+            try await store.upsert(proposed)
+        }
+
+        let loaded = try await store.record(id: record.id)
+        let stored = try XCTUnwrap(loaded)
+        let delivery = try XCTUnwrap(stored.webhookDeliveries.first)
+        XCTAssertEqual(delivery.state, .cancelled)
+        XCTAssertNil(delivery.payloadBody)
+        XCTAssertFalse(delivery.retryable)
+        XCTAssertNil(delivery.nextAttemptAt)
+    }
+
     func testBatchPersistenceAttemptsRecordsAfterFailure() async {
         let transactions = WebhookOutboxTransactions()
         let records = [

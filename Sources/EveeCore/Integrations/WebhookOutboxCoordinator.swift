@@ -10,6 +10,11 @@ public struct WebhookOutboxPreparationToken: Hashable, Sendable {
     public let identifier: UInt64
 }
 
+public struct WebhookOutboxInstallationToken: Hashable, Sendable {
+    public let generation: UInt64
+    public let identifier: UInt64
+}
+
 public struct WebhookDeliveryReference: Hashable, Sendable {
     public let recordID: UUID
     public let deliveryID: UUID
@@ -34,6 +39,7 @@ public struct WebhookOutboxPreparationPersistence: Sendable {
     public let decision: WebhookOutboxPreparationDecision
     public let preparation: WebhookOutboxPersistenceResult
     public let cancellation: WebhookOutboxPersistenceResult?
+    public let installationToken: WebhookOutboxInstallationToken?
 }
 
 public struct WebhookOutboxInvalidation: Equatable, Sendable {
@@ -75,8 +81,10 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
     private let lock = NSLock()
     private var integrationGeneration: UInt64 = 0
     private var preparationSequence: UInt64 = 0
+    private var installationSequence: UInt64 = 0
     private var dispatchSequence: UInt64 = 0
     private var preparations: Set<WebhookOutboxPreparationToken> = []
+    private var installations: Set<WebhookOutboxInstallationToken> = []
     private var activeDispatches: [UUID: WebhookDispatchToken] = [:]
     private var tasks: [UUID: Task<Void, Never>] = [:]
 
@@ -110,6 +118,20 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
         lock.lock()
         preparations.remove(token)
         lock.unlock()
+    }
+
+    public func claimInstallation(
+        _ token: WebhookOutboxInstallationToken?,
+        records: [WorkspaceRecord],
+        at date: Date = .now
+    ) -> WebhookOutboxPreparationDecision {
+        lock.lock()
+        let isCurrent = token.map {
+            $0.generation == integrationGeneration && installations.remove($0) != nil
+        } ?? false
+        lock.unlock()
+        if isCurrent { return .commit(records) }
+        return .cancel(terminallyCancelledRecords(records, at: date))
     }
 
     public func beginDispatch(
@@ -188,6 +210,7 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
             .sorted { $0.uuidString < $1.uuidString }
         let cancelledTasks = Array(tasks.values)
         preparations.removeAll(keepingCapacity: true)
+        installations.removeAll(keepingCapacity: true)
         activeDispatches.removeAll(keepingCapacity: true)
         tasks.removeAll(keepingCapacity: true)
         lock.unlock()
@@ -282,22 +305,48 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
         using persist: @escaping @Sendable (WorkspaceRecord) async throws -> Void
     ) async -> WebhookOutboxPreparationPersistence {
         let preparation = await persistAll(records, using: persist)
-        let decision = finalize(token, records: records)
+        let (decision, installationToken) = finalizeForInstallation(token, records: records)
         switch decision {
         case .commit:
             return WebhookOutboxPreparationPersistence(
                 decision: decision,
                 preparation: preparation,
-                cancellation: nil
+                cancellation: nil,
+                installationToken: installationToken
             )
         case .cancel(let cancelledRecords):
             let cancellation = await persistAll(cancelledRecords, using: persist)
             return WebhookOutboxPreparationPersistence(
                 decision: decision,
                 preparation: preparation,
-                cancellation: cancellation
+                cancellation: cancellation,
+                installationToken: nil
             )
         }
+    }
+
+    private func finalizeForInstallation(
+        _ token: WebhookOutboxPreparationToken,
+        records: [WorkspaceRecord],
+        at date: Date = .now
+    ) -> (WebhookOutboxPreparationDecision, WebhookOutboxInstallationToken?) {
+        lock.lock()
+        let isCurrent = token.generation == integrationGeneration && preparations.remove(token) != nil
+        let installationToken: WebhookOutboxInstallationToken?
+        if isCurrent {
+            installationSequence &+= 1
+            let created = WebhookOutboxInstallationToken(
+                generation: integrationGeneration,
+                identifier: installationSequence
+            )
+            installations.insert(created)
+            installationToken = created
+        } else {
+            installationToken = nil
+        }
+        lock.unlock()
+        if isCurrent { return (.commit(records), installationToken) }
+        return (.cancel(terminallyCancelledRecords(records, at: date)), nil)
     }
 }
 
