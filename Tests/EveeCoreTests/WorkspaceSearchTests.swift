@@ -36,6 +36,39 @@ final class WorkspaceSearchTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testFTSProjectionRefreshesAfterMeetingSpeakerRelabel() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let segmentID = UUID()
+        let original = WorkspaceRecord(
+            kind: .meeting,
+            title: "Planning",
+            text: "Participant 1: First statement",
+            segments: [TranscriptSegment(
+                id: segmentID,
+                start: 0,
+                end: 4,
+                speaker: "Participant 1",
+                text: "First statement",
+                attribution: .diarized
+            )]
+        )
+        try await store.upsert(original)
+
+        let changed = try MeetingRecordProjection().relabel(
+            record: original,
+            segmentID: segmentID,
+            label: "Facilitator"
+        )
+        try await store.upsert(changed)
+
+        let newLabelResults = try await store.search("Facilitator")
+        let oldLabelResults = try await store.search("Participant 1")
+        XCTAssertEqual(newLabelResults.map(\.id), [original.id])
+        XCTAssertTrue(oldLabelResults.isEmpty)
+    }
+
     func testIndexFileUsesOwnerOnlyPermissions() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = LibraryStore(rootURL: root)

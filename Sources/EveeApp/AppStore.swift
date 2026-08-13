@@ -2169,7 +2169,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     func update(_ record: WorkspaceRecord) async {
         do {
             var changed = record
-            changed.updatedAt = .now
+            let persisted = records.first(where: { $0.id == changed.id })
+            if persisted?.updatedAt == changed.updatedAt {
+                changed.updatedAt = .now
+            }
             try await library.upsert(changed)
             if let index = records.firstIndex(where: { $0.id == changed.id }) {
                 let previous = records[index]

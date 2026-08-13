@@ -555,6 +555,7 @@ public struct MeetingIntelligencePipeline: Sendable {
             let words = first.text.split(whereSeparator: \.isWhitespace).prefix(8).joined(separator: " ")
             let title = words.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
             return MeetingTopic(
+                id: first.id,
                 title: title.isEmpty ? "Discussion" : title,
                 start: first.start,
                 end: last.end,
@@ -579,6 +580,7 @@ public struct MeetingIntelligencePipeline: Sendable {
         ]
         guard !isQuestion(text), markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
+            id: segment.id,
             kind: .decision,
             text: text,
             sourceSegmentID: segment.id,
@@ -602,6 +604,7 @@ public struct MeetingIntelligencePipeline: Sendable {
               !negations.contains(where: lower.contains),
               markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
+            id: segment.id,
             kind: .actionItem,
             text: text,
             assignee: assignee(in: text, fallbackSpeaker: segment.speaker),

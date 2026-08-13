@@ -55,7 +55,6 @@ struct MeetingWorkspaceView: View {
                 Button("Stop and transcribe") { Task { await store.finishCapture() } }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
-                    .keyboardShortcut(.return, modifiers: [])
                     .accessibilityLabel("Stop and transcribe the current meeting")
             } else {
                 Button { Task { await store.beginMeeting() } } label: {
@@ -75,19 +74,22 @@ struct MeetingWorkspaceView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: store.isSystemAudioActive ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(store.isSystemAudioActive ? .green : .orange)
-                        .font(.system(size: 17, weight: .semibold))
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(store.isSystemAudioActive ? "Microphone and system audio are recording" : "Microphone-only recording")
-                            .font(.system(size: 13, weight: .semibold))
-                        Text(store.isSystemAudioActive
-                             ? "Evee is capturing microphone audio and all Mac system audio locally. Pause unrelated media and notifications; no participant or bot joins your call."
-                             : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: store.isSystemAudioActive ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(store.isSystemAudioActive ? .green : .orange)
+                            .font(.system(size: 17, weight: .semibold))
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(store.isSystemAudioActive ? "Microphone and system audio are recording" : "Microphone-only recording")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text(store.isSystemAudioActive
+                                 ? "Evee is capturing microphone audio and all Mac system audio locally. Pause unrelated media and notifications; no participant or bot joins your call."
+                                 : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                    .accessibilityElement(children: .combine)
                     Spacer()
                     if !store.isSystemAudioActive {
                         Button("Open Privacy Settings", action: openScreenRecordingSettings)
@@ -97,7 +99,6 @@ struct MeetingWorkspaceView: View {
                             .accessibilityHint("Opens System Settings so Evee can include other meeting participants in local capture.")
                     }
                 }
-                .accessibilityElement(children: .combine)
 
                 Divider()
 

@@ -1583,6 +1583,106 @@ private func checkPublicRecord() throws {
     print("public-record: passed")
 }
 
+private func checkMeetingRelabel() async throws {
+    let firstID = UUID()
+    let secondID = UUID()
+    let unrelatedID = UUID()
+    let original = WorkspaceRecord(
+        kind: .meeting,
+        createdAt: Date(timeIntervalSince1970: 100),
+        updatedAt: Date(timeIntervalSince1970: 100),
+        title: "Synthetic meeting",
+        text: "stale transcript",
+        rawText: "stale raw transcript",
+        segments: [
+            TranscriptSegment(
+                id: secondID,
+                start: 20,
+                end: 25,
+                speaker: "Participant 1",
+                text: "I will send the release notes.",
+                channel: .system,
+                attribution: .diarized
+            ),
+            TranscriptSegment(
+                id: unrelatedID,
+                start: 10,
+                end: 15,
+                speaker: "Participant 2",
+                text: "We decided to ship on Friday.",
+                channel: .system,
+                attribution: .diarized
+            ),
+            TranscriptSegment(
+                id: firstID,
+                start: 0,
+                end: 5,
+                speaker: "Participant 1",
+                text: "First statement",
+                channel: .system,
+                attribution: .diarized
+            ),
+        ]
+    )
+
+    let changed = try MeetingRecordProjection().relabel(
+        record: original,
+        segmentID: firstID,
+        label: " Facilitator "
+    )
+    try require(changed.segments.filter { $0.speaker == "Facilitator" }.count == 2, "diarized cluster relabel was partial")
+    try require(changed.segments.map(\.id) == [firstID, unrelatedID, secondID], "segments were not chronological after relabel")
+    try require(changed.text.contains("Facilitator: First statement"), "finished transcript retained the stale speaker")
+    try require(changed.rawText?.contains("Facilitator: First statement") == true, "raw transcript retained the stale speaker")
+    try require(
+        changed.meetingIntelligence == MeetingIntelligencePipeline().generate(from: changed.segments, generatedAt: changed.updatedAt),
+        "meeting intelligence was not regenerated from relabelled segments"
+    )
+    try require(original.text == "stale transcript", "relabel mutated the source record")
+    let markdown = String(decoding: try WorkspaceExporter.data(for: [changed], format: .markdown), as: UTF8.self)
+    try require(markdown.contains("Facilitator"), "markdown export retained the stale speaker")
+    let publicJSON = String(decoding: try JSONEncoder().encode(PublicWorkspaceRecord(changed)), as: UTF8.self)
+    try require(publicJSON.contains("Facilitator"), "API/helper public projection retained the stale speaker")
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-meeting-relabel-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    try await store.upsert(original)
+    try await store.upsert(changed)
+    let newLabelResults = try await store.search("Facilitator")
+    let oldLabelResults = try await store.search("Participant 1")
+    try require(newLabelResults.map(\.id) == [changed.id], "search omitted the new speaker label")
+    try require(oldLabelResults.isEmpty, "search retained the stale speaker label")
+
+    let cleared = try MeetingRecordProjection().relabel(record: original, segmentID: firstID, label: " \n ")
+    try require(cleared.segments.filter { $0.id == firstID || $0.id == secondID }.allSatisfy { $0.speaker == nil }, "whitespace label did not clear the diarized cluster")
+    do {
+        _ = try MeetingRecordProjection().relabel(record: original, segmentID: UUID(), label: "Facilitator")
+        throw CoreCheckError.assertionFailed("missing segment relabel succeeded")
+    } catch MeetingRecordProjectionError.segmentNotFound {
+        // Expected.
+    }
+    try require(original.segments.first(where: { $0.id == firstID })?.speaker == "Participant 1", "failed relabel mutated the source record")
+
+    let channelFirstID = UUID()
+    let channelSecondID = UUID()
+    let channelRecord = WorkspaceRecord(
+        kind: .meeting,
+        title: "Channel meeting",
+        text: "Other participant: First\nOther participant: Second",
+        segments: [
+            TranscriptSegment(id: channelFirstID, start: 0, end: 2, speaker: "Other participant", text: "First", channel: .system, attribution: .channel),
+            TranscriptSegment(id: channelSecondID, start: 3, end: 5, speaker: "Other participant", text: "Second", channel: .system, attribution: .channel),
+        ]
+    )
+    let channelChanged = try MeetingRecordProjection().relabel(record: channelRecord, segmentID: channelFirstID, label: "Guest")
+    try require(channelChanged.segments.first(where: { $0.id == channelFirstID })?.speaker == "Guest", "selected channel segment was not relabelled")
+    try require(channelChanged.segments.first(where: { $0.id == channelSecondID })?.speaker == "Other participant", "channel relabel changed an unrelated segment")
+
+    print("meeting-relabel: passed")
+}
+
 private func checkAPIRevocation() async throws {
     let (server, credentials, root, store) = try await makeSyntheticServer()
     defer {
@@ -3904,6 +4004,8 @@ if arguments == ["--filter", "accessibility-events"] {
     checkContextPolicy()
 } else if arguments == ["--filter", "public-record"] {
     try checkPublicRecord()
+} else if arguments == ["--filter", "meeting-relabel"] {
+    try await checkMeetingRelabel()
 } else if arguments == ["--filter", "api-revoke"] {
     try await checkAPIRevocation()
 } else if arguments == ["--filter", "api-rotate"] {
@@ -3959,6 +4061,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "corrupt-library-recovery"] {
     try await checkCorruptLibraryRecovery()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
     exit(EXIT_FAILURE)
 }

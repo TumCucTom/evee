@@ -87,19 +87,16 @@ struct RecordDetailView: View {
                 }
 
                 if !draft.segments.isEmpty {
-                    section("Speaker timeline", subtitle: "Participant numbers are anonymous local speaker clusters, not identified people") {
+                    section("Speaker timeline", subtitle: "Relabelling rebuilds the transcript and meeting overview from these timed segments; participant numbers are anonymous local speaker clusters") {
                         VStack(alignment: .leading, spacing: 12) {
-                            ForEach($draft.segments) { $segment in
+                            ForEach(draft.segments) { segment in
                                 HStack(alignment: .top, spacing: 10) {
                                     Text(timestamp(segment.start))
                                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                         .frame(width: 44, alignment: .leading)
                                     VStack(alignment: .leading, spacing: 3) {
-                                        TextField("Speaker label", text: Binding(
-                                            get: { segment.speaker ?? "" },
-                                            set: { segment.speaker = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-                                        ))
+                                        TextField("Speaker label", text: speakerLabelBinding(for: segment.id))
                                         .textFieldStyle(.plain)
                                         .font(.caption.weight(.semibold))
                                         .foregroundStyle(AnimaTheme.violet)
@@ -406,6 +403,20 @@ struct RecordDetailView: View {
     private func timestamp(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func speakerLabelBinding(for segmentID: UUID) -> Binding<String> {
+        Binding(
+            get: { draft.segments.first(where: { $0.id == segmentID })?.speaker ?? "" },
+            set: { label in
+                guard let changed = try? MeetingRecordProjection().relabel(
+                    record: draft,
+                    segmentID: segmentID,
+                    label: label
+                ) else { return }
+                draft = changed
+            }
+        )
     }
 
     private func selectInitialAudioTrack() {
