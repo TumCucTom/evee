@@ -52,10 +52,30 @@ public struct WorkspaceContext: Codable, Hashable, Sendable {
     }
 }
 
-public enum AudioTrackRole: String, Codable, CaseIterable, Sendable {
+public enum AudioTrackRole: String, Codable, CaseIterable, Hashable, Sendable {
     case microphone
     case system
     case mixed
+}
+
+public struct RecoveryTrackAssessment: Identifiable, Equatable, Sendable {
+    public let track: WorkspaceAudioTrack
+    public let isValid: Bool
+    public let failureReason: String?
+
+    public init(track: WorkspaceAudioTrack, isValid: Bool, failureReason: String? = nil) {
+        self.track = track
+        self.isValid = isValid
+        self.failureReason = failureReason
+    }
+
+    public var id: UUID { track.id }
+    public var role: AudioTrackRole { track.role }
+}
+
+public enum RecoveryTrackSelection: Equatable, Sendable {
+    case allValid
+    case roles(Set<AudioTrackRole>)
 }
 
 public struct WorkspaceAudioTrack: Identifiable, Codable, Hashable, Sendable {
@@ -133,6 +153,16 @@ public struct MeetingDraft: Codable, Equatable, Sendable {
         self.title = title
         self.notes = notes
         self.updatedAt = updatedAt
+    }
+}
+
+public struct RecoveredLibraryLoad<Value: Sendable>: Sendable {
+    public let value: Value
+    public let preservedCorruptURL: URL?
+
+    public init(value: Value, preservedCorruptURL: URL? = nil) {
+        self.value = value
+        self.preservedCorruptURL = preservedCorruptURL
     }
 }
 

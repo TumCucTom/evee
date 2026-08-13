@@ -68,6 +68,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var localAPICredentials: LocalAPICredentials?
     @Published private(set) var pendingDelivery: PendingTextDelivery?
     @Published private(set) var recoverableCaptures: [CaptureRecoveryManifest] = []
+    @Published private(set) var recoveryTrackAssessments: [UUID: [RecoveryTrackAssessment]] = [:]
+    @Published private(set) var libraryRecoveryWarning: String?
+    private var preservedCorruptURLs: [URL] = []
     @Published private(set) var captureKind: WorkspaceRecordKind?
     @Published private(set) var captureOperation: WorkspaceRecordOperation?
     @Published private(set) var isSystemAudioActive = false
@@ -132,6 +135,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var activeSystemAudioURL: URL?
     private var activeRecoveryID: UUID?
     private var activeRecoveryDirectory: URL?
+    private var activeRecoveryTrackSelection: RecoveryTrackSelection?
     private var activeApplication: FrontmostApplication?
     private var activeKind: WorkspaceRecordKind = .dictation
     private var activeOperation: WorkspaceRecordOperation = .capture
@@ -408,53 +412,72 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         didBootstrap = true
         do {
             try await library.prepare()
-            settings = try await library.loadSettings()
-            let helperStorageRoot = await library.rootURL
-            do {
-                let recovery = try await MCPOwnedRegistration.recover(
-                    allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
-                    storageRootURL: helperStorageRoot,
-                    settings: settings,
-                    saveSettings: { [library] settings in try await library.save(settings) }
-                )
-                settings = try await library.loadSettings()
-                if !recovery.cleanupFailures.isEmpty {
-                    statusMessage = recovery.authorizationDisabled
-                        ? "Local helper access is disabled. An unfinished client registration needs manual cleanup."
-                        : "Local helper access remains enabled because the setting could not be saved. Registration recovery needs manual cleanup."
-                }
-            } catch {
-                let recoveryError = error
-                var disabled = settings
-                disabled.mcpEnabled = false
+            var preservedCorruptURLs: [URL] = []
+            let settingsLoad = try await library.loadSettingsRecoveringCorruption()
+            settings = settingsLoad.value
+            if let preserved = settingsLoad.preservedCorruptURL { preservedCorruptURLs.append(preserved) }
+            let settingsWereRecovered = settingsLoad.preservedCorruptURL != nil
+            if !settingsWereRecovered {
+                let helperStorageRoot = await library.rootURL
                 do {
-                    try await library.save(disabled)
-                    settings = disabled
-                    statusMessage = "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                    let recovery = try await MCPOwnedRegistration.recover(
+                        allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+                        storageRootURL: helperStorageRoot,
+                        settings: settings,
+                        saveSettings: { [library] settings in try await library.save(settings) }
+                    )
+                    settings = try await library.loadSettings()
+                    if !recovery.cleanupFailures.isEmpty {
+                        statusMessage = recovery.authorizationDisabled
+                            ? "Local helper access is disabled. An unfinished client registration needs manual cleanup."
+                            : "Local helper access remains enabled because the setting could not be saved. Registration recovery needs manual cleanup."
+                    }
                 } catch {
-                    settings = (try? await library.loadSettings()) ?? settings
-                    statusMessage = settings.mcpEnabled
-                        ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"
-                        : "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                    let recoveryError = error
+                    var disabled = settings
+                    disabled.mcpEnabled = false
+                    do {
+                        try await library.save(disabled)
+                        settings = disabled
+                        statusMessage = "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                    } catch {
+                        settings = (try? await library.loadSettings()) ?? settings
+                        statusMessage = settings.mcpEnabled
+                            ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"
+                            : "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                    }
                 }
             }
             configuredWebhookDestination = normalizedWebhookDestination(settings.webhookURL)
             try await loadAndMigrateSecrets()
-            if settings.historyRetentionDays > 0 {
-                let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
-                _ = try await library.purgeRecords(olderThan: cutoff)
+            let recordsLoad = try await library.loadRecordsRecoveringCorruption()
+            records = recordsLoad.value.sorted { $0.createdAt > $1.createdAt }
+            if let preserved = recordsLoad.preservedCorruptURL { preservedCorruptURLs.append(preserved) }
+            let recordsWereRecovered = recordsLoad.preservedCorruptURL != nil
+            if !recordsWereRecovered {
+                if settings.historyRetentionDays > 0 {
+                    let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
+                    _ = try await library.purgeRecords(olderThan: cutoff)
+                    records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
+                }
+                await retireUnsupportedWebhookPayloads()
+                try await library.reconcileAudioStorage()
             }
-            records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
-            await retireUnsupportedWebhookPayloads()
-            try await library.reconcileAudioStorage()
-            if let draft = try await library.loadMeetingDraft() {
+            let draftLoad = try await library.loadMeetingDraftRecoveringCorruption()
+            if let preserved = draftLoad.preservedCorruptURL { preservedCorruptURLs.append(preserved) }
+            if let draft = draftLoad.value {
                 suppressDraftAutosave = true
                 meetingDraftCaptureID = draft.captureID
                 meetingTitle = draft.title
                 meetingNotes = draft.notes
                 suppressDraftAutosave = false
             }
-            recoverableCaptures = try await library.recoverableCaptures()
+            await refreshRecoverableCaptures()
+            if !preservedCorruptURLs.isEmpty {
+                let paths = Array(Set(preservedCorruptURLs.map(\.path))).sorted()
+                self.preservedCorruptURLs = paths.map { URL(fileURLWithPath: $0) }
+                libraryRecoveryWarning = "Evee preserved unreadable local data and continued with safe defaults. Review these private copies before deleting them:\n\(paths.joined(separator: "\n"))"
+            }
             let selectedTranscriber = try TranscriberFactory.make(settings.model)
             transcriber = selectedTranscriber
             reconcileModelDownloadCache(selectedTranscriber, model: settings.model)
@@ -1132,11 +1155,12 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     ) async throws {
         guard captureLifecycle == .finishing(sessionID) else { return }
         let duration = captureStartedAt.map { Date.now.timeIntervalSince($0) }
-        let keepAudio = switch activeKind {
-        case .dictation: settings.retainDictationAudio
-        case .meeting: settings.retainMeetingAudio
-        case .memo: settings.retainMemoAudio
-        }
+        let configuredRetention = switch activeKind {
+            case .dictation: settings.retainDictationAudio
+            case .meeting: settings.retainMeetingAudio
+            case .memo: settings.retainMemoAudio
+            }
+        let keepAudio = activeRecoveryTrackSelection != nil || configuredRetention
         let recordKind = activeKind
         let memoIntelligence = activeKind == .memo ? MemoIntelligencePipeline().generate(from: polished) : nil
         let title: String = switch activeKind {
@@ -1159,13 +1183,23 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             context: persistedActiveContext()
         )
         if activeKind == .meeting { record.segments = segments }
+        if case .roles(let roles) = activeRecoveryTrackSelection,
+           roles == [.system] {
+            record.tags.append("Recovered from system audio")
+        }
 
         guard terminationWorkGate.beginWork() else { return }
         recordCommitSequence &+= 1
         let commitID = recordCommitSequence
         let recoveryID = activeRecoveryID
+        let recoveryTrackSelection = activeRecoveryTrackSelection
         let commitTask = Task { [library] in
-            try await library.commitRecoveredRecord(record, recoveryID: recoveryID, keepAudio: keepAudio)
+            try await library.commitRecoveredRecord(
+                record,
+                recoveryID: recoveryID,
+                trackSelection: recoveryTrackSelection,
+                keepAudio: keepAudio
+            )
         }
         recordCommitOperation = RecordCommitOperation(id: commitID, recoveryID: recoveryID, task: commitTask)
         do {
@@ -1370,6 +1404,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         activeSystemAudioURL = nil
         activeRecoveryID = nil
         activeRecoveryDirectory = nil
+        activeRecoveryTrackSelection = nil
         activeApplication = nil
         activeOperation = .capture
         activeSelectedText = nil
@@ -1393,7 +1428,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         !meetingNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    func recover(_ capture: CaptureRecoveryManifest) async {
+    func recover(
+        _ capture: CaptureRecoveryManifest,
+        trackSelection: RecoveryTrackSelection = .allValid
+    ) async {
         guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else {
             statusMessage = "Recovery is protected while Evee finishes the quit checkpoint. Wait for it to finish, then retry."
             return
@@ -1402,8 +1440,38 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             statusMessage = "These notes belong to a different interrupted meeting. Recover or discard that meeting first."
             return
         }
-        guard let microphoneTrack = capture.tracks.first(where: { $0.role == .microphone }) else {
-            statusMessage = "This recovery does not contain a microphone recording. You can discard it if the source audio is no longer available."
+        let assessments: [RecoveryTrackAssessment]
+        do {
+            assessments = try await library.assessRecoveryTracks(captureID: capture.id)
+        } catch {
+            statusMessage = error.localizedDescription
+            return
+        }
+        let selectedRoles: Set<AudioTrackRole> = switch trackSelection {
+        case .allValid:
+            Set(assessments.filter(\.isValid).map(\.role))
+        case .roles(let roles):
+            roles
+        }
+        guard !selectedRoles.isEmpty else {
+            statusMessage = "This recovery has no playable audio tracks. You can discard it after reviewing the track details."
+            return
+        }
+        for role in selectedRoles {
+            guard let assessment = assessments.first(where: { $0.role == role }), assessment.isValid else {
+                statusMessage = assessments.first(where: { $0.role == role })?.failureReason
+                    ?? "The selected \(role.rawValue) recovery track is unavailable."
+                return
+            }
+        }
+        if capture.kind != .meeting, selectedRoles != [.microphone] {
+            statusMessage = "System-audio-only recovery is available for meetings. Dictations and memos require a valid microphone track."
+            return
+        }
+        let microphoneTrack = capture.tracks.first(where: { $0.role == .microphone && selectedRoles.contains(.microphone) })
+        let systemTrack = capture.tracks.first(where: { $0.role == .system && selectedRoles.contains(.system) })
+        guard microphoneTrack != nil || systemTrack != nil else {
+            statusMessage = "The selected recovery audio is unavailable."
             return
         }
         guard terminationWorkGate.beginWork() else {
@@ -1417,6 +1485,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         activeSelectedText = nil
         captureKind = capture.kind
         activeRecoveryID = sessionID
+        activeRecoveryTrackSelection = .roles(selectedRoles)
         captureStartedAt = capture.startedAt
         captureLifecycle = .finishing(sessionID)
         captureState = .transcribing
@@ -1424,32 +1493,53 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             activeRecoveryDirectory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
             try? await library.updateRecoveryCapture(id: sessionID, status: .processing)
 
-            let microphoneURL = try await library.safeURL(forRelativePath: microphoneTrack.relativePath)
-            activeAudioURL = microphoneURL
-            if let systemTrack = capture.tracks.first(where: { $0.role == .system }) {
-                activeSystemAudioURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)
+            let microphoneURL: URL?
+            if let microphoneTrack {
+                microphoneURL = try await library.safeURL(forRelativePath: microphoneTrack.relativePath)
+            } else {
+                microphoneURL = nil
             }
+            let systemURL: URL?
+            if let systemTrack {
+                systemURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)
+            } else {
+                systemURL = nil
+            }
+            activeAudioURL = microphoneURL
+            activeSystemAudioURL = systemURL
 
             let engine = try transcriber ?? recoveryTranscriberFactory(settings.model)
             transcriber = engine
-            let microphoneTranscript = try await engine.transcribeDetailed(fileURL: microphoneURL, languageCode: settings.languageCode)
+            let microphoneTranscript: LocalTranscript?
+            if let microphoneURL {
+                microphoneTranscript = try await engine.transcribeDetailed(fileURL: microphoneURL, languageCode: settings.languageCode)
+            } else {
+                microphoneTranscript = nil
+            }
             guard captureLifecycle == .finishing(sessionID) else { return }
 
-            var raw = microphoneTranscript.text
-            var segments: [TranscriptSegment] = capture.kind == .meeting
-                ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil)
-                : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
+            var raw = microphoneTranscript?.text ?? ""
+            var segments: [TranscriptSegment]
+            if let microphoneTranscript {
+                segments = capture.kind == .meeting
+                    ? MeetingTranscriptAssembler().assemble(microphone: microphoneTranscript, system: nil)
+                    : [TranscriptSegment(start: 0, end: microphoneTranscript.duration, text: microphoneTranscript.text)]
+            } else {
+                segments = []
+            }
             if capture.kind == .meeting,
-               let systemURL = activeSystemAudioURL,
+               let systemURL,
                FileManager.default.fileExists(atPath: systemURL.path) {
                 do {
                     let systemTranscript = try await engine.transcribeDetailed(fileURL: systemURL, languageCode: settings.languageCode)
                     guard captureLifecycle == .finishing(sessionID) else { return }
                     let speakerIntervals = await speakerIntervalsIfAvailable(for: systemURL)
-                    let microphoneOffset = recoveryOffset(for: microphoneTrack, in: capture)
-                    let systemOffset = capture.tracks.first(where: { $0.role == .system }).map { recoveryOffset(for: $0, in: capture) } ?? 0
+                    let microphoneOffset = microphoneTrack.map { recoveryOffset(for: $0, in: capture) } ?? 0
+                    let systemOffset = systemTrack.map { recoveryOffset(for: $0, in: capture) } ?? 0
+                    let microphoneForAssembly = microphoneTranscript
+                        ?? LocalTranscript(text: "", duration: 0, segments: [])
                     segments = MeetingTranscriptAssembler().assemble(
-                        microphone: microphoneTranscript,
+                        microphone: microphoneForAssembly,
                         system: systemTranscript,
                         systemSpeakerIntervals: speakerIntervals,
                         microphoneOffset: microphoneOffset,
@@ -1459,6 +1549,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
+                    guard microphoneTranscript != nil else { throw error }
                     guard canCommitMicrophoneFallback(after: error) else { throw error }
                     statusMessage = systemTrackFallbackMessage(error)
                 }
@@ -1473,6 +1564,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             )
             let intelligence = capture.kind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
             try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments, meetingIntelligence: intelligence)
+            if selectedRoles == [.system] {
+                statusMessage = "Meeting recovered from system audio. The transcript is labelled as other-participant audio."
+            }
         } catch {
             guard captureLifecycle == .finishing(sessionID) else { return }
             try? await library.updateRecoveryCapture(id: sessionID, status: .failed, failureReason: error.localizedDescription)
@@ -1529,10 +1623,47 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     private func refreshRecoverableCaptures() async {
         do {
-            recoverableCaptures = try await library.recoverableCaptures()
+            let captures = try await library.recoverableCaptures()
+            var assessments: [UUID: [RecoveryTrackAssessment]] = [:]
+            for capture in captures {
+                assessments[capture.id] = try await library.assessRecoveryTracks(captureID: capture.id)
+            }
+            recoverableCaptures = captures
+            recoveryTrackAssessments = assessments
         } catch {
             statusMessage = "Recovery recordings could not be loaded: \(error.localizedDescription)"
         }
+    }
+
+    func recoveryAssessments(for capture: CaptureRecoveryManifest) -> [RecoveryTrackAssessment] {
+        recoveryTrackAssessments[capture.id] ?? capture.tracks.map {
+            RecoveryTrackAssessment(track: $0, isValid: false, failureReason: "Checking audio…")
+        }
+    }
+
+    var meetingRecoveryWarning: String? {
+        for capture in recoverableCaptures where capture.kind == .meeting {
+            guard meetingDraftCaptureID == nil || meetingDraftCaptureID == capture.id else { continue }
+            let assessments = recoveryAssessments(for: capture)
+            let microphoneValid = assessments.contains { $0.role == .microphone && $0.isValid }
+            let systemValid = assessments.contains { $0.role == .system && $0.isValid }
+            if systemValid, !microphoneValid {
+                return "Only the system-audio track is playable. Recovering it will create an other-participant transcript and preserve that audio, regardless of your normal retention setting."
+            }
+            if !systemValid, !microphoneValid, !assessments.isEmpty {
+                return "This interrupted meeting has no playable tracks. Review each track below, then discard the capture if the originals are no longer useful."
+            }
+        }
+        return nil
+    }
+
+    func dismissLibraryRecoveryWarning() {
+        libraryRecoveryWarning = nil
+    }
+
+    func revealPreservedLibraryFiles() {
+        guard !preservedCorruptURLs.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(preservedCorruptURLs)
     }
 
     private func startLiveMeetingTranscription() async {
@@ -2089,6 +2220,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
            case .emptyResult = transcriptionError {
             return true
         }
+        if activeRecoveryTrackSelection != nil { return true }
         // When retention is disabled, committing a partial record would purge
         // the failed system track. Keep the recovery capture instead so the
         // user can retry or explicitly discard the original audio.

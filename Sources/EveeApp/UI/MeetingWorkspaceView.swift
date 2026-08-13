@@ -17,6 +17,18 @@ struct MeetingWorkspaceView: View {
                 processingCard
             } else {
                 VStack(spacing: 0) {
+                    if let warning = store.meetingRecoveryWarning {
+                        Label(warning, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(AnimaTheme.raisedSurface)
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 12)
+                            .accessibilityLabel("Meeting recovery warning: \(warning)")
+                    }
                     if store.hasMeetingDraft { restoredDraftCard }
                     LibraryView(title: "Past meetings", kind: .meeting, showsHeader: false)
                 }

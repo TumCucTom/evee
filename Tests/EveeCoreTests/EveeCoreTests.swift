@@ -112,9 +112,9 @@ final class EveeCoreTests: XCTestCase {
         let input = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
         let microphone = input.appendingPathComponent("microphone.caf")
-        let system = input.appendingPathComponent("system.m4a")
-        try Data("microphone".utf8).write(to: microphone)
-        try Data("system".utf8).write(to: system)
+        let system = input.appendingPathComponent("system.wav")
+        try coreTestsSilentWAV().write(to: microphone)
+        try coreTestsSilentWAV().write(to: system)
 
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .meeting)
@@ -136,7 +136,7 @@ final class EveeCoreTests: XCTestCase {
     func testRecoveryTrackPreservesCaptureClock() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
-        try Data("audio".utf8).write(to: input)
+        try coreTestsSilentWAV().write(to: input)
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .meeting)
         let trackStart = capture.startedAt.addingTimeInterval(0.75)
@@ -532,4 +532,21 @@ final class EveeCoreTests: XCTestCase {
             insertedText: "world"
         ))
     }
+}
+
+private func coreTestsSilentWAV() -> Data {
+    let sampleRate: UInt32 = 8_000
+    let sampleCount: UInt32 = 800
+    let dataSize = sampleCount * 2
+    var data = Data()
+    func append(_ text: String) { data.append(contentsOf: text.utf8) }
+    func append<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    append("RIFF"); append(UInt32(36) + dataSize); append("WAVE")
+    append("fmt "); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+    append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
+    append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
+    return data
 }

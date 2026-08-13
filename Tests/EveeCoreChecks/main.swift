@@ -751,7 +751,7 @@ private func checkTerminationCheckpoint() async throws {
     let commitStore = LibraryStore(rootURL: commitStoreRoot)
     let commitRecovery = try await commitStore.beginRecoveryCapture(kind: .memo)
     let commitSource = root.appendingPathComponent("synthetic-commit.caf")
-    try Data("synthetic commit audio".utf8).write(to: commitSource)
+    try coreCheckSilentWAV().write(to: commitSource)
     _ = try await commitStore.addRecoveryTrack(
         captureID: commitRecovery.id,
         kind: .memo,
@@ -3170,6 +3170,252 @@ private func checkMCPLegacyRegistrations() async throws {
     print("mcp-legacy: passed")
 }
 
+private func checkRecoveryTracks() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-recovery-track-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    let input = root.appendingPathComponent("Input", isDirectory: true)
+    try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+    let microphone = input.appendingPathComponent("microphone.wav")
+    let system = input.appendingPathComponent("system.wav")
+    try coreCheckSilentWAV().write(to: microphone)
+    try Data("invalid system audio".utf8).write(to: system)
+    let capture = try await store.beginRecoveryCapture(kind: .meeting)
+    _ = try await store.addRecoveryTrack(captureID: capture.id, kind: .meeting, role: .microphone, sourceURL: microphone)
+    _ = try await store.addRecoveryTrack(captureID: capture.id, kind: .meeting, role: .system, sourceURL: system)
+
+    let assessments = try await store.assessRecoveryTracks(captureID: capture.id)
+    try require(assessments.first(where: { $0.role == .microphone })?.isValid == true, "valid microphone was rejected")
+    try require(assessments.first(where: { $0.role == .system })?.isValid == false, "invalid system track was accepted")
+
+    let proposed = WorkspaceRecord(kind: .meeting, title: "Recovered", text: "Transcript")
+    do {
+        _ = try await store.commitRecoveredRecord(
+            proposed,
+            recoveryID: capture.id,
+            trackSelection: .roles([.system]),
+            keepAudio: true
+        )
+        throw CoreCheckError.assertionFailed("explicit invalid role selection committed")
+    } catch LibraryStoreError.invalidRecoveryTrack(.system, _) {
+        // Expected: the valid microphone original remains recoverable.
+    }
+    do {
+        _ = try await store.commitRecoveredRecord(
+            proposed,
+            recoveryID: capture.id,
+            trackSelection: .roles([]),
+            keepAudio: true
+        )
+        throw CoreCheckError.assertionFailed("empty recovery selection committed")
+    } catch LibraryStoreError.emptyRecoverySelection {
+        // Expected.
+    }
+    let saved = try await store.commitRecoveredRecord(
+        proposed,
+        recoveryID: capture.id,
+        trackSelection: .roles([.microphone]),
+        keepAudio: true
+    )
+    try require(saved.audioTracks.map(\.role) == [.microphone], "explicit role selection retained the wrong tracks")
+    let savedRecords = try await store.loadRecords()
+    let remainingRecoveries = try await store.recoverableCaptures()
+    try require(savedRecords.map(\.id) == [saved.id], "recovery created a missing or duplicate canonical record")
+    try require(remainingRecoveries.isEmpty, "committed recovery originals were not removed")
+
+    let systemOnlyRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-system-only-track-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: systemOnlyRoot) }
+    let systemOnlyStore = LibraryStore(rootURL: systemOnlyRoot)
+    let systemOnlyInput = systemOnlyRoot.appendingPathComponent("system.wav")
+    try FileManager.default.createDirectory(at: systemOnlyRoot, withIntermediateDirectories: true)
+    try coreCheckSilentWAV().write(to: systemOnlyInput)
+    let systemOnlyCapture = try await systemOnlyStore.beginRecoveryCapture(kind: .meeting)
+    _ = try await systemOnlyStore.addRecoveryTrack(
+        captureID: systemOnlyCapture.id,
+        kind: .meeting,
+        role: .system,
+        sourceURL: systemOnlyInput
+    )
+    let systemOnlyAssessments = try await systemOnlyStore.assessRecoveryTracks(captureID: systemOnlyCapture.id)
+    try require(systemOnlyAssessments.map(\.role) == [.system] && systemOnlyAssessments.allSatisfy { $0.isValid }, "system-only recovery was not valid")
+    let systemOnlyRecord = try await systemOnlyStore.commitRecoveredRecord(
+        WorkspaceRecord(kind: .meeting, title: "System only", text: "Recovered"),
+        recoveryID: systemOnlyCapture.id,
+        trackSelection: .allValid,
+        keepAudio: true
+    )
+    try require(systemOnlyRecord.audioTracks.map(\.role) == [.system], "system-only recovery retained the wrong role")
+
+    let atomicRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-atomic-recovery-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: atomicRoot) }
+    let seedStore = LibraryStore(rootURL: atomicRoot)
+    let recordID = UUID()
+    let oldDirectory = atomicRoot.appendingPathComponent("Audio/Records/\(recordID.uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
+    let oldAudio = oldDirectory.appendingPathComponent("existing.wav")
+    try coreCheckSilentWAV().write(to: oldAudio)
+    let existing = WorkspaceRecord(
+        id: recordID,
+        kind: .meeting,
+        title: "Existing",
+        text: "Canonical",
+        audioTracks: [WorkspaceAudioTrack(role: .microphone, relativePath: "Audio/Records/\(recordID.uuidString)/existing.wav")]
+    )
+    try await seedStore.upsert(existing)
+    let persistedExisting = try await seedStore.record(id: recordID)
+    let atomicInput = atomicRoot.appendingPathComponent("Input", isDirectory: true)
+    try FileManager.default.createDirectory(at: atomicInput, withIntermediateDirectories: true)
+    let atomicMicrophone = atomicInput.appendingPathComponent("microphone.wav")
+    let atomicSystem = atomicInput.appendingPathComponent("system.wav")
+    try coreCheckSilentWAV().write(to: atomicMicrophone)
+    try coreCheckSilentWAV().write(to: atomicSystem)
+    let atomicCapture = try await seedStore.beginRecoveryCapture(kind: .meeting)
+    _ = try await seedStore.addRecoveryTrack(captureID: atomicCapture.id, kind: .meeting, role: .microphone, sourceURL: atomicMicrophone)
+    let withBoth = try await seedStore.addRecoveryTrack(captureID: atomicCapture.id, kind: .meeting, role: .system, sourceURL: atomicSystem)
+    var originalURLs: [URL] = []
+    for track in withBoth.tracks {
+        originalURLs.append(try await seedStore.safeURL(forRelativePath: track.relativePath))
+    }
+    let failingStore = LibraryStore(rootURL: atomicRoot, failNextWritesAt: [.recordMetadata])
+    let replacement = WorkspaceRecord(id: recordID, kind: .meeting, title: "Recovered", text: "New")
+    do {
+        _ = try await failingStore.commitRecoveredRecord(
+            replacement,
+            recoveryID: atomicCapture.id,
+            trackSelection: .allValid,
+            keepAudio: true
+        )
+        throw CoreCheckError.assertionFailed("metadata failure unexpectedly committed recovery")
+    } catch CoreCheckError.assertionFailed(let message) {
+        throw CoreCheckError.assertionFailed(message)
+    } catch {
+        // Expected synthetic metadata write failure.
+    }
+    let unchanged = try await failingStore.record(id: recordID)
+    let filesAfterFailure = try FileManager.default.contentsOfDirectory(at: oldDirectory, includingPropertiesForKeys: nil)
+    try require(unchanged == persistedExisting, "metadata failure changed the canonical record")
+    try require(filesAfterFailure.map(\.lastPathComponent) == ["existing.wav"], "metadata failure left new owned copies")
+    try require(originalURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "metadata failure removed recovery originals")
+    let retried = try await failingStore.commitRecoveredRecord(
+        replacement,
+        recoveryID: atomicCapture.id,
+        trackSelection: .allValid,
+        keepAudio: true
+    )
+    let filesAfterRetry = try FileManager.default.contentsOfDirectory(at: oldDirectory, includingPropertiesForKeys: nil)
+    let recordsAfterRetry = try await failingStore.loadRecords()
+    try require(retried.audioTracks.count == 2 && filesAfterRetry.count == 2, "retry left duplicate or missing canonical audio")
+    try require(recordsAfterRetry.filter { $0.id == recordID }.count == 1, "retry duplicated canonical metadata")
+    try require(!FileManager.default.fileExists(atPath: oldAudio.path), "retry retained superseded canonical audio")
+
+    let discardRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-discard-recovery-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: discardRoot) }
+    let discardStore = LibraryStore(rootURL: discardRoot)
+    let discardInput = discardRoot.appendingPathComponent("microphone.wav")
+    try FileManager.default.createDirectory(at: discardRoot, withIntermediateDirectories: true)
+    try coreCheckSilentWAV().write(to: discardInput)
+    let discardCapture = try await discardStore.beginRecoveryCapture(kind: .memo)
+    _ = try await discardStore.addRecoveryTrack(captureID: discardCapture.id, kind: .memo, role: .microphone, sourceURL: discardInput)
+    try await discardStore.discardRecoveryCapture(id: discardCapture.id)
+    let discardedRecoveries = try await discardStore.recoverableCaptures()
+    try require(discardedRecoveries.isEmpty, "explicit discard left recovery artifacts")
+    print("recovery-tracks: passed")
+}
+
+private func checkCorruptLibraryRecovery() async throws {
+    let filenames = ["records.json", "settings.json", "meeting-draft.json"]
+    for filename in filenames {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-corrupt-library-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        try await store.prepare()
+        let source = root.appendingPathComponent(filename)
+        let bytes = Data("{".utf8)
+        try bytes.write(to: source)
+        let preserved: URL?
+        switch filename {
+        case "records.json":
+            let result = try await store.loadRecordsRecoveringCorruption()
+            try require(result.value.isEmpty, "corrupt records did not return an empty library")
+            preserved = result.preservedCorruptURL
+        case "settings.json":
+            let result = try await store.loadSettingsRecoveringCorruption()
+            try require(result.value == EveeSettings(), "corrupt settings did not return privacy-safe defaults")
+            preserved = result.preservedCorruptURL
+        default:
+            let result = try await store.loadMeetingDraftRecoveringCorruption()
+            try require(result.value == nil, "corrupt meeting draft did not return nil")
+            preserved = result.preservedCorruptURL
+        }
+        guard let preserved else { throw CoreCheckError.assertionFailed("\(filename) was not preserved") }
+        try require(!FileManager.default.fileExists(atPath: source.path), "\(filename) still blocked startup after preservation")
+        let preservedBytes = try Data(contentsOf: preserved)
+        try require(preservedBytes == bytes, "\(filename) preserved different bytes")
+        let permissions = try FileManager.default.attributesOfItem(atPath: preserved.path)[.posixPermissions] as? NSNumber
+        try require((permissions?.intValue ?? 0) & 0o777 == 0o600, "\(filename) preserved with non-private permissions")
+    }
+
+    let failureRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-corrupt-preservation-failure-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: failureRoot) }
+    let failureStore = LibraryStore(rootURL: failureRoot)
+    try await failureStore.prepare()
+    let failureSource = failureRoot.appendingPathComponent("records.json")
+    let failureBytes = Data("{".utf8)
+    try failureBytes.write(to: failureSource)
+    try Data("not a directory".utf8).write(to: failureRoot.appendingPathComponent("Corrupt"))
+    do {
+        _ = try await failureStore.loadRecordsRecoveringCorruption()
+        throw CoreCheckError.assertionFailed("preservation failure returned a fallback")
+    } catch CoreCheckError.assertionFailed(let message) {
+        throw CoreCheckError.assertionFailed(message)
+    } catch {
+        // Expected: canonical source must remain authoritative.
+    }
+    let remainingFailureBytes = try Data(contentsOf: failureSource)
+    try require(remainingFailureBytes == failureBytes, "preservation failure changed the canonical source")
+
+    let futureRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-future-schema-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: futureRoot) }
+    let futureStore = LibraryStore(rootURL: futureRoot)
+    try await futureStore.prepare()
+    let futureSource = futureRoot.appendingPathComponent("records.json")
+    let futureBytes = Data("{\"schemaVersion\":999,\"updatedAt\":\"2026-08-13T12:00:00Z\",\"records\":[]}".utf8)
+    try futureBytes.write(to: futureSource)
+    do {
+        _ = try await futureStore.loadRecordsRecoveringCorruption()
+        throw CoreCheckError.assertionFailed("future schema was treated as corruption")
+    } catch LibraryStoreError.unsupportedSchema(found: 999, supported: LibraryStore.currentSchemaVersion) {
+        // Expected hard error.
+    }
+    let remainingFutureBytes = try Data(contentsOf: futureSource)
+    try require(remainingFutureBytes == futureBytes, "future schema source was moved or changed")
+    print("corrupt-library-recovery: passed")
+}
+
+private func coreCheckSilentWAV() -> Data {
+    let sampleRate: UInt32 = 8_000
+    let sampleCount: UInt32 = 800
+    let dataSize = sampleCount * 2
+    var data = Data()
+    func append(_ text: String) { data.append(contentsOf: text.utf8) }
+    func append<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    append("RIFF"); append(UInt32(36) + dataSize); append("WAVE")
+    append("fmt "); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+    append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
+    append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
+    return data
+}
+
 let arguments = CommandLine.arguments.dropFirst()
 if arguments == ["--filter", "context-policy"] {
     checkContextPolicy()
@@ -3217,7 +3463,11 @@ if arguments == ["--filter", "context-policy"] {
     try await checkAudioRelay()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
+} else if arguments == ["--filter", "recovery-tracks"] {
+    try await checkRecoveryTracks()
+} else if arguments == ["--filter", "corrupt-library-recovery"] {
+    try await checkCorruptLibraryRecovery()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
     exit(EXIT_FAILURE)
 }

@@ -143,6 +143,9 @@ struct RecordDetailView: View {
             if !retainedAudioTracks.isEmpty {
                 Label("Audio retained", systemImage: "internaldrive")
             }
+            if draft.tags.contains("Recovered from system audio") {
+                Label("Recovered from system audio", systemImage: "speaker.wave.2")
+            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

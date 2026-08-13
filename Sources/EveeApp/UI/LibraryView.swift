@@ -63,32 +63,73 @@ struct LibraryView: View {
                         .foregroundStyle(.secondary)
 
                     ForEach(recoveryRows) { capture in
-                        HStack(spacing: 10) {
-                            Image(systemName: capture.kind == .meeting ? "person.2.wave.2" : capture.kind == .memo ? "waveform" : "text.cursor")
-                                .frame(width: 24)
-                                .foregroundStyle(AnimaTheme.violet)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Interrupted \(capture.kind.rawValue)")
-                                    .font(.system(size: 12, weight: .semibold))
-                                Text("\(capture.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(capture.tracks.count) audio \(capture.tracks.count == 1 ? "track" : "tracks")")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 9) {
+                            HStack(spacing: 10) {
+                                Image(systemName: capture.kind == .meeting ? "person.2.wave.2" : capture.kind == .memo ? "waveform" : "text.cursor")
+                                    .frame(width: 24)
+                                    .foregroundStyle(AnimaTheme.violet)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Interrupted \(capture.kind.rawValue)")
+                                        .font(.system(size: 12, weight: .semibold))
+                                    Text(capture.startedAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
                             }
-                            Spacer()
-                            Button("Discard", role: .destructive) {
-                                Task { await store.discardRecovery(capture) }
+
+                            ForEach(store.recoveryAssessments(for: capture)) { assessment in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: assessment.isValid ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundStyle(assessment.isValid ? Color.green : Color.orange)
+                                        .frame(width: 16)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(recoveryTrackTitle(assessment.role))
+                                            .font(.caption.weight(.semibold))
+                                        Text(assessment.isValid ? "Playable and ready to recover" : assessment.failureReason ?? "This track is not playable")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                .accessibilityElement(children: .combine)
                             }
-                            .controlSize(.small)
-                            .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
-                            Button("Transcribe") {
-                                Task { await store.recover(capture) }
+
+                            HStack(spacing: 7) {
+                                Button("Discard", role: .destructive) {
+                                    Task { await store.discardRecovery(capture) }
+                                }
+                                .controlSize(.small)
+
+                                Spacer()
+
+                                Button("Recover all valid") {
+                                    Task { await store.recover(capture, trackSelection: .allValid) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(!canRecoverAll(capture))
+
+                                if capture.tracks.contains(where: { $0.role == .microphone }) {
+                                    Button("Microphone") {
+                                        Task { await store.recover(capture, trackSelection: .roles([.microphone])) }
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(!isValid(.microphone, in: capture))
+                                }
+
+                                if capture.tracks.contains(where: { $0.role == .system }) {
+                                    Button("System") {
+                                        Task { await store.recover(capture, trackSelection: .roles([.system])) }
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(capture.kind != .meeting || !isValid(.system, in: capture))
+                                }
                             }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
                             .disabled(
                                 store.captureState != .idle
                                     || store.isTerminationCheckpointActive
-                                    || !capture.tracks.contains(where: { $0.role == .microphone })
                             )
                         }
                         .accessibilityElement(children: .contain)
@@ -163,6 +204,24 @@ struct LibraryView: View {
     private var isRecordingMemo: Bool {
         guard store.captureKind == .memo, case .recording = store.captureState else { return false }
         return true
+    }
+
+    private func isValid(_ role: AudioTrackRole, in capture: CaptureRecoveryManifest) -> Bool {
+        store.recoveryAssessments(for: capture).contains { $0.role == role && $0.isValid }
+    }
+
+    private func canRecoverAll(_ capture: CaptureRecoveryManifest) -> Bool {
+        let validRoles = Set(store.recoveryAssessments(for: capture).filter(\.isValid).map(\.role))
+        guard !validRoles.isEmpty else { return false }
+        return capture.kind == .meeting || validRoles.contains(.microphone)
+    }
+
+    private func recoveryTrackTitle(_ role: AudioTrackRole) -> String {
+        switch role {
+        case .microphone: "Microphone track"
+        case .system: "System-audio track"
+        case .mixed: "Mixed track"
+        }
     }
 }
 

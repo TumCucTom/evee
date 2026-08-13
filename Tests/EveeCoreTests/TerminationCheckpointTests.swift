@@ -56,7 +56,7 @@ final class TerminationCheckpointTests: XCTestCase {
         let store = LibraryStore(rootURL: root)
         let recovery = try await store.beginRecoveryCapture(kind: .memo)
         let source = root.appendingPathComponent("synthetic.caf")
-        try Data("synthetic audio".utf8).write(to: source)
+        try terminationSilentWAV().write(to: source)
         _ = try await store.addRecoveryTrack(
             captureID: recovery.id,
             kind: .memo,
@@ -176,6 +176,23 @@ final class TerminationCheckpointTests: XCTestCase {
             .awaitDurableCommitOrCheckpoint(recoveryID: recoveryID)
         )
     }
+}
+
+private func terminationSilentWAV() -> Data {
+    let sampleRate: UInt32 = 8_000
+    let sampleCount: UInt32 = 800
+    let dataSize = sampleCount * 2
+    var data = Data()
+    func append(_ text: String) { data.append(contentsOf: text.utf8) }
+    func append<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    append("RIFF"); append(UInt32(36) + dataSize); append("WAVE")
+    append("fmt "); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+    append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
+    append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
+    return data
 }
 
 @MainActor

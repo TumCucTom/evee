@@ -23,6 +23,27 @@ struct RootView: View {
 
         }
         .tint(AnimaTheme.indigo)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let warning = store.libraryRecoveryWarning {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "externaldrive.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text(warning)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 12)
+                    Button("Show in Finder") { store.revealPreservedLibraryFiles() }
+                        .controlSize(.small)
+                    Button("Dismiss") { store.dismissLibraryRecoveryWarning() }
+                        .controlSize(.small)
+                }
+                .padding(10)
+                .background(AnimaTheme.raisedSurface)
+                .overlay(alignment: .bottom) { Divider() }
+                .accessibilityElement(children: .contain)
+            }
+        }
         .alert(alertTitle, isPresented: Binding(
             get: { store.statusMessage != nil },
             set: {

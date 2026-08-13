@@ -56,7 +56,7 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         let library = LibraryStore(rootURL: root)
         let capture = try! await library.beginRecoveryCapture(kind: .memo)
         let source = root.appendingPathComponent("synthetic.caf")
-        try! Data("synthetic".utf8).write(to: source)
+        try! syntheticSilentWAV().write(to: source)
         let manifest = try! await library.addRecoveryTrack(
             captureID: capture.id,
             kind: .memo,
@@ -86,6 +86,72 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         XCTAssertTrue(try! await library.recoverableCaptures().contains(where: { $0.id == manifest.id }))
         await recovery.value
         XCTAssertTrue(store.isTerminationCheckpointActive)
+    }
+
+    func testSystemOnlyMeetingRecoveryRetainsAudioAndSystemChannelWhenRetentionIsOff() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-system-only-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let capture = try await library.beginRecoveryCapture(kind: .meeting)
+        let source = root.appendingPathComponent("system.wav")
+        try syntheticSilentWAV().write(to: source)
+        let manifest = try await library.addRecoveryTrack(
+            captureID: capture.id,
+            kind: .meeting,
+            role: .system,
+            sourceURL: source
+        )
+        let store = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            recoveryTranscriberFactory: { _ in ImmediateRecoveryTranscriber(text: "A system-only recovery") }
+        )
+        XCTAssertFalse(store.settings.retainMeetingAudio)
+
+        await store.recover(manifest, trackSelection: .roles([.system]))
+
+        let recoveredRecords = try await library.loadRecords()
+        let record = try XCTUnwrap(recoveredRecords.first)
+        XCTAssertEqual(record.audioTracks.map(\.role), [.system])
+        XCTAssertFalse(record.segments.isEmpty)
+        XCTAssertTrue(record.segments.allSatisfy { $0.channel == .system })
+        XCTAssertTrue(record.tags.contains("Recovered from system audio"))
+        for track in record.audioTracks {
+            let retainedURL = try await library.safeURL(forRelativePath: track.relativePath)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: retainedURL.path))
+        }
+        let remainingRecoveries = try await library.recoverableCaptures()
+        XCTAssertFalse(remainingRecoveries.contains(where: { $0.id == capture.id }))
+    }
+
+    func testSystemOnlyMemoRecoveryIsRejectedWithoutDiscardingOriginal() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-invalid-system-recovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let capture = try await library.beginRecoveryCapture(kind: .memo)
+        let source = root.appendingPathComponent("system.wav")
+        try syntheticSilentWAV().write(to: source)
+        let manifest = try await library.addRecoveryTrack(
+            captureID: capture.id,
+            kind: .memo,
+            role: .system,
+            sourceURL: source
+        )
+        let store = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            recoveryTranscriberFactory: { _ in ImmediateRecoveryTranscriber(text: "Must not run") }
+        )
+
+        await store.recover(manifest, trackSelection: .roles([.system]))
+
+        let records = try await library.loadRecords()
+        let recoveries = try await library.recoverableCaptures()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertTrue(recoveries.contains(where: { $0.id == capture.id }))
+        XCTAssertTrue(store.statusMessage?.localizedCaseInsensitiveContains("meeting") == true)
     }
 
     func testDeadlineCancelsTerminationAndLateCheckpointCannotReplyAgain() async {
@@ -322,6 +388,24 @@ private final class SuspendedRecoveryTranscriber: LocalTranscriber, @unchecked S
     @MainActor func fail() {
         continuation?.resume(throwing: SyntheticApplicationTerminationError.persistenceFailed)
         continuation = nil
+    }
+}
+
+private final class ImmediateRecoveryTranscriber: LocalTranscriber, @unchecked Sendable {
+    let model = SpeechModel.parakeet
+    var isDownloaded: Bool { true }
+    private let text: String
+    init(text: String) { self.text = text }
+    func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {}
+    func load() async throws {}
+    func unload() {}
+    func transcribe(fileURL: URL, languageCode: String?) async throws -> String { text }
+    func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
+        LocalTranscript(
+            text: text,
+            duration: 0.1,
+            segments: [LocalTranscriptSegment(start: 0, end: 0.1, text: text, timingSource: .trackEstimate)]
+        )
     }
 }
 
