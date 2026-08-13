@@ -48,11 +48,17 @@ struct EveeApp: App {
     }
 
     private var menuIcon: String {
-        switch store.captureState {
-        case .starting: "waveform.circle"
+        if !store.systemVoiceStatus.warnings.isEmpty {
+            return "exclamationmark.waveform"
+        }
+        return switch store.systemVoiceStatus.phase {
+        case .wakeListening, .wakeStopping: "mic.circle.fill"
+        case .captureStarting, .wakeStarting: "waveform.circle"
         case .recording: "waveform.circle.fill"
-        case .transcribing, .delivering: "ellipsis.circle"
-        default: "waveform.circle"
+        case .processing, .delivering: "ellipsis.circle"
+        case .protected: "checkmark.shield.fill"
+        case .failed: "exclamationmark.triangle"
+        case .ready: "waveform.circle"
         }
     }
 }
@@ -120,91 +126,30 @@ private final class CaptureOverlayController {
 
     private weak var store: AppStore?
     private var observation: AnyCancellable?
-    private var statusObservation: AnyCancellable?
     private var panel: CaptureHUDPanel?
-    private var announcedState: CaptureAnnouncementState?
 
     func install(store: AppStore) {
         guard self.store !== store else { return }
         self.store = store
-        observation = store.$captureState
-            .receive(on: RunLoop.main)
-            .sink { [weak self] state in self?.render(state) }
-        statusObservation = store.$statusMessage
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        observation = store.$systemVoiceStatus
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { message in
-                NSAccessibility.post(
-                    element: NSApplication.shared,
-                    notification: .announcementRequested,
-                    userInfo: [
-                        .announcement: message,
-                        .priority: NSAccessibilityPriorityLevel.high.rawValue
-                    ]
-                )
-            }
+            .sink { [weak self] status in self?.render(status) }
     }
 
-    private func render(_ state: CaptureState) {
-        announceStateChange(state)
-        guard state != .idle, let store else {
+    private func render(_ status: SystemVoiceStatus) {
+        guard status.phase != .ready else {
             panel?.orderOut(nil)
             return
         }
 
-        let content = RecordingPill(
-            state: state,
-            operation: store.captureOperation,
-            onStop: { [weak store] in Task { @MainActor in await store?.finishCapture() } },
-            onCancel: { [weak store] in Task { @MainActor in await store?.cancelCapture() } }
-        )
+        let content = RecordingPill(status: status)
 
         let panel = panel ?? makePanel()
         panel.contentView = NSHostingView(rootView: content)
         panel.setContentSize(NSSize(width: 410, height: 54))
         position(panel)
         panel.orderFrontRegardless()
-    }
-
-    private func announceStateChange(_ state: CaptureState) {
-        let announcement = CaptureAnnouncementState(
-            state,
-            isSelectionTransform: store?.captureOperation == .selectionTransform
-        )
-        guard announcement != announcedState else { return }
-        let previous = announcedState
-        announcedState = announcement
-
-        let message: String?
-        switch state {
-        case .idle:
-            message = previous == nil ? nil : "Evee is ready."
-        case .starting:
-            message = "Evee is preparing audio capture."
-        case .recording:
-            message = "Evee is recording."
-        case .transcribing:
-            message = "Evee is transcribing locally."
-        case .delivering:
-            message = store?.captureOperation == .selectionTransform
-                ? "Evee is verifying and replacing the selected text."
-                : "Evee is verifying and inserting the finished text."
-        case .checkpointed(let detail):
-            message = "Evee protected the capture for recovery. \(detail)"
-        case .failed(let detail):
-            message = "Evee capture failed. \(detail)"
-        }
-        guard let message else { return }
-        NSAccessibility.post(
-            element: NSApplication.shared,
-            notification: .announcementRequested,
-            userInfo: [
-                .announcement: message,
-                .priority: NSAccessibilityPriorityLevel.high.rawValue
-            ]
-        )
     }
 
     private func makePanel() -> CaptureHUDPanel {
@@ -235,22 +180,6 @@ private final class CaptureOverlayController {
             y: visibleFrame.maxY - panel.frame.height - 10
         )
         panel.setFrameOrigin(origin)
-    }
-}
-
-private enum CaptureAnnouncementState: Equatable {
-    case idle, starting, recording, transcribing, delivering, deliveringSelection, checkpointed(String), failed(String)
-
-    init(_ state: CaptureState, isSelectionTransform: Bool) {
-        switch state {
-        case .idle: self = .idle
-        case .starting: self = .starting
-        case .recording: self = .recording
-        case .transcribing: self = .transcribing
-        case .delivering: self = isSelectionTransform ? .deliveringSelection : .delivering
-        case .checkpointed(let detail): self = .checkpointed(detail)
-        case .failed(let detail): self = .failed(detail)
-        }
     }
 }
 

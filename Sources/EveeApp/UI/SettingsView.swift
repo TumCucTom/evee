@@ -22,6 +22,7 @@ struct SettingsView: View {
             Section("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
+                KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
                 KeyboardShortcuts.Recorder("Transform selection:", name: .transformSelection)
                 Picker("Local model", selection: $store.settings.model) {
                     ForEach(SpeechModel.allCases, id: \.self) { model in

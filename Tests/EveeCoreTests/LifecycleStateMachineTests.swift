@@ -37,6 +37,17 @@ final class LifecycleStateMachineTests: XCTestCase {
         XCTAssertTrue(hotMic.isDisabled)
     }
 
+    func testHotMicPublishesStoppingUntilCleanupCompletes() throws {
+        var hotMic = HotMicStateMachine()
+        let start = try XCTUnwrap(hotMic.beginStart())
+
+        XCTAssertTrue(hotMic.didStart(start))
+        XCTAssertTrue(hotMic.beginStop())
+        XCTAssertEqual(hotMic.state, .stopping)
+        XCTAssertTrue(hotMic.completeStop())
+        XCTAssertEqual(hotMic.state, .disabled)
+    }
+
     func testShutdownPlanMapsLifecycleSnapshots() {
         let recoveryID = UUID()
 

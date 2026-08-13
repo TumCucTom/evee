@@ -11,11 +11,19 @@ struct MenuBarView: View {
                 EveeMark(size: 24)
                 Text("Evee").font(.headline)
                 Spacer()
-                Label(status, systemImage: statusIcon)
+                Label(store.systemVoiceStatus.menuTitle, systemImage: statusIcon)
                     .font(.caption)
                     .foregroundStyle(statusColour)
             }
             Divider()
+
+            ForEach(Array(store.systemVoiceStatus.warnings.enumerated()), id: \.offset) { _, warning in
+                Label(warning.message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .accessibilityLabel("Capture warning: \(warning.message)")
+            }
 
             switch store.captureState {
             case .starting:
@@ -23,20 +31,26 @@ struct MenuBarView: View {
                     ProgressView().controlSize(.small)
                     Text("Preparing \(captureName)…").font(.caption)
                 }
-                Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
-                    .accessibilityLabel("Cancel preparation for \(captureName)")
+                if store.systemVoiceStatus.availableActions.contains(.discard) {
+                    Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                        .accessibilityLabel("Discard preparation for \(captureName)")
+                }
             case .recording:
                 Text("Recording \(captureName)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
-                        .accessibilityLabel("Discard \(captureName)")
-                        .accessibilityHint("Stops recording and permanently deletes this capture.")
-                    Button("Stop and transcribe") { Task { await store.finishCapture() } }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
-                        .accessibilityLabel("Stop and transcribe \(captureName)")
+                    if store.systemVoiceStatus.availableActions.contains(.discard) {
+                        Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                            .accessibilityLabel("Discard \(captureName)")
+                            .accessibilityHint("Stops recording and permanently deletes this capture.")
+                    }
+                    if store.systemVoiceStatus.availableActions.contains(.stopAndTranscribe) {
+                        Button("Stop and transcribe") { Task { await store.finishCapture() } }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .accessibilityLabel("Stop and transcribe \(captureName)")
+                    }
                 }
             case .transcribing, .delivering:
                 HStack(spacing: 9) {
@@ -99,37 +113,32 @@ struct MenuBarView: View {
         }
     }
 
-    private var status: String {
-        switch store.captureState {
-        case .idle: "Ready"
-        case .starting: "Starting"
-        case .recording: "Recording"
-        case .transcribing: "Transcribing"
-        case .delivering: "Inserting"
-        case .checkpointed: "Protected"
-        case .failed: "Error"
-        }
-    }
-
     private var statusIcon: String {
-        switch store.captureState {
-        case .idle: "checkmark.circle.fill"
-        case .starting: "waveform.circle"
+        if !store.systemVoiceStatus.warnings.isEmpty {
+            return "exclamationmark.triangle.fill"
+        }
+        return switch store.systemVoiceStatus.phase {
+        case .ready: "checkmark.circle.fill"
+        case .wakeStarting, .captureStarting: "waveform.circle"
+        case .wakeListening, .wakeStopping: "mic.circle.fill"
         case .recording: "record.circle"
-        case .transcribing, .delivering: "ellipsis.circle"
-        case .checkpointed: "checkmark.shield.fill"
+        case .processing, .delivering: "ellipsis.circle"
+        case .protected: "checkmark.shield.fill"
         case .failed: "exclamationmark.triangle.fill"
         }
     }
 
     private var statusColour: Color {
-        switch store.captureState {
-        case .idle: .green
-        case .starting: .secondary
+        if !store.systemVoiceStatus.warnings.isEmpty {
+            return .orange
+        }
+        return switch store.systemVoiceStatus.phase {
+        case .ready: .green
+        case .wakeListening, .wakeStopping: AnimaTheme.magenta
         case .recording: .red
-        case .checkpointed: .green
+        case .protected: .green
         case .failed: .orange
-        default: .secondary
+        case .wakeStarting, .captureStarting, .processing, .delivering: .secondary
         }
     }
 

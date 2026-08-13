@@ -1092,8 +1092,11 @@ private func checkHotMicRace() throws {
     try require(hotMic.isDisabled, "disabled hot mic did not publish disabled state")
 
     let captureStart = try unwrapped(hotMic.beginStart(), "hot mic did not restart before capture")
-    hotMic.disable()
+    try require(hotMic.beginStop(), "hot mic did not publish cleanup in progress")
+    try require(hotMic.state == .stopping, "hot mic cleanup was not visible")
     try require(!hotMic.didStart(captureStart), "foreground capture accepted a stale hot mic start")
+    try require(hotMic.completeStop(), "hot mic cleanup did not publish completion")
+    try require(hotMic.isDisabled, "completed hot mic cleanup did not close the microphone")
 
     let failingStart = try unwrapped(hotMic.beginStart(), "hot mic did not restart before failure")
     try require(hotMic.fail(failingStart, message: "Synthetic failure"), "hot mic failure was not recorded")
@@ -3765,8 +3768,94 @@ private func coreCheckSilentWAV() -> Data {
     return data
 }
 
+private func checkAccessibilityEvents() throws {
+    var reducer = AccessibilityAnnouncementReducer()
+
+    try require(reducer.receive(.wakeListeningStarted) == "Wake phrase listening started.", "wake start was not announced")
+    try require(reducer.receive(.wakeListeningStarted) == nil, "repeated wake start was announced")
+    try require(reducer.receive(.wakeListeningStopped) == "Wake phrase listening stopped.", "wake stop was not announced")
+    try require(reducer.receive(.wakeListeningFailed("Synthetic wake failure")) == "Wake phrase listening failed. Synthetic wake failure", "wake failure was not announced")
+
+    try require(reducer.receive(.captureStarted) == "Recording started.", "capture start was not announced")
+    try require(reducer.receive(.captureStarted) == nil, "audio-level publication repeated capture start")
+    try require(reducer.receive(.captureStopped) == "Recording stopped. Transcribing locally.", "capture stop was not announced")
+    try require(reducer.receive(.captureCancelled) == "Recording discarded.", "capture cancellation was not announced")
+    try require(reducer.receive(.captureFailed("Synthetic capture failure")) == "Capture failed. Synthetic capture failure", "capture failure was not announced")
+    try require(reducer.receive(.captureRecovered) == "Interrupted capture recovered.", "capture recovery was not announced")
+
+    try require(reducer.receive(.modelDownloadStarted) == "Local model download started.", "model download start was not announced")
+    try require(reducer.receive(.modelDownloadProgress(0.09)) == nil, "sub-milestone progress was announced")
+    try require(reducer.receive(.modelDownloadProgress(0.10)) == "Local model download 10 percent.", "10-percent milestone was not announced")
+    try require(reducer.receive(.modelDownloadProgress(0.19)) == nil, "repeated 10-percent bucket was announced")
+    try require(reducer.receive(.modelDownloadProgress(0.31)) == "Local model download 30 percent.", "crossed milestone was not announced")
+    try require(reducer.receive(.modelDownloadProgress(0.20)) == nil, "regressing progress was announced")
+    try require(reducer.receive(.modelDownloadCancelled) == "Local model download cancelled.", "model cancellation was not announced")
+    try require(reducer.receive(.modelDownloadStarted) == "Local model download started.", "a new download was deduplicated against an earlier operation")
+    try require(reducer.receive(.modelDownloadProgress(0.10)) == "Local model download 10 percent.", "a new download did not reset milestone tracking")
+    try require(reducer.receive(.modelDownloadFailed("Synthetic download failure")) == "Local model download failed. Synthetic download failure", "model failure was not announced")
+    try require(reducer.receive(.modelReady) == "Local model is ready.", "model readiness was not announced")
+
+    try require(reducer.receive(.microphoneSilence) == "No microphone signal has been detected. Check the selected input and mute switch.", "microphone silence was not announced")
+    try require(reducer.receive(.channelFailed(.system, "Synthetic channel failure")) == "System audio warning. Synthetic channel failure", "channel failure was not announced")
+    try require(reducer.receive(.webhookRevoked) == "Meeting webhook access revoked.", "webhook revocation was not announced")
+    try require(reducer.receive(.helperRevoked) == "Local helper access revoked.", "helper revocation was not announced")
+
+    print("accessibility-events: passed")
+}
+
+private func checkSystemVoiceStatus() throws {
+    let ready = SystemVoiceStatus.make(capture: .idle, hotMic: .disabled, warnings: [])
+    try require(ready.phase == .ready && !ready.isMicrophoneOpen, "idle status was not ready with a closed microphone")
+    try require(ready.availableActions.isEmpty, "idle status exposed capture actions")
+
+    let wakeStarting = SystemVoiceStatus.make(capture: .idle, hotMic: .starting, warnings: [])
+    try require(wakeStarting.phase == .wakeStarting && !wakeStarting.isMicrophoneOpen, "wake startup status was inaccurate")
+    let listening = SystemVoiceStatus.make(capture: .idle, hotMic: .active, warnings: [])
+    try require(listening.phase == .wakeListening, "active hot mic was not presented as wake listening")
+    try require(listening.isMicrophoneOpen, "active hot mic did not expose its open microphone")
+    try require(listening.menuTitle.contains("listening"), "menu title hid wake listening")
+    let wakeStopping = SystemVoiceStatus.make(capture: .idle, hotMic: .stopping, warnings: [])
+    try require(wakeStopping.phase == .wakeStopping && wakeStopping.isMicrophoneOpen, "wake cleanup did not remain visibly open")
+    let wakeFailed = SystemVoiceStatus.make(capture: .idle, hotMic: .failed(message: "Synthetic wake failure"), warnings: [])
+    try require(wakeFailed.phase == .failed && wakeFailed.hudDetail.contains("Synthetic wake failure"), "wake failure was hidden")
+
+    let starting = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .disabled, warnings: [])
+    try require(starting.phase == .captureStarting && starting.availableActions == [.discard], "capture startup did not expose discard")
+    let startingDuringWakeCleanup = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .stopping, warnings: [])
+    try require(startingDuringWakeCleanup.isMicrophoneOpen, "capture startup hid a wake microphone that was still closing")
+
+    let microphoneWarning = CaptureHealthWarning(channel: .microphone, reason: .silence)
+    let systemWarning = CaptureHealthWarning(channel: .system, reason: .unavailable)
+    let recording = SystemVoiceStatus.make(
+        capture: .recording(startedAt: .now, level: 0),
+        hotMic: .disabled,
+        warnings: [microphoneWarning, systemWarning]
+    )
+    try require(recording.phase == .recording && recording.isMicrophoneOpen, "hands-free capture did not expose recording microphone state")
+    try require(recording.hudWarning != nil, "capture health warnings were absent from the HUD")
+    try require(recording.menuTitle.contains("warning"), "capture health warnings were absent from the menu")
+    try require(recording.availableActions == [.stopAndTranscribe, .discard], "recording did not expose stop and discard")
+
+    let processing = SystemVoiceStatus.make(capture: .transcribing, hotMic: .disabled, warnings: [])
+    try require(processing.phase == .processing && !processing.isMicrophoneOpen, "transcription status was inaccurate")
+    let delivering = SystemVoiceStatus.make(capture: .delivering, hotMic: .disabled, warnings: [])
+    try require(delivering.phase == .delivering && !delivering.isMicrophoneOpen, "delivery status was inaccurate")
+    let failed = SystemVoiceStatus.make(capture: .failed("Synthetic capture failure"), hotMic: .active, warnings: [])
+    try require(failed.phase == .failed && !failed.isMicrophoneOpen, "capture failure did not override stale wake state")
+    try require(failed.hudDetail.contains("Synthetic capture failure"), "capture failure detail was hidden")
+    let protected = SystemVoiceStatus.make(capture: .checkpointed("Synthetic recovery checkpoint"), hotMic: .disabled, warnings: [])
+    try require(protected.phase == .protected && !protected.isMicrophoneOpen, "recovery checkpoint was presented as a live or failed capture")
+    try require(protected.menuTitle == "Capture protected", "recovery checkpoint lost its protected status")
+
+    print("system-voice-status: passed")
+}
+
 let arguments = CommandLine.arguments.dropFirst()
-if arguments == ["--filter", "action-contrast"] {
+if arguments == ["--filter", "accessibility-events"] {
+    try checkAccessibilityEvents()
+} else if arguments == ["--filter", "system-voice-status"] {
+    try checkSystemVoiceStatus()
+} else if arguments == ["--filter", "action-contrast"] {
     try checkActionContrast()
 } else if arguments == ["--filter", "onboarding-presentation"] {
     try checkOnboardingPresentation()
@@ -3831,6 +3920,6 @@ if arguments == ["--filter", "action-contrast"] {
 } else if arguments == ["--filter", "corrupt-library-recovery"] {
     try await checkCorruptLibraryRecovery()
 } else {
-    fputs("usage: evee-core-checks --filter <action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
     exit(EXIT_FAILURE)
 }

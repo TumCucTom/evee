@@ -4,6 +4,7 @@ public enum HotMicState: Equatable, Sendable {
     case disabled
     case starting
     case active
+    case stopping
     case failed(message: String)
 }
 
@@ -31,6 +32,21 @@ public struct HotMicStateMachine: Sendable {
         state = .disabled
     }
 
+    @discardableResult
+    public mutating func beginStop() -> Bool {
+        operation = nil
+        guard state != .disabled, state != .stopping else { return false }
+        state = .stopping
+        return true
+    }
+
+    @discardableResult
+    public mutating func completeStop() -> Bool {
+        guard state == .stopping else { return false }
+        state = .disabled
+        return true
+    }
+
     public func isCurrent(_ operation: LifecycleOperation) -> Bool {
         self.operation == operation && state == .starting
     }
@@ -55,7 +71,7 @@ public struct HotMicStateMachine: Sendable {
         switch state {
         case .disabled, .failed:
             true
-        case .starting, .active:
+        case .starting, .active, .stopping:
             false
         }
     }

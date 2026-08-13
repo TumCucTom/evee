@@ -10,6 +10,7 @@ extension KeyboardShortcuts.Name {
     static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
     static let transformSelection = Self("transformSelection", default: .init(.space, modifiers: [.command, .option, .shift]))
     static let toggleHandsFree = Self("toggleHandsFree")
+    static let cancelCapture = Self("cancelCapture", default: .init(.escape, modifiers: [.command, .option]))
 }
 
 private enum CaptureTerminationCheckpointError: LocalizedError {
@@ -55,8 +56,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published var settings = EveeSettings()
     @Published var captureState: CaptureState = .idle {
         didSet {
-            guard settings.audioCuesEnabled else { return }
-            CaptureAudioCuePlayer.playTransition(from: oldValue, to: captureState)
+            publishSystemVoiceStatus()
+            if settings.audioCuesEnabled {
+                CaptureAudioCuePlayer.playTransition(from: oldValue, to: captureState)
+            }
         }
     }
     @Published var search = ""
@@ -87,8 +90,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var liveMeetingStatus: String?
     @Published private(set) var availableUpdate: EveeRelease?
     @Published private(set) var isCheckingForUpdates = false
-    @Published private(set) var microphoneHealthWarning: String?
-    @Published private(set) var hotMicState: HotMicState = .disabled
+    @Published private(set) var microphoneHealthWarning: String? {
+        didSet { publishSystemVoiceStatus() }
+    }
+    @Published private(set) var hotMicState: HotMicState = .disabled {
+        didSet { publishSystemVoiceStatus() }
+    }
+    @Published private(set) var systemVoiceStatus = SystemVoiceStatus.make(
+        capture: .idle,
+        hotMic: .disabled,
+        warnings: []
+    )
 
     var modelProgress: ModelProgress? {
         guard case .downloading(_, let progress) = modelDownloadState else { return nil }
@@ -140,6 +152,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         hotMicState == .active
     }
 
+    var captureHealthWarnings: [CaptureHealthWarning] {
+        var warnings: [CaptureHealthWarning] = []
+        if microphoneHealthWarning != nil {
+            warnings.append(CaptureHealthWarning(channel: .microphone, reason: .silence))
+        }
+        if let systemAudioHealthWarning {
+            warnings.append(systemAudioHealthWarning)
+        }
+        return warnings
+    }
+
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
             count += record.webhookDeliveries.filter {
@@ -169,6 +192,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let systemAudioStopper: SystemAudioStopper?
     private let textDeliverer: TextDeliverer
     private let recoveryTranscriberFactory: RecoveryTranscriberFactory
+    let accessibilityAnnouncements: AccessibilityAnnouncementCoordinator
     private var transcriber: (any LocalTranscriber)?
     private var modelDownloadStateMachine = ModelDownloadStateMachine()
     private var modelDownloadOperation: LifecycleOperation?
@@ -207,6 +231,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var wakePhraseListener: (any WakePhraseListening)?
     private var hotMicStateMachine = HotMicStateMachine()
     private var hotMicTranscriptTask: Task<Void, Never>?
+    private var hotMicPendingStart = false
+    private var systemAudioHealthWarning: CaptureHealthWarning? {
+        didSet { publishSystemVoiceStatus() }
+    }
     private var suppressDraftAutosave = false
     private var terminationCheckpointRecoveryID: UUID?
     private var terminationWorkGate = TerminationWorkGate()
@@ -249,7 +277,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     func prepareForTerminationCheckpoint() -> UInt64 {
         let generation = terminationWorkGate.prepareCheckpoint()
         deliveryTask?.cancel()
-        hotMicStateMachine.disable()
+        _ = hotMicStateMachine.beginStop()
         publishHotMicState()
         return generation
     }
@@ -311,7 +339,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             )
         },
         recoveryTranscriberFactory: @escaping RecoveryTranscriberFactory = { try TranscriberFactory.make($0) },
-        speechModelAvailability: SpeechModelAvailability = .current
+        speechModelAvailability: SpeechModelAvailability = .current,
+        accessibilityAnnouncements: AccessibilityAnnouncementCoordinator? = nil
     ) {
         self.modelDownloaderFactory = modelDownloaderFactory
         self.wakeListenerFactory = wakeListenerFactory
@@ -326,6 +355,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         self.systemAudioStopper = systemAudioStopper
         self.textDeliverer = textDeliverer
         self.recoveryTranscriberFactory = recoveryTranscriberFactory
+        self.accessibilityAnnouncements = accessibilityAnnouncements ?? AccessibilityAnnouncementCoordinator()
         self.microphonePermissionState = microphonePermissionProvider()
             ? .granted
             : MicrophoneRecorder.authorizationState
@@ -379,6 +409,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
         KeyboardShortcuts.onKeyUp(for: .toggleHandsFree) { [weak self] in
             Task { @MainActor in await self?.toggleHandsFreeDictation() }
+        }
+        KeyboardShortcuts.onKeyUp(for: .cancelCapture) { [weak self] in
+            Task { @MainActor in await self?.cancelCapture() }
         }
         shortcutTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -571,6 +604,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
         do {
             let destinationValue = normalizedWebhookDestination(settings.webhookURL)
+            let revokedWebhookDestination = configuredWebhookDestination != nil && destinationValue == nil
             if let destinationValue {
                 guard let destination = URL(string: destinationValue) else { throw WebhookEndpointError.invalidURL }
                 try WebhookEndpointPolicy.validate(destination)
@@ -586,6 +620,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
             settings.webhookSecret = ""
             try await library.save(settings)
+            if revokedWebhookDestination {
+                accessibilityAnnouncements.post(.webhookRevoked)
+            }
             if settings.historyRetentionDays > 0 {
                 let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
                 let removed = try await library.purgeRecords(olderThan: cutoff)
@@ -690,6 +727,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         )
         if outcome.authorizationDisabled {
             settings.mcpEnabled = false
+            accessibilityAnnouncements.post(.helperRevoked)
         }
         return outcome
     }
@@ -707,6 +745,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloadNeedsRetry = true
         modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
+        accessibilityAnnouncements.post(.modelDownloadStarted)
 
         let factory = modelDownloaderFactory
         let forceRepair = modelsRequiringRepair.contains(model)
@@ -753,6 +792,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private func receiveModelDownloadProgress(_ progress: ModelProgress, operation: LifecycleOperation) {
         guard modelDownloadStateMachine.update(operation, progress: progress) else { return }
         publishModelDownloadState()
+        accessibilityAnnouncements.post(.modelDownloadProgress(progress.fraction))
     }
 
     private func completeModelDownload(
@@ -770,6 +810,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelsRequiringRepair.remove(model)
         modelDownloadDefaults?.set(false, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
+        accessibilityAnnouncements.post(.modelReady)
     }
 
     private func finishModelDownloadCancellation(
@@ -784,6 +825,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelsRequiringRepair.insert(model)
         modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
+        accessibilityAnnouncements.post(.modelDownloadCancelled)
     }
 
     private func failModelDownload(_ error: Error, model: SpeechModel, operation: LifecycleOperation) {
@@ -795,6 +837,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
         statusMessage = error.localizedDescription
+        accessibilityAnnouncements.post(.modelDownloadFailed(error.localizedDescription))
     }
 
     private func reconcileModelDownloadCache(_ downloader: any LocalModelDownloading, model: SpeechModel) {
@@ -1071,6 +1114,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                         return
                     }
                     isSystemAudioActive = true
+                    systemAudioHealthWarning = nil
                 } catch {
                     guard captureLifecycle == .starting(sessionID) else {
                         await cleanUpCancelledStart(sessionID: sessionID)
@@ -1079,6 +1123,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     activeSystemAudioURL = nil
                     systemTrackStartedAt = nil
                     isSystemAudioActive = false
+                    systemAudioHealthWarning = CaptureHealthWarning(channel: .system, reason: .unavailable)
+                    accessibilityAnnouncements.post(.channelFailed(.system, "System audio is unavailable. The microphone is still recording."))
                     statusMessage = "Meeting capture is using your microphone only. Enable Screen Recording permission to include everyone else."
                 }
             } else if activeKind == .meeting {
@@ -1092,6 +1138,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             captureLifecycle = .recording(sessionID)
             captureState = .recording(startedAt: startedAt, level: 0)
             startMicrophoneHealthMonitor(sessionID: sessionID)
+            accessibilityAnnouncements.post(.captureStarted)
 
             if stopRequestedDuringStart == sessionID {
                 stopRequestedDuringStart = nil
@@ -1126,11 +1173,14 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 do {
                     try await stopSystemAudio()
                 } catch {
+                    systemAudioHealthWarning = CaptureHealthWarning(channel: .system, reason: .failed(error.localizedDescription))
+                    accessibilityAnnouncements.post(.channelFailed(.system, error.localizedDescription))
                     statusMessage = "System audio ended unexpectedly; Evee will keep processing the microphone track. \(error.localizedDescription)"
                 }
                 isSystemAudioActive = false
             }
             if activeKind == .meeting { await stopLiveMeetingTranscription() }
+            accessibilityAnnouncements.post(.captureStopped)
 
             guard let recoveryID = activeRecoveryID else {
                 throw NSError(domain: "Evee.Recovery", code: 1, userInfo: [NSLocalizedDescriptionKey: "The capture recovery session is unavailable."])
@@ -1261,6 +1311,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         // lifecycle closed until that continuation observes cancellation and cleans up.
         if !wasStarting {
             resetSession(state: .idle)
+            accessibilityAnnouncements.post(.captureCancelled)
         }
     }
 
@@ -1481,6 +1532,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         await refreshRecoverableCaptures()
         if captureLifecycle == .cancelling(sessionID) || captureLifecycle == .starting(sessionID) {
             resetSession(state: .idle)
+            accessibilityAnnouncements.post(.captureCancelled)
         }
     }
 
@@ -1512,6 +1564,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         guard captureLifecycle == .starting(sessionID) || captureLifecycle == .finishing(sessionID) else { return }
         resetSession(state: .failed(detail))
         statusMessage = detail
+        accessibilityAnnouncements.post(.captureFailed(detail))
     }
 
     private func removeActiveRecoveryFiles() {
@@ -1524,6 +1577,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func resetSession(state: CaptureState) {
+        microphoneHealthTask?.cancel()
+        microphoneHealthTask = nil
+        microphoneHealthWarning = nil
+        systemAudioHealthWarning = nil
         captureState = state
         captureLifecycle = .idle
         captureKind = nil
@@ -1543,9 +1600,6 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         stopRequestedDuringStart = nil
         recorder.setBufferHandler(nil)
         systemAudioRecorder.setBufferHandler(nil)
-        microphoneHealthTask?.cancel()
-        microphoneHealthTask = nil
-        microphoneHealthWarning = nil
         if state == .idle, settings.hotMicEnabled, !isApplicationTerminationCheckpointing {
             Task { @MainActor [weak self] in await self?.updateHotMicState() }
         }
@@ -1697,6 +1751,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             )
             let intelligence = capture.kind == .meeting ? MeetingIntelligencePipeline().generate(from: segments) : nil
             try await completeRecord(sessionID: sessionID, raw: raw, polished: polished, segments: segments, meetingIntelligence: intelligence)
+            if captureLifecycle == .idle {
+                accessibilityAnnouncements.post(.captureRecovered)
+            }
             if selectedRoles == [.system] {
                 statusMessage = "Meeting recovered from system audio. The transcript is labelled as other-participant audio."
             }
@@ -1860,7 +1917,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, !Task.isCancelled, self.captureLifecycle == .recording(sessionID) else { return }
                 if Date.now.timeIntervalSince(self.lastNonSilentAudioAt) >= 15 {
-                    self.microphoneHealthWarning = "No microphone signal has been detected for 15 seconds. Check the selected input and its mute switch; the recording is still running."
+                    if self.microphoneHealthWarning == nil {
+                        self.microphoneHealthWarning = "No microphone signal has been detected for 15 seconds. Check the selected input and its mute switch; the recording is still running."
+                        self.accessibilityAnnouncements.post(.microphoneSilence)
+                    }
                 }
             }
         }
@@ -1902,15 +1962,19 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         let listener = wakeListenerFactory()
         guard hotMicStartIsCurrent(operation, phrase: phrase) else {
             await listener.stop()
+            completeHotMicCleanupAfterPendingStart()
             return
         }
         do {
+            hotMicPendingStart = true
             try await listener.start(
                 deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
                 lowLatency: true
             )
+            hotMicPendingStart = false
             guard hotMicStartIsCurrent(operation, phrase: phrase) else {
                 await listener.stop()
+                completeHotMicCleanupAfterPendingStart()
                 return
             }
 
@@ -1932,11 +1996,16 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             wakePhraseListener = listener
             hotMicTranscriptTask = transcriptTask
             publishHotMicState()
+            accessibilityAnnouncements.post(.wakeListeningStarted)
         } catch {
+            hotMicPendingStart = false
             await listener.stop()
             if hotMicStateMachine.fail(operation, message: error.localizedDescription) {
                 publishHotMicState()
                 statusMessage = "Wake-phrase listening could not start: \(error.localizedDescription)"
+                accessibilityAnnouncements.post(.wakeListeningFailed(error.localizedDescription))
+            } else {
+                completeHotMicCleanupAfterPendingStart()
             }
         }
     }
@@ -1947,13 +2016,26 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func stopHotMic() async {
-        hotMicStateMachine.disable()
-        publishHotMicState()
+        let wasOpenOrStarting = hotMicState == .active || hotMicState == .starting || hotMicState == .stopping
+        if hotMicState != .disabled, hotMicState != .stopping {
+            _ = hotMicStateMachine.beginStop()
+            publishHotMicState()
+        }
         hotMicTranscriptTask?.cancel()
         hotMicTranscriptTask = nil
         let listener = wakePhraseListener
         wakePhraseListener = nil
         if let listener { await listener.stop() }
+        guard !hotMicPendingStart else { return }
+        if hotMicStateMachine.completeStop() {
+            publishHotMicState()
+            if wasOpenOrStarting {
+                accessibilityAnnouncements.post(.wakeListeningStopped)
+            }
+        } else if hotMicState != .disabled {
+            hotMicStateMachine.disable()
+            publishHotMicState()
+        }
     }
 
     private func hotMicStartIsCurrent(_ operation: LifecycleOperation, phrase: String) -> Bool {
@@ -1970,16 +2052,40 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
               hotMicState == .active,
               settings.hotMicEnabled,
               captureLifecycle == .idle else { return }
-        hotMicStateMachine.disable()
+        _ = hotMicStateMachine.beginStop()
         publishHotMicState()
         hotMicTranscriptTask = nil
         wakePhraseListener = nil
         await listener.stop()
+        if hotMicStateMachine.completeStop() {
+            publishHotMicState()
+            accessibilityAnnouncements.post(.wakeListeningStopped)
+        }
         await beginDictation()
     }
 
     private func publishHotMicState() {
         hotMicState = hotMicStateMachine.state
+    }
+
+    private func completeHotMicCleanupAfterPendingStart() {
+        if hotMicState != .stopping {
+            _ = hotMicStateMachine.beginStop()
+            publishHotMicState()
+        }
+        guard hotMicStateMachine.completeStop() else { return }
+        publishHotMicState()
+        accessibilityAnnouncements.post(.wakeListeningStopped)
+    }
+
+    private func publishSystemVoiceStatus() {
+        let status = SystemVoiceStatus.make(
+            capture: captureState,
+            hotMic: hotMicState,
+            warnings: captureHealthWarnings
+        )
+        guard status != systemVoiceStatus else { return }
+        systemVoiceStatus = status
     }
 
     private func stopLiveMeetingTranscription(discardPendingAudio: Bool = false) async {

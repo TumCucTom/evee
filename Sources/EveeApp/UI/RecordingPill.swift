@@ -2,60 +2,25 @@ import EveeCore
 import SwiftUI
 
 struct RecordingPill: View {
-    let state: CaptureState
-    let operation: WorkspaceRecordOperation?
-    var onStop: (() -> Void)?
-    var onCancel: (() -> Void)?
+    let status: SystemVoiceStatus
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    init(
-        state: CaptureState,
-        operation: WorkspaceRecordOperation? = nil,
-        onStop: (() -> Void)? = nil,
-        onCancel: (() -> Void)? = nil
-    ) {
-        self.state = state
-        self.operation = operation
-        self.onStop = onStop
-        self.onCancel = onCancel
-    }
 
     var body: some View {
         HStack(spacing: 12) {
             statusIcon
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+                Text(status.hudTitle)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(AnimaTheme.ink)
-                Text(detail)
+                Text(status.hudDetail)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
 
             Spacer(minLength: 10)
-
-            if canCancel {
-                if let onCancel {
-                    Button("Discard", role: .destructive, action: onCancel)
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .help("Stop recording and permanently discard this capture")
-                        .accessibilityLabel("Discard the current capture")
-                        .accessibilityHint("Stops recording and permanently deletes this capture.")
-                }
-                if let onStop, case .recording = state {
-                    Button("Stop", action: onStop)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .tint(.red)
-                        .keyboardShortcut(.return, modifiers: [])
-                        .help("Stop recording and transcribe")
-                        .accessibilityLabel("Stop and transcribe the current capture")
-                }
-            }
         }
         .padding(.horizontal, 14)
         .frame(width: 410, height: 54)
@@ -68,20 +33,16 @@ struct RecordingPill: View {
     }
 
     @ViewBuilder private var statusIcon: some View {
-        switch state {
-        case .recording(_, let level):
-            HStack(spacing: 2) {
-                ForEach(0..<6, id: \.self) { index in
-                    Capsule()
-                        .fill(index.isMultiple(of: 2) ? AnimaTheme.magenta : AnimaTheme.periwinkle)
-                        .frame(width: 3, height: reduceMotion ? 12 : barHeight(level: level, index: index))
-                }
-            }
-            .frame(width: 28, height: 28)
-            .accessibilityHidden(true)
-        case .checkpointed:
-            Image(systemName: "checkmark.shield.fill")
-                .foregroundStyle(.green)
+        switch status.phase {
+        case .recording:
+            Image(systemName: "record.circle.fill")
+                .foregroundStyle(.red)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(width: 28)
+                .accessibilityHidden(true)
+        case .wakeListening, .wakeStopping:
+            Image(systemName: "mic.fill")
+                .foregroundStyle(AnimaTheme.magenta)
                 .font(.system(size: 18, weight: .semibold))
                 .frame(width: 28)
                 .accessibilityHidden(true)
@@ -91,7 +52,13 @@ struct RecordingPill: View {
                 .font(.system(size: 18, weight: .semibold))
                 .frame(width: 28)
                 .accessibilityHidden(true)
-        default:
+        case .ready, .protected:
+            Image(systemName: "checkmark.shield.fill")
+                .foregroundStyle(.green)
+                .font(.system(size: 18, weight: .semibold))
+                .frame(width: 28)
+                .accessibilityHidden(true)
+        case .wakeStarting, .captureStarting, .processing, .delivering:
             ProgressView()
                 .controlSize(.small)
                 .frame(width: 28)
@@ -99,60 +66,8 @@ struct RecordingPill: View {
         }
     }
 
-    private var title: String {
-        switch state {
-        case .idle: "Ready"
-        case .starting: operation == .selectionTransform ? "Starting selection transform" : "Starting capture"
-        case .recording: operation == .selectionTransform ? "Recording transform instruction" : "Recording"
-        case .transcribing: "Transcribing locally"
-        case .delivering: operation == .selectionTransform ? "Replacing selected text" : "Inserting text"
-        case .checkpointed: "Capture protected"
-        case .failed: "Capture needs attention"
-        }
-    }
-
-    private var detail: String {
-        switch state {
-        case .idle: "Hold your shortcut to dictate"
-        case .starting(let kind): operation == .selectionTransform
-            ? "Keep the original text selected · you can discard at any time"
-            : "Preparing \(kind.rawValue) audio · you can discard at any time"
-        case .recording(let startedAt, _): operation == .selectionTransform
-            ? "Speak a supported transform, then release or press Stop"
-            : "Started \(startedAt.formatted(date: .omitted, time: .standard)) · audio stays on this Mac"
-        case .transcribing: "You can keep working while Evee processes the audio"
-        case .delivering: operation == .selectionTransform ? "Verifying the original selection before replacement" : "Sending the finished text to your active app"
-        case .checkpointed(let message): message
-        case .failed(let message): message
-        }
-    }
-
     private var accessibilityLabel: String {
-        switch state {
-        case .starting: operation == .selectionTransform
-            ? "Evee is preparing a selection transform. Keep the original text selected. Use Discard to cancel."
-            : "Evee is preparing audio capture. Use Discard to cancel."
-        case .recording: operation == .selectionTransform
-            ? "Evee is recording a transform instruction. Use Stop to transform or Discard to leave the selection unchanged."
-            : "Evee is recording. Use Stop to transcribe or Discard to delete the recording."
-        case .transcribing: "Evee is transcribing locally."
-        case .delivering: operation == .selectionTransform ? "Evee is verifying and replacing the selected text." : "Evee is inserting the finished text."
-        case .checkpointed(let message): "Evee protected this capture for recovery. \(message)"
-        case .failed(let message): "Evee capture failed. \(message)"
-        case .idle: "Evee is ready."
-        }
-    }
-
-    private var canCancel: Bool {
-        switch state {
-        case .starting, .recording: true
-        default: false
-        }
-    }
-
-    private func barHeight(level: Float, index: Int) -> CGFloat {
-        let normalised = min(max(CGFloat(level) * 24, 5), 24)
-        let variance: CGFloat = index.isMultiple(of: 3) ? 0.65 : (index.isMultiple(of: 2) ? 0.85 : 1)
-        return max(5, normalised * variance)
+        let microphone = status.isMicrophoneOpen ? "Microphone open." : "Microphone closed."
+        return "\(status.hudTitle). \(microphone) \(status.hudDetail)"
     }
 }
