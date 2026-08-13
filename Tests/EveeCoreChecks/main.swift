@@ -40,6 +40,54 @@ private final class SyntheticTerminationCheckpoint: CaptureCheckpointing {
     }
 }
 
+@MainActor
+private final class SyntheticGenerationCheckpoint: CaptureCheckpointing {
+    private(set) var terminationWorkGeneration: UInt64 = 0
+    private(set) var callCount = 0
+
+    func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
+    func checkpointForTermination() async throws { callCount += 1 }
+    func beginNewWork() { terminationWorkGeneration &+= 1 }
+}
+
+@MainActor
+private final class SuspendedGenerationCheckpoint: CaptureCheckpointing {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private(set) var terminationWorkGeneration: UInt64 = 0
+    func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
+    func checkpointForTermination() async throws {
+        try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+    func beginNewWork() { terminationWorkGeneration &+= 1 }
+    func succeed() { continuation?.resume(); continuation = nil }
+}
+
+private actor SyntheticOperationGate<Value: Sendable> {
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    func wait() async throws -> Value {
+        try await withCheckedThrowingContinuation {
+            continuation = $0
+            startWaiters.forEach { $0.resume() }
+            startWaiters.removeAll()
+        }
+    }
+    func waitUntilStarted() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+    func release(_ value: Value) {
+        continuation?.resume(returning: value)
+        continuation = nil
+    }
+}
+
+private actor SyntheticCounter {
+    private var count = 0
+    func increment() { count += 1 }
+    var value: Int { count }
+}
+
 private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
     private let lock = NSLock()
     private let enteredRead = DispatchSemaphore(value: 0)
@@ -627,6 +675,106 @@ private func checkTerminationCheckpoint() async throws {
     try require(deadlineFailures.values.count == 1, "checkpoint deadline was not surfaced")
     try await Task.sleep(for: .milliseconds(120))
     try require(replies.values == [false], "late durability completion replied to AppKit twice")
+
+    let generationCheckpoint = SyntheticGenerationCheckpoint()
+    let generationCoordinator = ApplicationTerminationCoordinator(deadline: .seconds(1))
+    let firstGenerationReplies = LockedValues<Bool>()
+    _ = generationCoordinator.requestTermination(
+        plan: .invalidateDeliveryAndAwaitCommit,
+        checkpoint: generationCheckpoint,
+        reply: { firstGenerationReplies.append($0) },
+        reportFailure: { _ in }
+    )
+    while firstGenerationReplies.values.isEmpty { await Task.yield() }
+    try require(firstGenerationReplies.values == [true], "initial generation did not checkpoint")
+    generationCheckpoint.beginNewWork()
+    let secondGenerationReplies = LockedValues<Bool>()
+    let secondGenerationDecision = generationCoordinator.requestTermination(
+        plan: .invalidateDeliveryAndAwaitCommit,
+        checkpoint: generationCheckpoint,
+        reply: { secondGenerationReplies.append($0) },
+        reportFailure: { _ in }
+    )
+    try require(secondGenerationDecision == .terminateLater, "new work reused a stale successful checkpoint")
+    while secondGenerationReplies.values.isEmpty { await Task.yield() }
+    try require(generationCheckpoint.callCount == 2, "new work did not run a new checkpoint")
+
+    let suspendedGeneration = SuspendedGenerationCheckpoint()
+    let suspendedReplies = LockedValues<Bool>()
+    let suspendedFailures = LockedValues<String>()
+    let suspendedCoordinator = ApplicationTerminationCoordinator(deadline: .seconds(1))
+    _ = suspendedCoordinator.requestTermination(
+        plan: .invalidateDeliveryAndAwaitCommit,
+        checkpoint: suspendedGeneration,
+        reply: { suspendedReplies.append($0) },
+        reportFailure: { suspendedFailures.append($0.localizedDescription) }
+    )
+    await Task.yield()
+    suspendedGeneration.beginNewWork()
+    suspendedGeneration.succeed()
+    while suspendedReplies.values.isEmpty { await Task.yield() }
+    try require(suspendedReplies.values == [false], "generation changed during checkpoint still terminated")
+    try require(suspendedFailures.values.count == 1, "changed generation was not surfaced")
+
+    let commitStoreRoot = root.appendingPathComponent("suspended-commit")
+    let commitStore = LibraryStore(rootURL: commitStoreRoot)
+    let commitRecovery = try await commitStore.beginRecoveryCapture(kind: .memo)
+    let commitSource = root.appendingPathComponent("synthetic-commit.caf")
+    try Data("synthetic commit audio".utf8).write(to: commitSource)
+    _ = try await commitStore.addRecoveryTrack(
+        captureID: commitRecovery.id,
+        kind: .memo,
+        role: .microphone,
+        sourceURL: commitSource
+    )
+    let commitGate = SyntheticOperationGate<Void>()
+    let commitOperation = TerminationOwnedOperation<WorkspaceRecord>()
+    let committedRecord = WorkspaceRecord(kind: .memo, title: "Synthetic", text: "Saved")
+    _ = await commitOperation.begin {
+        try await commitGate.wait()
+        return try await commitStore.commitRecoveredRecord(
+            committedRecord,
+            recoveryID: commitRecovery.id,
+            keepAudio: true
+        )
+    }
+    let commitJoin = Task { try await commitOperation.join() }
+    await commitGate.release(())
+    let joinedRecord = try await commitJoin.value
+    try require(joinedRecord?.id == committedRecord.id, "quit did not join the suspended commit")
+    let repeatedCommit = try await commitOperation.join()
+    try require(repeatedCommit == nil, "joined commit was repeated")
+    let committedRecords = try await commitStore.loadRecords()
+    let committedRecoveries = try await commitStore.recoverableCaptures()
+    try require(committedRecords.map(\.id) == [committedRecord.id], "suspended commit was not retained exactly once")
+    try require(committedRecoveries.isEmpty, "durable commit left an empty recovery behind")
+
+    let startGate = SyntheticOperationGate<URL>()
+    let startOperation = TerminationOwnedOperation<URL>()
+    let syntheticOutput = root.appendingPathComponent("delayed-start.caf")
+    _ = await startOperation.begin { try await startGate.wait() }
+    let startJoin = Task { try await startOperation.join() }
+    await startGate.release(syntheticOutput)
+    let startedOutput = try await startJoin.value
+    try require(startedOutput == syntheticOutput, "quit did not join delayed recorder start")
+    let startIsActive = await startOperation.isActive
+    try require(!startIsActive, "recorder start remained active after checkpoint")
+
+    let deliveryGate = SyntheticOperationGate<Void>()
+    let deliveryOperation = TerminationOwnedOperation<Void>()
+    let sendCounter = SyntheticCounter()
+    _ = await deliveryOperation.begin {
+        try await deliveryGate.wait()
+        try Task.checkCancellation()
+        await sendCounter.increment()
+    }
+    await deliveryGate.waitUntilStarted()
+    await deliveryOperation.cancel()
+    let deliveryJoin = Task { try? await deliveryOperation.join() }
+    await deliveryGate.release(())
+    _ = await deliveryJoin.value
+    let sendCount = await sendCounter.value
+    try require(sendCount == 0, "cancelled delivery auto-sent after checkpoint began")
 
     print("termination-checkpoint: passed")
 }

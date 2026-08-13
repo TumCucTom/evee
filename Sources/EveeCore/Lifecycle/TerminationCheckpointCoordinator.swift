@@ -4,7 +4,14 @@ import Foundation
 /// application termination.
 @MainActor
 public protocol CaptureCheckpointing: AnyObject {
+    var terminationWorkGeneration: UInt64 { get }
+    @discardableResult func prepareForTerminationCheckpoint() -> UInt64
     func checkpointForTermination() async throws
+}
+
+public extension CaptureCheckpointing {
+    var terminationWorkGeneration: UInt64 { 0 }
+    func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
 }
 
 /// Compatibility for integrations installed before capture shutdown joined the
@@ -68,4 +75,53 @@ public actor TerminationCheckpointCoordinator {
         failedResult = nil
         try await checkpoint()
     }
+}
+
+/// Retains an operation that can cross a termination request. The quit path
+/// joins the exact task that started the work; it never starts a duplicate.
+public actor TerminationOwnedOperation<Value: Sendable> {
+    private struct InFlight {
+        var id: UInt64
+        var task: Task<Value, Error>
+    }
+
+    private var sequence: UInt64 = 0
+    private var inFlight: InFlight?
+
+    public init() {}
+
+    @discardableResult
+    public func begin(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) -> Task<Value, Error> {
+        if let inFlight { return inFlight.task }
+        sequence &+= 1
+        let id = sequence
+        let task = Task { try await operation() }
+        inFlight = InFlight(id: id, task: task)
+        return task
+    }
+
+    public func join() async throws -> Value? {
+        guard let operation = inFlight else { return nil }
+        do {
+            let value = try await operation.task.value
+            if inFlight?.id == operation.id { inFlight = nil }
+            return value
+        } catch {
+            if inFlight?.id == operation.id { inFlight = nil }
+            throw error
+        }
+    }
+
+    public func cancelAndJoin() async throws -> Value? {
+        cancel()
+        return try await join()
+    }
+
+    public func cancel() {
+        inFlight?.task.cancel()
+    }
+
+    public var isActive: Bool { inFlight != nil }
 }

@@ -100,6 +100,7 @@ struct RootView: View {
 
     private var alertTitle: String {
         if case .failed = store.captureState { return "Capture stopped" }
+        if case .checkpointed = store.captureState { return "Capture protected" }
         return "Evee needs attention"
     }
 

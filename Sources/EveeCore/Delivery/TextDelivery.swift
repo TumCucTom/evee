@@ -184,14 +184,17 @@ public enum TextDelivery {
         sendAfterPaste: Bool = false,
         restoreClipboardAfter delay: TimeInterval = 0.6
     ) async throws {
+        try Task.checkCancellation()
         guard isAccessibilityTrusted else {
             requestAccessibility()
             throw DeliveryError.accessibilityRequired
         }
 
+        try Task.checkCancellation()
         try verifyTarget(target, expectedSelectedText: expectedSelectedText)
         let valueBeforePaste = sendAfterPaste ? focusedEditableValue(processIdentifier: target.processIdentifier) : nil
 
+        try Task.checkCancellation()
         let pasteboard = NSPasteboard.general
         let prior = PasteboardSnapshot(pasteboard)
         pasteboard.clearContents()
@@ -210,6 +213,7 @@ public enum TextDelivery {
             throw error
         }
 
+        try Task.checkCancellation()
         let source = CGEventSource(stateID: .combinedSessionState)
         let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
         down?.flags = .maskCommand
@@ -221,7 +225,8 @@ public enum TextDelivery {
         if sendAfterPaste {
             var insertionVerified = false
             for _ in 0..<12 {
-                try? await Task.sleep(for: .milliseconds(100))
+                try await Task.sleep(for: .milliseconds(100))
+                try Task.checkCancellation()
                 do {
                     try verifyTarget(target, expectedSelectedText: nil)
                 } catch {
@@ -248,10 +253,12 @@ public enum TextDelivery {
                 }
                 throw DeliveryError.autoSendDeclined(target.name)
             }
+            try Task.checkCancellation()
             postKey(virtualKey: 36)
         }
 
-        try? await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
+        try await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
+        try Task.checkCancellation()
         if pasteboard.changeCount == dictatedClipboardChange {
             prior.restore(to: pasteboard)
         }
@@ -276,6 +283,7 @@ public enum TextDelivery {
         mode: TextDeliveryMode,
         expectedSelectedText: String? = nil
     ) async throws {
+        try Task.checkCancellation()
         switch mode {
         case .copyOnly:
             try copyToClipboard(text)

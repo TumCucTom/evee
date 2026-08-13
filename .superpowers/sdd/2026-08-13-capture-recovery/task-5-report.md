@@ -102,3 +102,48 @@ workspace data was used.
   expression are absent from this worker environment. The controller owns the
   restricted-reference gate; this worker performs staged artifact, common-secret,
   diff, and neutral-metadata inspection before committing.
+
+## Fix round 1
+
+Addressed all five termination-race findings without adding another AppKit
+delegate or reply owner.
+
+- A retained complete-record operation is now joined by termination. A durable
+  commit is published idempotently and is never deleted because the capture
+  lifecycle changed. If termination gates the path before commit creation, the
+  existing stopped sources are checkpointed instead. The synthetic suspended
+  commit check uses a temporary `LibraryStore` and verifies exactly one record
+  plus removal of the committed recovery.
+- Termination synchronously closes capture, shortcut, hot-mic, clipboard, and
+  delivery starts. `CaptureCheckpointing` exposes a work generation; the reply
+  owner snapshots and revalidates it before replying success, and cannot reuse a
+  cached success after later work. A generation change during the await cancels
+  termination visibly.
+- Timeout/failure publishes an explicit `checkpointed` capture presentation.
+  The overlay no longer offers Discard, `cancelCapture` cannot remove artifacts
+  once the termination gate is active, and the menu offers Open Recovery and
+  Retry Quit.
+- Microphone and system-audio start tasks are retained. The checkpoint joins a
+  start already in progress, then stops/finalises the writer and checkpoints its
+  produced path or the existing fallback. Test seams use synthetic continuations
+  and temporary paths only; no capture permission or hardware was touched.
+- Text delivery is retained, invalidated and joined before a termination reply.
+  `TextDelivery` now checks task cancellation before clipboard mutation, paste,
+  every verification iteration, and Return. A suspended synthetic delivery is
+  cancelled before its auto-send boundary.
+
+Fix-round verification:
+
+- Rebuilt `evee-core-checks`, then ran `--filter termination-checkpoint` ten
+  consecutive times: 10/10 passed. Coverage includes suspended commit,
+  in-flight recorder start, delivery cancellation, stale cached success, and a
+  generation change while checkpointing.
+- `--filter lifecycle-state`: passed.
+- `--filter webhook-generation`: passed.
+- `swift build --target EveeCore --jobs 2`: passed.
+- Direct `swiftc -typecheck` of every EveeApp source against built modules:
+  passed after the fix-round changes.
+- `swift test --filter TerminationCheckpointTests --jobs 1` remains blocked
+  before test compilation by KeyboardShortcuts' unavailable `PreviewsMacros`
+  plugin under Command Line Tools. No full-Xcode, package, physical capture, or
+  packaged-app result is claimed.

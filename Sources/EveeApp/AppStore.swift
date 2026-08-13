@@ -31,6 +31,12 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     typealias ModelDownloaderFactory = @Sendable (SpeechModel) throws -> any LocalModelDownloading
     typealias WakeListenerFactory = @Sendable () -> any WakePhraseListening
     typealias MicrophonePermissionProvider = @MainActor @Sendable () -> Bool
+    typealias MicrophoneStarter = @MainActor @Sendable (URL, String?, Bool) async throws -> Void
+    typealias MicrophoneStopper = @MainActor @Sendable () throws -> URL
+    typealias MicrophoneRecordingProbe = @MainActor @Sendable () -> Bool
+    typealias SystemAudioStarter = @MainActor @Sendable (URL) async throws -> Void
+    typealias SystemAudioStopper = @MainActor @Sendable () async throws -> Void
+    typealias TextDeliverer = @MainActor @Sendable (String, FrontmostApplication?, TextDeliveryMode, String?) async throws -> Void
 
     enum Route: Hashable { case library, meetings, memos, dictionary, settings }
     struct PendingTextDelivery {
@@ -99,7 +105,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     let recorder = MicrophoneRecorder()
     private let systemAudioRecorder = SystemAudioRecorder()
-    private let library = LibraryStore.shared
+    private let library: LibraryStore
     private let cleanup = TextCleanupPipeline()
     private let selectionTransform = SelectionTransformPipeline()
     private let writingEnhancements = WritingEnhancementPipeline()
@@ -110,6 +116,12 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let wakeListenerFactory: WakeListenerFactory
     private let microphonePermissionProvider: MicrophonePermissionProvider
     private let modelDownloadDefaults: UserDefaults?
+    private let microphoneStarter: MicrophoneStarter?
+    private let microphoneStopper: MicrophoneStopper?
+    private let microphoneRecordingProbe: MicrophoneRecordingProbe?
+    private let systemAudioStarter: SystemAudioStarter?
+    private let systemAudioStopper: SystemAudioStopper?
+    private let textDeliverer: TextDeliverer
     private var transcriber: (any LocalTranscriber)?
     private var modelDownloadStateMachine = ModelDownloadStateMachine()
     private var modelDownloadOperation: LifecycleOperation?
@@ -148,6 +160,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var suppressDraftAutosave = false
     private var terminationCheckpointRecoveryID: UUID?
     private var isApplicationTerminationCheckpointing = false
+    private var terminationGeneration: UInt64 = 0
+    private var microphoneStartTask: Task<Void, Error>?
+    private var systemAudioStartTask: Task<Void, Error>?
+    private var deliveryTask: Task<Void, Error>?
+    private struct RecordCommitOperation {
+        var id: UInt64
+        var recoveryID: UUID?
+        var task: Task<WorkspaceRecord, Error>
+    }
+    private var recordCommitOperation: RecordCommitOperation?
+    private var recordCommitSequence: UInt64 = 0
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
     private enum PushToTalkEvent: Sendable {
@@ -168,6 +191,20 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private var captureLifecycle: CaptureLifecycle = .idle
+
+    var terminationWorkGeneration: UInt64 { terminationGeneration }
+
+    @discardableResult
+    func prepareForTerminationCheckpoint() -> UInt64 {
+        if !isApplicationTerminationCheckpointing {
+            isApplicationTerminationCheckpointing = true
+            terminationGeneration &+= 1
+        }
+        deliveryTask?.cancel()
+        hotMicStateMachine.disable()
+        publishHotMicState()
+        return terminationGeneration
+    }
 
     var captureShutdownPlan: CaptureShutdownPlan {
         let snapshot: CaptureLifecycleSnapshot
@@ -210,12 +247,33 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloaderFactory: @escaping ModelDownloaderFactory = { try TranscriberFactory.make($0) },
         wakeListenerFactory: @escaping WakeListenerFactory = { WakePhraseListener() },
         microphonePermissionProvider: @escaping MicrophonePermissionProvider = { MicrophoneRecorder.isPermissionGranted },
-        modelDownloadDefaults: UserDefaults? = .standard
+        modelDownloadDefaults: UserDefaults? = .standard,
+        library: LibraryStore = .shared,
+        microphoneStarter: MicrophoneStarter? = nil,
+        microphoneStopper: MicrophoneStopper? = nil,
+        microphoneRecordingProbe: MicrophoneRecordingProbe? = nil,
+        systemAudioStarter: SystemAudioStarter? = nil,
+        systemAudioStopper: SystemAudioStopper? = nil,
+        textDeliverer: @escaping TextDeliverer = { text, target, mode, expectedSelectedText in
+            try await TextDelivery.deliver(
+                text,
+                to: target,
+                mode: mode,
+                expectedSelectedText: expectedSelectedText
+            )
+        }
     ) {
         self.modelDownloaderFactory = modelDownloaderFactory
         self.wakeListenerFactory = wakeListenerFactory
         self.microphonePermissionProvider = microphonePermissionProvider
         self.modelDownloadDefaults = modelDownloadDefaults
+        self.library = library
+        self.microphoneStarter = microphoneStarter
+        self.microphoneStopper = microphoneStopper
+        self.microphoneRecordingProbe = microphoneRecordingProbe
+        self.systemAudioStarter = systemAudioStarter
+        self.systemAudioStopper = systemAudioStopper
+        self.textDeliverer = textDeliverer
         self.microphonePermissionGranted = microphonePermissionProvider()
         let webhookOutboxTransactions = WebhookOutboxTransactions()
         self.webhookOutboxTransactions = webhookOutboxTransactions
@@ -271,6 +329,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         shortcutTask = Task { @MainActor [weak self] in
             guard let self else { return }
             for await event in self.shortcutEvents {
+                guard !self.isApplicationTerminationCheckpointing else { continue }
                 switch event {
                 case .dictationDown:
                     guard !self.pushToTalkHeld else { continue }
@@ -679,7 +738,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func beginDictation() async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
         refreshPermissionState()
         if !microphonePermissionGranted {
             await requestMicrophonePermission()
@@ -710,7 +769,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func beginSelectionTransform() async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
         refreshPermissionState()
         if !microphonePermissionGranted {
             await requestMicrophonePermission()
@@ -743,7 +802,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func beginMeeting() async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
         if meetingDraftCaptureID != nil {
             statusMessage = "An interrupted meeting draft is still open. Recover or discard it before starting another meeting."
             route = .meetings
@@ -757,7 +816,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func beginMemo() async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
         activeApplication = nil
         activeKind = .memo
         activeOperation = .capture
@@ -766,6 +825,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func toggleHandsFreeDictation() async {
+        guard !isApplicationTerminationCheckpointing else { return }
         switch captureLifecycle {
         case .idle:
             await beginDictation()
@@ -783,7 +843,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func beginCapture(prefix: String) async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
+        terminationGeneration &+= 1
         let sessionID = UUID()
         captureLifecycle = .starting(sessionID)
         captureKind = activeKind
@@ -811,11 +872,25 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             let url = directory.appendingPathComponent("microphone.caf")
             activeAudioURL = url
             microphoneTrackStartedAt = .now
-            try await recorder.start(
-                at: url,
-                deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
-                lowLatency: settings.lowLatencyMode
-            )
+            let microphoneStarter = self.microphoneStarter
+            let microphoneStartTask = Task { @MainActor [recorder, settings] in
+                if let microphoneStarter {
+                    try await microphoneStarter(
+                        url,
+                        settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                        settings.lowLatencyMode
+                    )
+                } else {
+                    try await recorder.start(
+                        at: url,
+                        deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
+                        lowLatency: settings.lowLatencyMode
+                    )
+                }
+            }
+            self.microphoneStartTask = microphoneStartTask
+            try await microphoneStartTask.value
+            if self.microphoneStartTask != nil { self.microphoneStartTask = nil }
 
             guard captureLifecycle == .starting(sessionID) else {
                 await cleanUpCancelledStart(sessionID: sessionID)
@@ -827,7 +902,18 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 activeSystemAudioURL = systemURL
                 do {
                     systemTrackStartedAt = .now
-                    try await systemAudioRecorder.start(at: systemURL)
+                    let systemAudioStarter = self.systemAudioStarter
+                    let systemStartTask = Task { @MainActor [weak self, systemAudioRecorder] in
+                        if let systemAudioStarter {
+                            try await systemAudioStarter(systemURL)
+                        } else {
+                            try await systemAudioRecorder.start(at: systemURL)
+                        }
+                        self?.isSystemAudioActive = true
+                    }
+                    self.systemAudioStartTask = systemStartTask
+                    try await systemStartTask.value
+                    if self.systemAudioStartTask != nil { self.systemAudioStartTask = nil }
                     guard captureLifecycle == .starting(sessionID) else {
                         await cleanUpCancelledStart(sessionID: sessionID)
                         return
@@ -882,11 +968,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
 
         do {
-            let stoppedMicrophoneURL = try recorder.stop()
+            let stoppedMicrophoneURL = try stopMicrophone()
             activeAudioURL = stoppedMicrophoneURL
             if isSystemAudioActive {
                 do {
-                    try await systemAudioRecorder.stop()
+                    try await stopSystemAudio()
                 } catch {
                     statusMessage = "System audio ended unexpectedly; Evee will keep processing the microphone track. \(error.localizedDescription)"
                 }
@@ -989,6 +1075,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func cancelCapture() async {
+        guard !isApplicationTerminationCheckpointing else {
+            openCheckpointedRecovery()
+            return
+        }
         let sessionID: UUID
         switch captureLifecycle {
         case .idle:
@@ -1003,11 +1093,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         captureLifecycle = .cancelling(sessionID)
         stopRequestedDuringStart = nil
 
-        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
             activeAudioURL = stoppedURL
         }
         if isSystemAudioActive {
-            try? await systemAudioRecorder.stop()
+            try? await stopSystemAudio()
             isSystemAudioActive = false
         }
         if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
@@ -1069,19 +1159,28 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         )
         if activeKind == .meeting { record.segments = segments }
 
-        record = try await library.commitRecoveredRecord(
-            record,
-            recoveryID: activeRecoveryID,
-            keepAudio: keepAudio
-        )
+        guard !isApplicationTerminationCheckpointing else { return }
+        terminationGeneration &+= 1
+        recordCommitSequence &+= 1
+        let commitID = recordCommitSequence
+        let recoveryID = activeRecoveryID
+        let commitTask = Task { [library] in
+            try await library.commitRecoveredRecord(record, recoveryID: recoveryID, keepAudio: keepAudio)
+        }
+        recordCommitOperation = RecordCommitOperation(id: commitID, recoveryID: recoveryID, task: commitTask)
+        do {
+            record = try await commitTask.value
+        } catch {
+            if recordCommitOperation?.id == commitID { recordCommitOperation = nil }
+            throw error
+        }
+        acceptDurableRecord(record, commitID: commitID)
+        await refreshRecoverableCaptures()
 
-        guard captureLifecycle == .finishing(sessionID) else {
-            try? await library.delete(id: record.id)
+        guard !isApplicationTerminationCheckpointing else {
+            captureState = .checkpointed("Capture saved. Quit again to close Evee, or open Recovery to review it.")
             return
         }
-        records.insert(record, at: 0)
-        selectedRecordID = record.id
-        await refreshRecoverableCaptures()
 
         if recordKind == .dictation {
             captureState = .delivering
@@ -1094,7 +1193,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 expectedSelectedText: expectedSelection
             )
             do {
-                try await TextDelivery.deliver(
+                try await runTextDelivery(
                     polished,
                     to: activeApplication,
                     mode: mode,
@@ -1118,6 +1217,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
         if recordKind == .meeting { await clearMeetingDraft() }
         resetSession(state: .idle)
+        if recordCommitOperation?.id == commitID { recordCommitOperation = nil }
 
         if recordKind == .meeting,
            let destination = URL(string: settings.webhookURL),
@@ -1127,12 +1227,13 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func retryPendingTextDelivery() async {
+        guard !isApplicationTerminationCheckpointing else { return }
         guard let pendingDelivery, let target = pendingDelivery.target else {
             statusMessage = "The original destination is unavailable. Copy the text and paste it manually."
             return
         }
         do {
-            try await TextDelivery.deliver(
+            try await runTextDelivery(
                 pendingDelivery.text,
                 to: target,
                 mode: pendingDelivery.mode,
@@ -1144,6 +1245,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func copyPendingTextDelivery() {
+        guard !isApplicationTerminationCheckpointing else { return }
         guard let pendingDelivery else { return }
         do {
             try TextDelivery.copyToClipboard(pendingDelivery.text)
@@ -1152,12 +1254,64 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         } catch { statusMessage = error.localizedDescription }
     }
 
+    private func runTextDelivery(
+        _ text: String,
+        to target: FrontmostApplication?,
+        mode: TextDeliveryMode,
+        expectedSelectedText: String?
+    ) async throws {
+        guard !isApplicationTerminationCheckpointing else { throw CancellationError() }
+        terminationGeneration &+= 1
+        let textDeliverer = self.textDeliverer
+        let task = Task { @MainActor in
+            try await textDeliverer(text, target, mode, expectedSelectedText)
+        }
+        deliveryTask = task
+        defer { deliveryTask = nil }
+        try await task.value
+    }
+
+    private var isMicrophoneRecording: Bool {
+        microphoneRecordingProbe?() ?? recorder.isRecording
+    }
+
+    private func stopMicrophone() throws -> URL {
+        if let microphoneStopper { return try microphoneStopper() }
+        return try recorder.stop()
+    }
+
+    private func stopSystemAudio() async throws {
+        if let systemAudioStopper {
+            try await systemAudioStopper()
+        } else {
+            try await systemAudioRecorder.stop()
+        }
+    }
+
+    private func acceptDurableRecord(_ record: WorkspaceRecord, commitID: UInt64) {
+        if !records.contains(where: { $0.id == record.id }) {
+            records.insert(record, at: 0)
+        }
+        selectedRecordID = record.id
+        if recordCommitOperation?.id == commitID {
+            activeRecoveryID = nil
+            activeRecoveryDirectory = nil
+            terminationCheckpointRecoveryID = nil
+        }
+    }
+
+    func openCheckpointedRecovery() {
+        route = activeKind == .meeting ? .meetings : .library
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first(where: { !($0 is NSPanel) })?.makeKeyAndOrderFront(nil)
+    }
+
     private func cleanUpCancelledStart(sessionID: UUID) async {
         let preservesRecovery = terminationCheckpointRecoveryID == sessionID
-        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
             activeAudioURL = stoppedURL
         }
-        try? await systemAudioRecorder.stop()
+        try? await stopSystemAudio()
         isSystemAudioActive = false
         if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         if preservesRecovery { return }
@@ -1170,10 +1324,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func failSession(sessionID: UUID, error: Error, preserveRecoveryAudio: Bool) async {
-        if recorder.isRecording, let stoppedURL = try? recorder.stop() {
+        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
             activeAudioURL = stoppedURL
         }
-        try? await systemAudioRecorder.stop()
+        try? await stopSystemAudio()
         if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         isSystemAudioActive = false
 
@@ -1432,6 +1586,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     func updateHotMicState() async {
         let phrase = settings.wakePhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isApplicationTerminationCheckpointing else {
+            await stopHotMic()
+            return
+        }
         guard settings.hotMicEnabled else {
             await stopHotMic()
             return
@@ -1517,7 +1675,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func hotMicStartIsCurrent(_ operation: LifecycleOperation, phrase: String) -> Bool {
-        settings.hotMicEnabled
+        !isApplicationTerminationCheckpointing
+            && settings.hotMicEnabled
             && settings.model == .parakeet
             && settings.wakePhrase.trimmingCharacters(in: .whitespacesAndNewlines) == phrase
             && captureLifecycle == .idle
@@ -1525,7 +1684,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func handleWakePhrase(listener: any WakePhraseListening) async {
-        guard hotMicState == .active, settings.hotMicEnabled, captureLifecycle == .idle else { return }
+        guard !isApplicationTerminationCheckpointing,
+              hotMicState == .active,
+              settings.hotMicEnabled,
+              captureLifecycle == .idle else { return }
         hotMicStateMachine.disable()
         publishHotMicState()
         hotMicTranscriptTask = nil
@@ -2030,13 +2192,41 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         invalidateForApplicationTermination(plan: plan)
 
         do {
+            if let deliveryTask {
+                deliveryTask.cancel()
+                _ = try? await deliveryTask.value
+                if self.deliveryTask != nil { self.deliveryTask = nil }
+            }
+            if let microphoneStartTask {
+                _ = try? await microphoneStartTask.value
+                if self.microphoneStartTask != nil { self.microphoneStartTask = nil }
+            }
+            if let systemAudioStartTask {
+                _ = try? await systemAudioStartTask.value
+                if self.systemAudioStartTask != nil { self.systemAudioStartTask = nil }
+            }
+
+            var durableCommitWon = false
+            if let operation = recordCommitOperation {
+                do {
+                    let record = try await operation.task.value
+                    acceptDurableRecord(record, commitID: operation.id)
+                    durableCommitWon = true
+                    recordCommitOperation = nil
+                } catch {
+                    if recordCommitOperation?.id == operation.id {
+                        recordCommitOperation = nil
+                    }
+                }
+            }
+
             await stopHotMic()
             api.stop()
             localAPICredentials = nil
 
-            if recorder.isRecording {
+            if isMicrophoneRecording {
                 do {
-                    activeAudioURL = try recorder.stop()
+                    activeAudioURL = try stopMicrophone()
                 } catch {
                     guard activeAudioURL.map({ FileManager.default.fileExists(atPath: $0.path) }) == true else {
                         throw error
@@ -2045,7 +2235,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
             if isSystemAudioActive {
                 do {
-                    try await systemAudioRecorder.stop()
+                    try await stopSystemAudio()
                 } catch {
                     statusMessage = "System audio could not be finalised cleanly. Evee will checkpoint the microphone track and retain any system-audio prefix for recovery. \(error.localizedDescription)"
                 }
@@ -2063,7 +2253,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             case .stopWritersAndCheckpoint(let kind, let recoveryID):
                 try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: kind)
             case .awaitDurableCommitOrCheckpoint(let recoveryID):
-                try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: activeKind)
+                if !durableCommitWon {
+                    try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: activeKind)
+                }
             case .awaitCancellationCleanup:
                 removeActiveRecoveryFiles()
                 if activeKind == .meeting {
@@ -2079,6 +2271,13 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
             try await persistWebhookOutboxTerminationCancellation()
             await refreshRecoverableCaptures()
+            if plan != .terminateImmediately {
+                captureState = .checkpointed(
+                    durableCommitWon
+                        ? "Capture saved. Quit again to close Evee, or open it to review the record."
+                        : "Capture checkpointed for recovery. Quit again to close Evee, or open Recovery to review it."
+                )
+            }
         } catch {
             if let recoveryID = terminationCheckpointRecoveryID ?? activeRecoveryID {
                 try? await library.updateRecoveryCapture(
@@ -2087,7 +2286,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     failureReason: error.localizedDescription
                 )
             }
-            captureState = .failed("Quit checkpoint failed: \(error.localizedDescription)")
+            captureState = .checkpointed("Recovery checkpoint needs attention: \(error.localizedDescription)")
             statusMessage = "Quit was cancelled because Evee could not finish the recovery checkpoint. The app stayed open and retained any completed audio. Check available disk space and permissions, then quit again. \(error.localizedDescription)"
             await refreshRecoverableCaptures()
             throw error

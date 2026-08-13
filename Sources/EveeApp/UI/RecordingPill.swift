@@ -76,6 +76,12 @@ struct RecordingPill: View {
             }
             .frame(width: 28, height: 28)
             .accessibilityHidden(true)
+        case .checkpointed:
+            Image(systemName: "checkmark.shield.fill")
+                .foregroundStyle(.green)
+                .font(.system(size: 18, weight: .semibold))
+                .frame(width: 28)
+                .accessibilityHidden(true)
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -97,6 +103,7 @@ struct RecordingPill: View {
         case .recording: operation == .selectionTransform ? "Recording transform instruction" : "Recording"
         case .transcribing: "Transcribing locally"
         case .delivering: operation == .selectionTransform ? "Replacing selected text" : "Inserting text"
+        case .checkpointed: "Capture protected"
         case .failed: "Capture needs attention"
         }
     }
@@ -112,6 +119,7 @@ struct RecordingPill: View {
             : "Started \(startedAt.formatted(date: .omitted, time: .standard)) · audio stays on this Mac"
         case .transcribing: "You can keep working while Evee processes the audio"
         case .delivering: operation == .selectionTransform ? "Verifying the original selection before replacement" : "Sending the finished text to your active app"
+        case .checkpointed(let message): message
         case .failed(let message): message
         }
     }
@@ -126,6 +134,7 @@ struct RecordingPill: View {
             : "Evee is recording. Use Stop to transcribe or Discard to delete the recording."
         case .transcribing: "Evee is transcribing locally."
         case .delivering: operation == .selectionTransform ? "Evee is verifying and replacing the selected text." : "Evee is inserting the finished text."
+        case .checkpointed(let message): "Evee protected this capture for recovery. \(message)"
         case .failed(let message): "Evee capture failed. \(message)"
         case .idle: "Evee is ready."
         }

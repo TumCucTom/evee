@@ -46,6 +46,17 @@ struct MenuBarView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(3)
                 Button("Open Evee", action: showMainWindow)
+            case .checkpointed(let message):
+                Label(message, systemImage: "checkmark.shield.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .lineLimit(3)
+                HStack {
+                    Button("Open Recovery") {
+                        store.openCheckpointedRecovery()
+                    }
+                    Button("Retry Quit") { NSApp.terminate(nil) }
+                }
             case .idle:
                 Button("Start dictation") { Task { await store.beginDictation() } }
                     .buttonStyle(.borderedProminent)
@@ -83,6 +94,7 @@ struct MenuBarView: View {
         case .recording: "Recording"
         case .transcribing: "Transcribing"
         case .delivering: "Inserting"
+        case .checkpointed: "Protected"
         case .failed: "Error"
         }
     }
@@ -93,6 +105,7 @@ struct MenuBarView: View {
         case .starting: "waveform.circle"
         case .recording: "record.circle"
         case .transcribing, .delivering: "ellipsis.circle"
+        case .checkpointed: "checkmark.shield.fill"
         case .failed: "exclamationmark.triangle.fill"
         }
     }
@@ -102,6 +115,7 @@ struct MenuBarView: View {
         case .idle: .green
         case .starting: .secondary
         case .recording: .red
+        case .checkpointed: .green
         case .failed: .orange
         default: .secondary
         }

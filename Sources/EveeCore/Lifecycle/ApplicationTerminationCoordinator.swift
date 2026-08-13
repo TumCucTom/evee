@@ -24,6 +24,14 @@ public struct ApplicationTerminationPlanError: LocalizedError, Sendable {
     public var errorDescription: String? { message }
 }
 
+public struct ApplicationTerminationWorkChangedError: LocalizedError, Sendable {
+    public init() {}
+
+    public var errorDescription: String? {
+        "Evee detected new capture work while saving for quit. The app stayed open; quit again after the current recovery checkpoint finishes."
+    }
+}
+
 /// The single owner of an AppKit termination reply. Durability continues after
 /// a deadline so a late file/manifest write is preserved, while the expired
 /// reply operation can never answer AppKit a second time.
@@ -37,6 +45,7 @@ public final class ApplicationTerminationCoordinator {
     private var durabilityOwner: ObjectIdentifier?
     private var retryFailedDurability = false
     private var durabilitySucceeded = false
+    private var checkpointedGeneration: UInt64?
 
     public init(deadline: Duration = .seconds(15)) {
         self.deadline = deadline
@@ -63,7 +72,8 @@ public final class ApplicationTerminationCoordinator {
             break
         }
 
-        if durabilitySucceeded { return .terminateNow }
+        let preparedGeneration = checkpoint.prepareForTerminationCheckpoint()
+        if durabilitySucceeded, checkpointedGeneration == preparedGeneration { return .terminateNow }
         if replyOperation != nil { return .terminateLater }
 
         let owner = ObjectIdentifier(checkpoint)
@@ -72,11 +82,13 @@ public final class ApplicationTerminationCoordinator {
             durability = TerminationCheckpointCoordinator(checkpointer: checkpoint)
             retryFailedDurability = false
             durabilitySucceeded = false
+            checkpointedGeneration = nil
         }
         guard let durability else { return .terminateCancel }
 
         sequence &+= 1
         let operationID = sequence
+        let operationGeneration = preparedGeneration
         replyOperation = operationID
         let retry = retryFailedDurability
         retryFailedDurability = false
@@ -90,6 +102,8 @@ public final class ApplicationTerminationCoordinator {
                 }
                 self?.finish(
                     operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    currentGeneration: checkpoint.terminationWorkGeneration,
                     result: .success(()),
                     reply: reply,
                     reportFailure: reportFailure
@@ -97,6 +111,8 @@ public final class ApplicationTerminationCoordinator {
             } catch {
                 self?.finish(
                     operationID: operationID,
+                    operationGeneration: operationGeneration,
+                    currentGeneration: checkpoint.terminationWorkGeneration,
                     result: .failure(error),
                     reply: reply,
                     reportFailure: reportFailure
@@ -132,22 +148,30 @@ public final class ApplicationTerminationCoordinator {
 
     private func finish(
         operationID: UInt64,
+        operationGeneration: UInt64,
+        currentGeneration: UInt64,
         result: Result<Void, Error>,
         reply: @escaping @MainActor (Bool) -> Void,
         reportFailure: @escaping @MainActor (Error) -> Void
     ) {
+        let validatedResult: Result<Void, Error>
         switch result {
         case .success:
-            durabilitySucceeded = true
+            durabilitySucceeded = operationGeneration == currentGeneration
+            checkpointedGeneration = durabilitySucceeded ? operationGeneration : nil
+            validatedResult = durabilitySucceeded
+                ? .success(())
+                : .failure(ApplicationTerminationWorkChangedError())
         case .failure:
             retryFailedDurability = true
+            validatedResult = result
         }
 
         guard replyOperation == operationID else { return }
         replyOperation = nil
         deadlineTask?.cancel()
         deadlineTask = nil
-        switch result {
+        switch validatedResult {
         case .success:
             reply(true)
         case .failure(let error):

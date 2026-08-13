@@ -598,5 +598,6 @@ public enum CaptureState: Equatable, Sendable {
     case recording(startedAt: Date, level: Float)
     case transcribing
     case delivering
+    case checkpointed(String)
     case failed(String)
 }

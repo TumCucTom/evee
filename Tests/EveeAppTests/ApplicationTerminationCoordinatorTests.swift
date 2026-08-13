@@ -80,6 +80,57 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         XCTAssertTrue(replies.values.isEmpty)
     }
 
+    func testDeadlineCompletionCannotBeReusedAfterNewWorkStarts() async {
+        let checkpoint = GenerationCaptureCheckpointer()
+        let firstReplies = TerminationReplySink()
+        let coordinator = ApplicationTerminationCoordinator(deadline: .milliseconds(20))
+
+        XCTAssertEqual(coordinator.requestTermination(
+            plan: .invalidateDeliveryAndAwaitCommit,
+            checkpoint: checkpoint,
+            reply: firstReplies.reply,
+            reportFailure: { _ in }
+        ), .terminateLater)
+        await checkpoint.waitUntilCalled()
+        await waitUntil { firstReplies.values == [false] }
+        checkpoint.succeed()
+        await waitUntil { checkpoint.callCount == 1 }
+
+        checkpoint.beginNewWork()
+        let secondReplies = TerminationReplySink()
+        XCTAssertEqual(coordinator.requestTermination(
+            plan: .invalidateDeliveryAndAwaitCommit,
+            checkpoint: checkpoint,
+            reply: secondReplies.reply,
+            reportFailure: { _ in }
+        ), .terminateLater)
+        await checkpoint.waitUntilCalled(count: 2)
+        XCTAssertEqual(checkpoint.callCount, 2)
+        checkpoint.succeed()
+        await waitUntil { secondReplies.values == [true] }
+    }
+
+    func testWorkStartingWhileCheckpointSuspendedCancelsTermination() async {
+        let checkpoint = GenerationCaptureCheckpointer()
+        let replies = TerminationReplySink()
+        let failures = FailureSink()
+        let coordinator = ApplicationTerminationCoordinator(deadline: .seconds(1))
+
+        XCTAssertEqual(coordinator.requestTermination(
+            plan: .invalidateDeliveryAndAwaitCommit,
+            checkpoint: checkpoint,
+            reply: replies.reply,
+            reportFailure: failures.report
+        ), .terminateLater)
+        await checkpoint.waitUntilCalled()
+        checkpoint.beginNewWork()
+        checkpoint.succeed()
+        await waitUntil { !replies.values.isEmpty }
+
+        XCTAssertEqual(replies.values, [false])
+        XCTAssertEqual(failures.count, 1)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool
@@ -113,6 +164,36 @@ private final class FailingCaptureCheckpointer: CaptureCheckpointing {
     func checkpointForTermination() async throws {
         callCount += 1
         throw SyntheticApplicationTerminationError.persistenceFailed
+    }
+}
+
+@MainActor
+private final class GenerationCaptureCheckpointer: CaptureCheckpointing {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private(set) var callCount = 0
+    private(set) var terminationWorkGeneration: UInt64 = 0
+
+    func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
+
+    func checkpointForTermination() async throws {
+        callCount += 1
+        let ready = waiters.filter { callCount >= $0.0 }
+        waiters.removeAll { callCount >= $0.0 }
+        ready.forEach { $0.1.resume() }
+        try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    func beginNewWork() { terminationWorkGeneration &+= 1 }
+
+    func waitUntilCalled(count: Int = 1) async {
+        guard callCount < count else { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+
+    func succeed() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

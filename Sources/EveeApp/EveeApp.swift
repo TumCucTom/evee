@@ -191,6 +191,8 @@ private final class CaptureOverlayController {
             message = store?.captureOperation == .selectionTransform
                 ? "Evee is verifying and replacing the selected text."
                 : "Evee is verifying and inserting the finished text."
+        case .checkpointed(let detail):
+            message = "Evee protected the capture for recovery. \(detail)"
         case .failed(let detail):
             message = "Evee capture failed. \(detail)"
         }
@@ -237,7 +239,7 @@ private final class CaptureOverlayController {
 }
 
 private enum CaptureAnnouncementState: Equatable {
-    case idle, starting, recording, transcribing, delivering, deliveringSelection, failed(String)
+    case idle, starting, recording, transcribing, delivering, deliveringSelection, checkpointed(String), failed(String)
 
     init(_ state: CaptureState, isSelectionTransform: Bool) {
         switch state {
@@ -246,6 +248,7 @@ private enum CaptureAnnouncementState: Equatable {
         case .recording: self = .recording
         case .transcribing: self = .transcribing
         case .delivering: self = isSelectionTransform ? .deliveringSelection : .delivering
+        case .checkpointed(let detail): self = .checkpointed(detail)
         case .failed(let detail): self = .failed(detail)
         }
     }

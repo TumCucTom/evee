@@ -40,6 +40,7 @@ enum CaptureAudioCuePlayer {
         case .starting: .starting
         case .recording: .recording
         case .transcribing, .delivering: .processing
+        case .checkpointed: .idle
         case .failed: .failed
         }
     }
