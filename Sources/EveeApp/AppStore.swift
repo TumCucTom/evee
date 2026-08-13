@@ -92,10 +92,11 @@ final class AppStore: ObservableObject {
     private var meetingDraftCaptureID: UUID?
     private var didBootstrap = false
     private var webhookRetryTask: Task<Void, Never>?
-    private let webhookOutboxCoordinator = WebhookOutboxCoordinator()
-    private var webhookDispatchEpoch: UInt64 = 0
+    private let webhookOutboxTransactions: WebhookOutboxTransactions
+    private let webhookOutboxCoordinator: WebhookOutboxCoordinator
     private var configuredWebhookDestination: String?
     private var terminationObserver: NSObjectProtocol?
+    private var pendingWebhookTerminationRecords: [WorkspaceRecord] = []
     private var liveMeetingTranscriber: LiveMeetingTranscriber?
     private var liveMeetingUpdateTask: Task<Void, Never>?
     private var microphoneHealthTask: Task<Void, Never>?
@@ -125,6 +126,9 @@ final class AppStore: ObservableObject {
     private var captureLifecycle: CaptureLifecycle = .idle
 
     init() {
+        let webhookOutboxTransactions = WebhookOutboxTransactions()
+        self.webhookOutboxTransactions = webhookOutboxTransactions
+        self.webhookOutboxCoordinator = WebhookOutboxCoordinator(transactions: webhookOutboxTransactions)
         let eventPair = AsyncStream<PushToTalkEvent>.makeStream()
         shortcutEvents = eventPair.stream
         shortcutContinuation = eventPair.continuation
@@ -209,7 +213,9 @@ final class AppStore: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in await self?.cancelWebhookOutbox() }
+            MainActor.assumeIsolated {
+                self?.invalidateWebhookOutboxForTermination()
+            }
         }
     }
 
@@ -1318,45 +1324,77 @@ final class AppStore: ObservableObject {
     }
 
     private func enqueueAndDeliverWebhook(record: WorkspaceRecord, destination: URL) async {
+        let preparation = webhookOutboxTransactions.beginPreparation()
         var queued = record
+        let delivery: WebhookDelivery
         do {
-            let delivery = WebhookDelivery(
+            delivery = WebhookDelivery(
                 destination: destination.absoluteString,
                 payloadBody: try MeetingWebhook.payload(for: record)
             )
-            queued.webhookDeliveries.append(delivery)
-            try await library.upsert(queued)
-            replaceRecord(queued)
-            await deliverWebhook(recordID: queued.id, deliveryID: delivery.id)
         } catch {
+            webhookOutboxTransactions.abandon(preparation)
             statusMessage = "The meeting was saved, but its webhook could not be queued: \(error.localizedDescription)"
+            return
+        }
+        queued.webhookDeliveries.append(delivery)
+        let transaction = await persistWebhookPreparation(preparation, records: [queued])
+        switch transaction.decision {
+        case .commit:
+            guard transaction.preparation.didPersist(recordID: queued.id) else {
+                statusMessage = WebhookOutboxPersistenceBatchError(failures: transaction.preparation.failures).localizedDescription
+                return
+            }
+            replaceRecord(queued)
+            await deliverWebhook(
+                recordID: queued.id,
+                deliveryID: delivery.id,
+                requiringGeneration: preparation.generation
+            )
+        case .cancel(let cancelledRecords):
+            replaceWebhookRecords(cancelledRecords)
+            if let cancellation = transaction.cancellation, !cancellation.failures.isEmpty {
+                statusMessage = WebhookOutboxPersistenceBatchError(failures: cancellation.failures).localizedDescription
+            }
         }
     }
 
-    private func deliverWebhook(recordID: UUID, deliveryID: UUID) async {
-        let epoch = webhookDispatchEpoch
+    private func deliverWebhook(
+        recordID: UUID,
+        deliveryID: UUID,
+        requiringGeneration generation: UInt64? = nil
+    ) async {
         guard normalizedWebhookDestination(settings.webhookURL) != nil else { return }
-        let token = await webhookOutboxCoordinator.begin(deliveryID: deliveryID)
-        guard epoch == webhookDispatchEpoch,
-              normalizedWebhookDestination(settings.webhookURL) != nil else {
+        let token: WebhookDispatchToken?
+        if let generation {
+            token = await webhookOutboxCoordinator.begin(
+                deliveryID: deliveryID,
+                requiringGeneration: generation
+            )
+        } else {
+            token = await webhookOutboxCoordinator.begin(deliveryID: deliveryID)
+        }
+        guard let token, normalizedWebhookDestination(settings.webhookURL) != nil else {
+            if let token { await webhookOutboxCoordinator.finish(token) }
+            return
+        }
+        guard webhookOutboxTransactions.mayCommit(token) else {
             await webhookOutboxCoordinator.finish(token)
             return
         }
         let coordinator = webhookOutboxCoordinator
-        let task = Task { @MainActor [weak self] in
+        let task = webhookOutboxTransactions.startTask(for: token) { @MainActor [weak self] in
             if let self {
-                await self.performWebhookDelivery(recordID: recordID, token: token, epoch: epoch)
+                await self.performWebhookDelivery(recordID: recordID, token: token)
             }
             await coordinator.finish(token)
         }
-        await webhookOutboxCoordinator.register(task, for: token)
         await task.value
     }
 
-    private func performWebhookDelivery(recordID: UUID, token: WebhookDispatchToken, epoch: UInt64) async {
+    private func performWebhookDelivery(recordID: UUID, token: WebhookDispatchToken) async {
         do {
-            let active = await webhookOutboxCoordinator.mayCommit(token)
-            guard active, epoch == webhookDispatchEpoch,
+            guard webhookOutboxTransactions.mayCommit(token),
                   let record = records.first(where: { $0.id == recordID }),
                   let index = record.webhookDeliveries.firstIndex(where: { $0.id == token.deliveryID }) else { return }
             let existing = record.webhookDeliveries[index]
@@ -1375,9 +1413,9 @@ final class AppStore: ObservableObject {
                 payloadBody: payloadBody,
                 startingAttemptCount: existing.attemptCount
             )
-            await persistWebhookReceipt(recordID: recordID, token: token, epoch: epoch, receipt: receipt)
+            await persistWebhookReceipt(recordID: recordID, token: token, receipt: receipt)
         } catch let failure as WebhookDeliveryFailure {
-            await persistWebhookFailure(recordID: recordID, token: token, epoch: epoch, delivery: failure.delivery)
+            await persistWebhookFailure(recordID: recordID, token: token, delivery: failure.delivery)
         } catch {
             var failure = WebhookDelivery(id: token.deliveryID, destination: "", state: .failed, attemptCount: 1, lastAttemptAt: .now, lastError: error.localizedDescription)
             if let record = records.first(where: { $0.id == recordID }),
@@ -1390,18 +1428,16 @@ final class AppStore: ObservableObject {
                 failure.retryable = true
                 failure.nextAttemptAt = .now.addingTimeInterval(60)
             }
-            await persistWebhookFailure(recordID: recordID, token: token, epoch: epoch, delivery: failure)
+            await persistWebhookFailure(recordID: recordID, token: token, delivery: failure)
         }
     }
 
     private func persistWebhookReceipt(
         recordID: UUID,
         token: WebhookDispatchToken,
-        epoch: UInt64,
         receipt: WebhookDeliveryReceipt
     ) async {
-        let active = await webhookOutboxCoordinator.mayCommit(token)
-        guard active, epoch == webhookDispatchEpoch,
+        guard webhookOutboxTransactions.mayCommit(token),
               let recordIndex = records.firstIndex(where: { $0.id == recordID }),
               let deliveryIndex = records[recordIndex].webhookDeliveries.firstIndex(where: { $0.id == token.deliveryID }) else { return }
         records[recordIndex].webhookDeliveries[deliveryIndex].state = .delivered
@@ -1418,7 +1454,7 @@ final class AppStore: ObservableObject {
         do {
             try await library.upsert(updated)
         } catch {
-            if epoch == webhookDispatchEpoch {
+            if webhookOutboxTransactions.mayCommit(token) {
                 statusMessage = "Webhook delivery completed, but its outbox state could not be saved: \(error.localizedDescription)"
             }
         }
@@ -1427,11 +1463,9 @@ final class AppStore: ObservableObject {
     private func persistWebhookFailure(
         recordID: UUID,
         token: WebhookDispatchToken,
-        epoch: UInt64,
         delivery: WebhookDelivery
     ) async {
-        let active = await webhookOutboxCoordinator.mayCommit(token)
-        guard active, epoch == webhookDispatchEpoch,
+        guard webhookOutboxTransactions.mayCommit(token),
               let recordIndex = records.firstIndex(where: { $0.id == recordID }),
               let deliveryIndex = records[recordIndex].webhookDeliveries.firstIndex(where: { $0.id == delivery.id }) else { return }
         var storedDelivery = delivery
@@ -1441,17 +1475,19 @@ final class AppStore: ObservableObject {
         let updated = records[recordIndex]
         do {
             try await library.upsert(updated)
-            guard epoch == webhookDispatchEpoch else { return }
+            guard webhookOutboxTransactions.mayCommit(token) else { return }
             statusMessage = "The meeting was saved. Its webhook remains in the delivery outbox: \(delivery.lastError ?? "Delivery failed.")"
             scheduleWebhookRetry()
         } catch {
-            guard epoch == webhookDispatchEpoch else { return }
+            guard webhookOutboxTransactions.mayCommit(token) else { return }
             statusMessage = "Webhook delivery failed and its outbox state could not be saved: \(error.localizedDescription)"
         }
     }
 
     private func retryPendingWebhookDeliveries() async {
         guard normalizedWebhookDestination(settings.webhookURL) != nil else { return }
+        let operation = webhookOutboxTransactions.beginPreparation()
+        defer { webhookOutboxTransactions.abandon(operation) }
         let now = Date.now
         let queued = records.flatMap { record in
             record.webhookDeliveries.filter {
@@ -1459,7 +1495,12 @@ final class AppStore: ObservableObject {
             }.map { (record.id, $0.id) }
         }
         for (recordID, deliveryID) in queued {
-            await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
+            guard !Task.isCancelled else { return }
+            await deliverWebhook(
+                recordID: recordID,
+                deliveryID: deliveryID,
+                requiringGeneration: operation.generation
+            )
         }
         scheduleWebhookRetry()
     }
@@ -1541,68 +1582,116 @@ final class AppStore: ObservableObject {
     }
 
     func retryWebhookDeliveriesNow() async {
-        var queued: [(UUID, UUID)] = []
         do {
             guard let configured = normalizedWebhookDestination(settings.webhookURL),
                   let destination = URL(string: configured) else { throw WebhookEndpointError.invalidURL }
             try WebhookEndpointPolicy.validate(destination)
-            let snapshot = records
-            for var record in snapshot {
-                var changed = false
-                for index in record.webhookDeliveries.indices where
-                    record.webhookDeliveries[index].retryable &&
-                    (record.webhookDeliveries[index].state == .pending || record.webhookDeliveries[index].state == .failed) &&
-                    record.webhookDeliveries[index].destination == configured {
-                    record.webhookDeliveries[index].state = .pending
-                    record.webhookDeliveries[index].nextAttemptAt = nil
-                    changed = true
-                    queued.append((record.id, record.webhookDeliveries[index].id))
+            let token = webhookOutboxTransactions.beginPreparation()
+            let preparation = webhookOutboxTransactions.prepareManualRetry(
+                records: records,
+                destination: configured
+            )
+            let transaction = await persistWebhookPreparation(token, records: preparation.records)
+            switch transaction.decision {
+            case .commit(let preparedRecords):
+                let persistedRecords = preparedRecords.filter {
+                    transaction.preparation.didPersist(recordID: $0.id)
                 }
-                if changed {
-                    record.updatedAt = .now
-                    try await library.upsert(record)
-                    replaceRecord(record)
+                replaceWebhookRecords(persistedRecords)
+                let persistedIDs = Set(transaction.preparation.persistedRecordIDs)
+                let queued = preparation.deliveries.filter { persistedIDs.contains($0.recordID) }
+                for delivery in queued {
+                    await deliverWebhook(
+                        recordID: delivery.recordID,
+                        deliveryID: delivery.deliveryID,
+                        requiringGeneration: token.generation
+                    )
+                }
+                if queued.isEmpty && transaction.preparation.failures.isEmpty {
+                    statusMessage = "The webhook outbox is already clear."
+                } else if !transaction.preparation.failures.isEmpty {
+                    statusMessage = WebhookOutboxPersistenceBatchError(
+                        failures: transaction.preparation.failures
+                    ).localizedDescription
+                }
+            case .cancel(let cancelledRecords):
+                replaceWebhookRecords(cancelledRecords)
+                if let cancellation = transaction.cancellation, !cancellation.failures.isEmpty {
+                    statusMessage = WebhookOutboxPersistenceBatchError(
+                        failures: cancellation.failures
+                    ).localizedDescription
                 }
             }
-            for (recordID, deliveryID) in queued {
-                await deliverWebhook(recordID: recordID, deliveryID: deliveryID)
-            }
-            if queued.isEmpty { statusMessage = "The webhook outbox is already clear." }
         } catch {
             statusMessage = "The webhook outbox could not be retried: \(error.localizedDescription)"
         }
     }
 
     func cancelWebhookOutbox() async {
+        let cancelledRecords = invalidateWebhookOutbox()
+        let persistence = await persistWebhookRecords(cancelledRecords)
+        if !persistence.failures.isEmpty {
+            statusMessage = WebhookOutboxPersistenceBatchError(failures: persistence.failures).localizedDescription
+        }
+    }
+
+    /// Task 5's terminate-later checkpoint calls this after synchronous
+    /// invalidation. The notification observer deliberately does not launch or
+    /// claim completion of this durable phase.
+    func persistWebhookOutboxTerminationCancellation() async throws {
+        let pending = pendingWebhookTerminationRecords
+        let persistence = await persistWebhookRecords(pending)
+        let failedIDs = Set(persistence.failures.map(\.recordID))
+        pendingWebhookTerminationRecords = pending.filter { failedIDs.contains($0.id) }
+        guard persistence.failures.isEmpty else {
+            throw WebhookOutboxPersistenceBatchError(failures: persistence.failures)
+        }
+    }
+
+    private func invalidateWebhookOutboxForTermination() {
+        pendingWebhookTerminationRecords = mergeWebhookRecords(
+            pendingWebhookTerminationRecords,
+            replacingWith: invalidateWebhookOutbox()
+        )
+    }
+
+    private func invalidateWebhookOutbox() -> [WorkspaceRecord] {
         webhookRetryTask?.cancel()
         webhookRetryTask = nil
-        webhookDispatchEpoch &+= 1
-        _ = await webhookOutboxCoordinator.cancelAll()
-        var changedRecords: [WorkspaceRecord] = []
-        for recordIndex in records.indices {
-            var changed = false
-            for deliveryIndex in records[recordIndex].webhookDeliveries.indices where
-                records[recordIndex].webhookDeliveries[deliveryIndex].state == .pending ||
-                records[recordIndex].webhookDeliveries[deliveryIndex].state == .failed {
-                records[recordIndex].webhookDeliveries[deliveryIndex].state = .cancelled
-                records[recordIndex].webhookDeliveries[deliveryIndex].retryable = false
-                records[recordIndex].webhookDeliveries[deliveryIndex].nextAttemptAt = nil
-                records[recordIndex].webhookDeliveries[deliveryIndex].payloadBody = nil
-                records[recordIndex].webhookDeliveries[deliveryIndex].lastError = "Webhook delivery was cancelled."
-                changed = true
-            }
-            if changed {
-                records[recordIndex].updatedAt = .now
-                changedRecords.append(records[recordIndex])
-            }
+        _ = webhookOutboxCoordinator.invalidateSynchronously()
+        let cancelledRecords = webhookOutboxTransactions.terminallyCancelledRecords(records)
+        replaceWebhookRecords(cancelledRecords)
+        return cancelledRecords
+    }
+
+    private func persistWebhookRecords(_ records: [WorkspaceRecord]) async -> WebhookOutboxPersistenceResult {
+        await webhookOutboxTransactions.persistAll(records) { [library] record in
+            try await library.upsert(record)
         }
-        do {
-            for record in changedRecords {
-                try await library.upsert(record)
-            }
-        } catch {
-            statusMessage = "The webhook outbox could not be cancelled: \(error.localizedDescription)"
+    }
+
+    private func persistWebhookPreparation(
+        _ token: WebhookOutboxPreparationToken,
+        records: [WorkspaceRecord]
+    ) async -> WebhookOutboxPreparationPersistence {
+        await webhookOutboxTransactions.persistPreparation(token, records: records) { [library] record in
+            try await library.upsert(record)
         }
+    }
+
+    private func replaceWebhookRecords(_ replacements: [WorkspaceRecord]) {
+        for record in replacements {
+            replaceRecord(record)
+        }
+    }
+
+    private func mergeWebhookRecords(
+        _ existing: [WorkspaceRecord],
+        replacingWith replacements: [WorkspaceRecord]
+    ) -> [WorkspaceRecord] {
+        var recordsByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        for record in replacements { recordsByID[record.id] = record }
+        return recordsByID.values.sorted { $0.id.uuidString < $1.id.uuidString }
     }
 
     private func normalizedWebhookDestination(_ value: String) -> String? {

@@ -75,6 +75,124 @@ private final class SuspendedWebhookURLProtocol: URLProtocol, @unchecked Sendabl
 }
 
 final class WebhookOutboxTests: XCTestCase {
+    func testQueuePersistenceInvalidatedBeforeFinalizeBecomesTerminal() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let transactions = WebhookOutboxTransactions()
+        var record = WorkspaceRecord(kind: .meeting, title: "Queue race", text: "Synthetic")
+        let delivery = WebhookDelivery(
+            destination: "https://example.invalid/webhook",
+            payloadBody: Data("{\"queued\":true}".utf8)
+        )
+        record.webhookDeliveries = [delivery]
+        let token = transactions.beginPreparation()
+        let attempts = LockedValues<UUID>()
+
+        let transaction = await transactions.persistPreparation(token, records: [record]) { proposed in
+            attempts.append(proposed.id)
+            try await store.upsert(proposed)
+            if attempts.values.count == 1 { _ = transactions.invalidate() }
+        }
+        guard case .cancel = transaction.decision else {
+            return XCTFail("Invalidated queue preparation committed")
+        }
+
+        XCTAssertTrue(transaction.cancellation?.failures.isEmpty == true)
+        XCTAssertEqual(attempts.values, [record.id, record.id])
+        let stored = try await store.record(id: record.id)
+        let persisted = try XCTUnwrap(stored)
+        let persistedDelivery = try XCTUnwrap(persisted.webhookDeliveries.first)
+        XCTAssertEqual(persistedDelivery.state, .cancelled)
+        XCTAssertNil(persistedDelivery.payloadBody)
+        XCTAssertFalse(persistedDelivery.retryable)
+    }
+
+    func testManualRetryInvalidatedDuringPersistenceCannotReviveCancelledRow() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let transactions = WebhookOutboxTransactions()
+        let destination = "https://example.invalid/webhook"
+        var record = WorkspaceRecord(kind: .meeting, title: "Retry race", text: "Synthetic")
+        record.webhookDeliveries = [WebhookDelivery(
+            destination: destination,
+            state: .failed,
+            attemptCount: 1,
+            payloadBody: Data("{\"retry\":true}".utf8),
+            retryable: true,
+            nextAttemptAt: .now
+        )]
+        try await store.upsert(record)
+        let token = transactions.beginPreparation()
+        let retry = transactions.prepareManualRetry(records: [record], destination: destination)
+        let attempts = LockedValues<UUID>()
+
+        let transaction = await transactions.persistPreparation(token, records: retry.records) { proposed in
+            attempts.append(proposed.id)
+            try await store.upsert(proposed)
+            if attempts.values.count == 1 { _ = transactions.invalidate() }
+        }
+        guard case .cancel = transaction.decision else {
+            return XCTFail("Invalidated manual retry committed")
+        }
+        XCTAssertTrue(transaction.cancellation?.failures.isEmpty == true)
+        XCTAssertEqual(attempts.values, [record.id, record.id])
+
+        let stored = try await store.record(id: record.id)
+        let persisted = try XCTUnwrap(stored)
+        let persistedDelivery = try XCTUnwrap(persisted.webhookDeliveries.first)
+        XCTAssertEqual(persistedDelivery.state, .cancelled)
+        XCTAssertNil(persistedDelivery.payloadBody)
+        XCTAssertFalse(persistedDelivery.retryable)
+    }
+
+    func testBatchPersistenceAttemptsRecordsAfterFailure() async {
+        let transactions = WebhookOutboxTransactions()
+        let records = [
+            WorkspaceRecord(kind: .meeting, title: "First", text: "Synthetic"),
+            WorkspaceRecord(kind: .meeting, title: "Second", text: "Synthetic"),
+            WorkspaceRecord(kind: .meeting, title: "Third", text: "Synthetic"),
+        ]
+        let attempted = LockedValues<UUID>()
+
+        let result = await transactions.persistAll(records) { record in
+            attempted.append(record.id)
+            if record.id == records[1].id { throw SyntheticWebhookTestError.rejected }
+        }
+
+        XCTAssertEqual(attempted.values, records.map(\.id))
+        XCTAssertEqual(result.persistedRecordIDs, [records[0].id, records[2].id])
+        XCTAssertEqual(result.failures.map(\.recordID), [records[1].id])
+    }
+
+    func testTerminationInvalidationSynchronouslyCancelsTasksAndPreparations() {
+        let transactions = WebhookOutboxTransactions()
+        let preparation = transactions.beginPreparation()
+        let deliveryID = UUID()
+        let dispatch = try! XCTUnwrap(transactions.beginDispatch(deliveryID: deliveryID))
+        let task = transactions.startTask(for: dispatch) {
+            try? await Task.sleep(for: .seconds(30))
+        }
+
+        let invalidation = transactions.invalidate()
+        let decision = transactions.finalize(
+            preparation,
+            records: [WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Local")]
+        )
+
+        XCTAssertTrue(task.isCancelled)
+        XCTAssertFalse(transactions.mayCommit(dispatch))
+        XCTAssertNil(transactions.beginDispatch(
+            deliveryID: UUID(),
+            requiringGeneration: preparation.generation
+        ))
+        XCTAssertEqual(invalidation.deliveryIDs, [deliveryID])
+        guard case .cancel = decision else {
+            return XCTFail("Invalidated preparation committed")
+        }
+    }
+
     func testLateSuspendedResponseCannotOverwriteTerminalCancellation() async throws {
         let body = Data("{\"meeting\":\"synthetic\"}".utf8)
         let deliveryID = UUID(uuidString: "19CF6CE4-3841-4CF7-9888-679CC63B3364")!
@@ -168,6 +286,27 @@ final class WebhookOutboxTests: XCTestCase {
         XCTAssertFalse(final.retryable)
         XCTAssertNil(final.nextAttemptAt)
         XCTAssertNil(final.payloadBody)
+    }
+}
+
+private enum SyntheticWebhookTestError: Error {
+    case rejected
+}
+
+private final class LockedValues<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Value] = []
+
+    var values: [Value] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: Value) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
     }
 }
 

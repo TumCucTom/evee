@@ -14,6 +14,10 @@ private enum SyntheticSecretStoreError: Error {
     case deletionFailed
 }
 
+private enum SyntheticWebhookPersistenceError: Error {
+    case rejected
+}
+
 private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
     private let lock = NSLock()
     private let enteredRead = DispatchSemaphore(value: 0)
@@ -71,6 +75,23 @@ private final class MemorySecretStore: LocalAPISecretStore, @unchecked Sendable 
     func delete(_ account: String) throws {
         if failsDeletion { throw SyntheticSecretStoreError.deletionFailed }
         lock.withLock { value = nil }
+    }
+}
+
+private final class LockedValues<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Value] = []
+
+    var values: [Value] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: Value) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
     }
 }
 
@@ -293,6 +314,122 @@ private func checkWebhookSignature() throws {
         timestamp: timestamp
     ), "webhook signature omitted the body")
     print("webhook-signature: passed")
+}
+
+private func checkWebhookTransactions() async throws {
+    let queueRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: queueRoot) }
+    let queueStore = LibraryStore(rootURL: queueRoot)
+    let queueTransactions = WebhookOutboxTransactions()
+    var queuedRecord = WorkspaceRecord(kind: .meeting, title: "Queue race", text: "Synthetic")
+    let queuedDelivery = WebhookDelivery(
+        id: UUID(uuidString: "57CBE526-0514-48B0-9C18-42EE74653CA5")!,
+        destination: "https://example.invalid/webhook",
+        payloadBody: Data("{\"queued\":true}".utf8)
+    )
+    queuedRecord.webhookDeliveries = [queuedDelivery]
+    let queueToken = queueTransactions.beginPreparation()
+    let queueAttempts = LockedValues<UUID>()
+    let queueTransaction = await queueTransactions.persistPreparation(
+        queueToken,
+        records: [queuedRecord]
+    ) { record in
+        queueAttempts.append(record.id)
+        try await queueStore.upsert(record)
+        if queueAttempts.values.count == 1 { _ = queueTransactions.invalidate() }
+    }
+    guard case .cancel = queueTransaction.decision else {
+        throw CoreCheckError.assertionFailed("invalidated queue preparation committed")
+    }
+    try require(queueTransaction.cancellation?.failures.isEmpty == true, "queue cancellation compensation failed")
+    try require(queueAttempts.values == [queuedRecord.id, queuedRecord.id], "queue cancellation compensation was not persisted")
+    let storedQueue = try await queueStore.record(id: queuedRecord.id)
+    let storedQueueDelivery = storedQueue?.webhookDeliveries.first(where: { $0.id == queuedDelivery.id })
+    try require(storedQueueDelivery?.state == .cancelled, "queue race left a pending delivery")
+    try require(storedQueueDelivery?.payloadBody == nil, "queue race retained payload bytes")
+
+    let retryRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: retryRoot) }
+    let retryStore = LibraryStore(rootURL: retryRoot)
+    let retryTransactions = WebhookOutboxTransactions()
+    let retryDeliveryID = UUID(uuidString: "546290F6-C799-4967-AC9C-B6CAF86726D7")!
+    let destination = "https://example.invalid/webhook"
+    var failedRecord = WorkspaceRecord(kind: .meeting, title: "Retry race", text: "Synthetic")
+    failedRecord.webhookDeliveries = [WebhookDelivery(
+        id: retryDeliveryID,
+        destination: destination,
+        state: .failed,
+        attemptCount: 1,
+        payloadBody: Data("{\"retry\":true}".utf8),
+        retryable: true,
+        nextAttemptAt: .now
+    )]
+    try await retryStore.upsert(failedRecord)
+    let retryToken = retryTransactions.beginPreparation()
+    let retryPreparation = retryTransactions.prepareManualRetry(
+        records: [failedRecord],
+        destination: destination,
+        at: Date(timeIntervalSince1970: 1_786_616_200)
+    )
+    let retryAttempts = LockedValues<UUID>()
+    let retryTransaction = await retryTransactions.persistPreparation(
+        retryToken,
+        records: retryPreparation.records
+    ) { record in
+        retryAttempts.append(record.id)
+        try await retryStore.upsert(record)
+        if retryAttempts.values.count == 1 { _ = retryTransactions.invalidate() }
+    }
+    guard case .cancel = retryTransaction.decision else {
+        throw CoreCheckError.assertionFailed("invalidated manual retry committed")
+    }
+    try require(retryTransaction.cancellation?.failures.isEmpty == true, "manual retry cancellation compensation failed")
+    try require(retryAttempts.values == [failedRecord.id, failedRecord.id], "manual retry cancellation compensation was not persisted")
+    let storedRetry = try await retryStore.record(id: failedRecord.id)
+    let storedRetryDelivery = storedRetry?.webhookDeliveries.first(where: { $0.id == retryDeliveryID })
+    try require(storedRetryDelivery?.state == .cancelled, "manual retry race revived a cancelled delivery")
+    try require(storedRetryDelivery?.payloadBody == nil, "manual retry race retained payload bytes")
+
+    let partialTransactions = WebhookOutboxTransactions()
+    let partialRecords = [
+        WorkspaceRecord(id: UUID(uuidString: "EE6C5238-D656-4591-9496-4AFBFC27CC8B")!, kind: .meeting, title: "First", text: "Synthetic"),
+        WorkspaceRecord(id: UUID(uuidString: "73DF5302-12BE-45D6-B7D8-7973394654DE")!, kind: .meeting, title: "Second", text: "Synthetic"),
+        WorkspaceRecord(id: UUID(uuidString: "AF38DCD7-E785-42F0-B646-97425F20C66E")!, kind: .meeting, title: "Third", text: "Synthetic"),
+    ]
+    let attempted = LockedValues<UUID>()
+    let partialResult = await partialTransactions.persistAll(partialRecords) { record in
+        attempted.append(record.id)
+        if record.id == partialRecords[1].id { throw SyntheticWebhookPersistenceError.rejected }
+    }
+    try require(attempted.values == partialRecords.map(\.id), "batch persistence stopped before later records")
+    try require(partialResult.persistedRecordIDs == [partialRecords[0].id, partialRecords[2].id], "batch persistence reported the wrong successes")
+    try require(partialResult.failures.map(\.recordID) == [partialRecords[1].id], "batch persistence reported the wrong failure")
+
+    let terminationTransactions = WebhookOutboxTransactions()
+    let preparation = terminationTransactions.beginPreparation()
+    let terminationDeliveryID = UUID(uuidString: "FEABF695-DAD7-4FC5-95B5-F5653C9A2D5E")!
+    guard let dispatch = terminationTransactions.beginDispatch(deliveryID: terminationDeliveryID) else {
+        throw CoreCheckError.assertionFailed("termination dispatch did not start")
+    }
+    let activeTask = terminationTransactions.startTask(for: dispatch) {
+        try? await Task.sleep(for: .seconds(30))
+    }
+    let invalidation = terminationTransactions.invalidate()
+    let preparationDecision = terminationTransactions.finalize(preparation, records: [failedRecord])
+    try require(activeTask.isCancelled, "synchronous termination invalidation left the task active")
+    try require(!terminationTransactions.mayCommit(dispatch), "termination invalidation left the dispatch current")
+    try require(
+        terminationTransactions.beginDispatch(
+            deliveryID: UUID(),
+            requiringGeneration: preparation.generation
+        ) == nil,
+        "termination invalidation allowed stale work to start"
+    )
+    guard case .cancel = preparationDecision else {
+        throw CoreCheckError.assertionFailed("termination invalidation left the preparation current")
+    }
+    try require(invalidation.deliveryIDs == [terminationDeliveryID], "termination invalidation omitted the active delivery")
+    print("webhook-transactions: passed")
 }
 
 private func withTimeout<T: Sendable>(
@@ -777,7 +914,9 @@ if arguments == ["--filter", "context-policy"] {
     try await checkWebhookGeneration()
 } else if arguments == ["--filter", "webhook-signature"] {
     try checkWebhookSignature()
+} else if arguments == ["--filter", "webhook-transactions"] {
+    try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|webhook-generation|webhook-signature>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|webhook-generation|webhook-signature|webhook-transactions>\n", stderr)
     exit(EXIT_FAILURE)
 }
