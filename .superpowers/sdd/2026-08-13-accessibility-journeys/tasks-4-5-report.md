@@ -78,3 +78,20 @@ quit-track-independence: passed
 - `swift build --target EveeApp --jobs 2` passed with the same temporary preview-only dependency guard described above; the checkout was restored clean.
 - The new app lifecycle/shortcut test source passed a synthetic XCTest-module typecheck. Native XCTest execution remains blocked because this Command Line Tools installation has no `XCTest` module.
 - `git diff --check` and the direct accessibility-post/HUD-control source scans passed. No real microphone or user data was used.
+
+## Review Round 2/5
+
+Resolved the remaining teardown timing finding:
+
+- `finishCapture()` now publishes `.transcribing` at the same synchronous boundary where the lifecycle enters `.finishing`, before awaiting microphone, system-audio, or live-transcript cleanup. Global Stop and Discard actions therefore disappear for the full teardown interval.
+- While the microphone is still open, the shared processing presentation explicitly says `Microphone open · Stopping capture`; after it closes, the HUD remains in local processing while system-audio cleanup completes.
+- The capture-stopped announcement remains after microphone, system-audio, and live-transcript cleanup, and before recovery persistence.
+- Added a delayed meeting system-stop contract that holds teardown open and verifies processing state, empty actions, microphone truth, processing HUD copy, and suppression of `captureStopped` until the stop continuation completes.
+
+Round 2 verification:
+
+- The new system-status contract was observed failing against the previous teardown copy, then passed after the finishing-boundary change.
+- All 34 `evee-core-checks` filters passed sequentially, including system voice, accessibility, lifecycle, hot-mic, and both termination filters.
+- `swift build --target EveeCore --jobs 2` passed.
+- `swift build --target EveeApp --jobs 2` passed with the temporary preview-only dependency guard; the dependency checkout was restored clean.
+- The expanded app lifecycle test source passed the synthetic XCTest-module typecheck. Native XCTest and interactive VoiceOver/package gates remain environment-blocked. No real microphone or user data was used.

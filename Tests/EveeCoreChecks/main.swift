@@ -3861,6 +3861,14 @@ private func checkSystemVoiceStatus() throws {
 
     let processing = SystemVoiceStatus.make(capture: .transcribing, hotMic: .disabled, warnings: [])
     try require(processing.phase == .processing && !processing.isMicrophoneOpen, "transcription status was inaccurate")
+    let stoppingCapture = SystemVoiceStatus.make(
+        capture: .transcribing,
+        hotMic: .disabled,
+        captureMicrophone: .open,
+        warnings: []
+    )
+    try require(stoppingCapture.phase == .processing && stoppingCapture.availableActions.isEmpty, "capture teardown exposed recording actions")
+    try require(stoppingCapture.isMicrophoneOpen && stoppingCapture.hudTitle.contains("Stopping capture"), "capture teardown did not expose its open microphone and stopping status")
     let delivering = SystemVoiceStatus.make(capture: .delivering, hotMic: .disabled, warnings: [])
     try require(delivering.phase == .delivering && !delivering.isMicrophoneOpen, "delivery status was inaccurate")
     let failed = SystemVoiceStatus.make(capture: .failed("Synthetic capture failure"), hotMic: .active, warnings: [])

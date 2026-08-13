@@ -1195,6 +1195,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         case .recording(let id):
             sessionID = id
             captureLifecycle = .finishing(id)
+            captureState = .transcribing
         case .idle, .finishing, .cancelling:
             return
         }
@@ -1212,7 +1213,6 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 }
                 isSystemAudioActive = false
             }
-            captureState = .transcribing
             if activeKind == .meeting { await stopLiveMeetingTranscription() }
             accessibilityAnnouncements.post(.captureStopped)
 

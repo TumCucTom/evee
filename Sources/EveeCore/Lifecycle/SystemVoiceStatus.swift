@@ -108,10 +108,10 @@ public struct SystemVoiceStatus: Equatable, Sendable {
             return Self(
                 phase: .processing,
                 isMicrophoneOpen: microphoneIsOpen,
-                menuTitle: "Transcribing locally\(warningSuffix)",
-                hudTitle: microphoneIsOpen ? "Microphone open · Transcribing locally" : "Transcribing locally",
+                menuTitle: microphoneIsOpen ? "Stopping capture\(warningSuffix)" : "Transcribing locally\(warningSuffix)",
+                hudTitle: microphoneIsOpen ? "Microphone open · Stopping capture" : "Transcribing locally",
                 hudDetail: detail(
-                    microphoneIsOpen ? "The microphone has not closed. Evee is still processing locally." : "The microphone is closed. You can keep working.",
+                    microphoneIsOpen ? "Closing the microphone before local transcription." : "The microphone is closed. You can keep working.",
                     warning: warningDetail
                 ),
                 warnings: warnings,

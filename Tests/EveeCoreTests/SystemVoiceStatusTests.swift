@@ -71,6 +71,20 @@ final class SystemVoiceStatusTests: XCTestCase {
         XCTAssertTrue(status.hudTitle.contains("Microphone open"))
     }
 
+    func testProcessingPresentationHidesActionsBeforeRecorderStopCompletes() {
+        let status = SystemVoiceStatus.make(
+            capture: .transcribing,
+            hotMic: .disabled,
+            captureMicrophone: .open,
+            warnings: []
+        )
+
+        XCTAssertEqual(status.phase, .processing)
+        XCTAssertTrue(status.availableActions.isEmpty)
+        XCTAssertTrue(status.isMicrophoneOpen)
+        XCTAssertTrue(status.hudTitle.contains("Stopping capture"))
+    }
+
     func testCaptureStatusOverridesWakeAndMapsPostCapturePhases() {
         let processing = SystemVoiceStatus.make(capture: .transcribing, hotMic: .active, warnings: [])
         let delivering = SystemVoiceStatus.make(capture: .delivering, hotMic: .active, warnings: [])

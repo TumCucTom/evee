@@ -113,6 +113,62 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
         })
     }
 
+    func testMeetingHidesCaptureActionsWhileSystemAudioStopIsSuspended() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-accessible-delayed-system-stop-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let systemStop = SuspendedVoidOperation()
+        var microphoneURL: URL?
+        var microphoneIsRecording = false
+        var announcements: [String] = []
+        let announcementCoordinator = AccessibilityAnnouncementCoordinator {
+            announcements.append($0)
+        }
+        let store = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            microphoneStarter: { url, _, _ in
+                microphoneURL = url
+                microphoneIsRecording = true
+                try accessibleSyntheticSilentWAV().write(to: url)
+            },
+            microphoneStopper: {
+                microphoneIsRecording = false
+                return try XCTUnwrap(microphoneURL)
+            },
+            microphoneRecordingProbe: { microphoneIsRecording },
+            systemAudioStarter: { url in
+                try accessibleSyntheticSilentWAV().write(to: url)
+            },
+            systemAudioStopper: {
+                try await systemStop.run()
+            },
+            recoveryTranscriberFactory: { _ in
+                throw AccessibleSyntheticError.transcriptionFailed
+            },
+            accessibilityAnnouncements: announcementCoordinator
+        )
+        store.settings.meetingCaptureEnabled = true
+        store.settings.liveMeetingTranscriptionEnabled = false
+        await store.beginMeeting()
+        XCTAssertEqual(store.systemVoiceStatus.phase, .recording)
+
+        let finish = Task { @MainActor in await store.finishCapture() }
+        await systemStop.waitUntilCalled()
+
+        XCTAssertEqual(store.captureState, .transcribing)
+        XCTAssertEqual(store.systemVoiceStatus.phase, .processing)
+        XCTAssertTrue(store.systemVoiceStatus.availableActions.isEmpty)
+        XCTAssertFalse(store.systemVoiceStatus.isMicrophoneOpen)
+        XCTAssertTrue(store.systemVoiceStatus.hudTitle.localizedCaseInsensitiveContains("transcribing"))
+        XCTAssertFalse(announcements.contains("Recording stopped. Transcribing locally."))
+
+        systemStop.succeed()
+        await finish.value
+        XCTAssertTrue(announcements.contains("Recording stopped. Transcribing locally."))
+    }
+
     func testCancelShortcutDefaultIsNonreservedAndDoesNotCollideWithCaptureShortcuts() {
         let expected = KeyboardShortcuts.Shortcut(
             .escape,
@@ -179,8 +235,16 @@ private final class SuspendedRecoveryPersistence {
 
 private enum AccessibleSyntheticError: LocalizedError {
     case persistenceFailed
+    case transcriptionFailed
 
-    var errorDescription: String? { "Synthetic recovery persistence failure." }
+    var errorDescription: String? {
+        switch self {
+        case .persistenceFailed:
+            "Synthetic recovery persistence failure."
+        case .transcriptionFailed:
+            "Synthetic transcription failure."
+        }
+    }
 }
 
 private func accessibleSyntheticSilentWAV() -> Data {
