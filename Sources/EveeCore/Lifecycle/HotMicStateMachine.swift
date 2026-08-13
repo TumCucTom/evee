@@ -31,6 +31,10 @@ public struct HotMicStateMachine: Sendable {
         state = .disabled
     }
 
+    public func isCurrent(_ operation: LifecycleOperation) -> Bool {
+        self.operation == operation && state == .starting
+    }
+
     public mutating func didStart(_ operation: LifecycleOperation) -> Bool {
         guard self.operation == operation, state == .starting else { return false }
 

@@ -4,7 +4,7 @@ import CoreAudio
 import FluidAudio
 import Foundation
 
-public actor WakePhraseListener {
+public actor WakePhraseListener: WakePhraseListening {
     public nonisolated let transcripts: AsyncStream<String>
     private nonisolated let continuation: AsyncStream<String>.Continuation
     private let engine = AVAudioEngine()

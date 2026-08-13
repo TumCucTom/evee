@@ -611,6 +611,49 @@ private func checkLifecycleState() throws {
     print("lifecycle-state: passed")
 }
 
+private func checkModelDownloadLifecycle() throws {
+    var download = ModelDownloadStateMachine()
+    let cancelled = try unwrapped(download.begin(model: .parakeet), "model download did not start")
+    try require(download.begin(model: .parakeet) == nil, "model download allowed a concurrent operation")
+
+    download.cancel(cancelled)
+    try require(
+        !download.update(cancelled, progress: ModelProgress(fraction: 0.5, status: "Synthetic late progress")),
+        "cancelled model download accepted late progress"
+    )
+    try require(!download.complete(cancelled), "cancelled model download accepted late completion")
+    try require(download.isIdle, "cancelled model download did not return to idle")
+
+    let failed = try unwrapped(download.begin(model: .qwen3), "model download retry setup did not start")
+    try require(download.fail(failed, message: "Synthetic failure"), "model download failure was not recorded")
+    try require(download.begin(model: .qwen3) != nil, "model download failure did not permit retry")
+
+    print("model-download: passed")
+}
+
+private func checkHotMicRace() throws {
+    var hotMic = HotMicStateMachine()
+    let disabledStart = try unwrapped(hotMic.beginStart(), "hot mic did not begin starting")
+    try require(hotMic.beginStart() == nil, "hot mic allowed a repeated concurrent start")
+    hotMic.disable()
+    try require(!hotMic.didStart(disabledStart), "disabled hot mic accepted a stale start")
+    try require(hotMic.isDisabled, "disabled hot mic did not publish disabled state")
+
+    let captureStart = try unwrapped(hotMic.beginStart(), "hot mic did not restart before capture")
+    hotMic.disable()
+    try require(!hotMic.didStart(captureStart), "foreground capture accepted a stale hot mic start")
+
+    let failingStart = try unwrapped(hotMic.beginStart(), "hot mic did not restart before failure")
+    try require(hotMic.fail(failingStart, message: "Synthetic failure"), "hot mic failure was not recorded")
+    try require(hotMic.state == .failed(message: "Synthetic failure"), "hot mic failure state was not published")
+
+    hotMic.disable()
+    hotMic.disable()
+    try require(hotMic.isDisabled, "repeated hot mic disable was not idempotent")
+
+    print("hot-mic-race: passed")
+}
+
 private func checkWebhookTransactions() async throws {
     let queueRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: queueRoot) }
@@ -2734,9 +2777,13 @@ if arguments == ["--filter", "context-policy"] {
     try await checkTerminationCheckpoint()
 } else if arguments == ["--filter", "lifecycle-state"] {
     try checkLifecycleState()
+} else if arguments == ["--filter", "model-download"] {
+    try checkModelDownloadLifecycle()
+} else if arguments == ["--filter", "hot-mic-race"] {
+    try checkHotMicRace()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race>\n", stderr)
     exit(EXIT_FAILURE)
 }

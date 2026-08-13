@@ -36,5 +36,6 @@ let package = Package(
             path: "Tests/EveeCoreChecks"
         ),
         .testTarget(name: "EveeCoreTests", dependencies: ["EveeCore"]),
+        .testTarget(name: "EveeAppTests", dependencies: ["EveeApp"]),
     ]
 )

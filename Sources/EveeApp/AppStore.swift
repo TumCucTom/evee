@@ -13,6 +13,10 @@ extension KeyboardShortcuts.Name {
 
 @MainActor
 final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
+    typealias ModelDownloaderFactory = @Sendable (SpeechModel) throws -> any LocalModelDownloading
+    typealias WakeListenerFactory = @Sendable () -> any WakePhraseListening
+    typealias MicrophonePermissionProvider = @MainActor @Sendable () -> Bool
+
     enum Route: Hashable { case library, meetings, memos, dictionary, settings }
     struct PendingTextDelivery {
         var text: String
@@ -32,8 +36,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
     @Published var search = ""
     @Published var selectedRecordID: UUID?
-    @Published var modelProgress: ModelProgress?
-    @Published var modelReady = false
+    @Published private(set) var modelDownloadState: ModelDownloadState = .idle
+    @Published private(set) var modelDownloadNeedsRetry = false
     @Published var statusMessage: String?
     @Published var meetingTitle = ""
     @Published var meetingNotes = ""
@@ -48,13 +52,27 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var isPreparingMeetingDiarization = false
     @Published private(set) var meetingDiarizationReady = false
     @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
-    @Published private(set) var microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
+    @Published private(set) var microphonePermissionGranted = false
     @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
     @Published private(set) var liveMeetingStatus: String?
     @Published private(set) var availableUpdate: EveeRelease?
     @Published private(set) var isCheckingForUpdates = false
     @Published private(set) var microphoneHealthWarning: String?
-    @Published private(set) var hotMicActive = false
+    @Published private(set) var hotMicState: HotMicState = .disabled
+
+    var modelProgress: ModelProgress? {
+        guard case .downloading(_, let progress) = modelDownloadState else { return nil }
+        return progress
+    }
+
+    var modelReady: Bool {
+        if case .ready = modelDownloadState { return true }
+        return false
+    }
+
+    var hotMicActive: Bool {
+        hotMicState == .active
+    }
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
@@ -73,7 +91,14 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let meetingDiarizer = FluidOfflineMeetingDiarizer()
     private let api = LocalAPIServer()
     private let secretStore = KeychainSecretStore()
+    private let modelDownloaderFactory: ModelDownloaderFactory
+    private let wakeListenerFactory: WakeListenerFactory
+    private let microphonePermissionProvider: MicrophonePermissionProvider
+    private let modelDownloadDefaults: UserDefaults?
     private var transcriber: (any LocalTranscriber)?
+    private var modelDownloadStateMachine = ModelDownloadStateMachine()
+    private var modelDownloadOperation: LifecycleOperation?
+    private var modelDownloadTask: Task<Void, Never>?
     private var activeAudioURL: URL?
     private var activeSystemAudioURL: URL?
     private var activeRecoveryID: UUID?
@@ -102,8 +127,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var liveMeetingUpdateTask: Task<Void, Never>?
     private var microphoneHealthTask: Task<Void, Never>?
     private var lastNonSilentAudioAt = Date.distantPast
-    private var wakePhraseListener: WakePhraseListener?
-    private var hotMicTask: Task<Void, Never>?
+    private var wakePhraseListener: (any WakePhraseListening)?
+    private var hotMicStateMachine = HotMicStateMachine()
+    private var hotMicTranscriptTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
 
     private enum CaptureShortcut: Equatable, Sendable { case dictation, selectionTransform }
@@ -126,7 +152,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     private var captureLifecycle: CaptureLifecycle = .idle
 
-    init() {
+    init(
+        modelDownloaderFactory: @escaping ModelDownloaderFactory = { try TranscriberFactory.make($0) },
+        wakeListenerFactory: @escaping WakeListenerFactory = { WakePhraseListener() },
+        microphonePermissionProvider: @escaping MicrophonePermissionProvider = { MicrophoneRecorder.isPermissionGranted },
+        modelDownloadDefaults: UserDefaults? = .standard
+    ) {
+        self.modelDownloaderFactory = modelDownloaderFactory
+        self.wakeListenerFactory = wakeListenerFactory
+        self.microphonePermissionProvider = microphonePermissionProvider
+        self.modelDownloadDefaults = modelDownloadDefaults
+        self.microphonePermissionGranted = microphonePermissionProvider()
         let webhookOutboxTransactions = WebhookOutboxTransactions()
         self.webhookOutboxTransactions = webhookOutboxTransactions
         self.webhookOutboxCoordinator = WebhookOutboxCoordinator(transactions: webhookOutboxTransactions)
@@ -304,8 +340,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 suppressDraftAutosave = false
             }
             recoverableCaptures = try await library.recoverableCaptures()
-            transcriber = try TranscriberFactory.make(settings.model)
-            modelReady = transcriber?.isDownloaded == true
+            let selectedTranscriber = try TranscriberFactory.make(settings.model)
+            transcriber = selectedTranscriber
+            reconcileModelDownloadCache(selectedTranscriber, model: settings.model)
             refreshPermissionState()
             if settings.localAPIEnabled { localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort) }
             if settings.webhookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -347,9 +384,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     statusMessage = "Removed \(removed) \(removed == 1 ? "record" : "records") outside the retention window."
                 }
             }
+            cancelModelDownload()
             transcriber?.unload()
-            transcriber = try TranscriberFactory.make(settings.model)
-            modelReady = transcriber?.isDownloaded == true
+            let selectedTranscriber = try TranscriberFactory.make(settings.model)
+            transcriber = selectedTranscriber
+            reconcileModelDownloadCache(selectedTranscriber, model: settings.model)
             if settings.localAPIEnabled {
                 localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort)
             } else {
@@ -444,20 +483,113 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         return outcome
     }
 
-    func downloadSelectedModel() async {
-        do {
-            let selected = try TranscriberFactory.make(settings.model)
-            transcriber = selected
-            try await selected.download { [weak self] progress in
-                Task { @MainActor in self?.modelProgress = progress }
+    func startModelDownload() {
+        let model = settings.model
+        guard let operation = modelDownloadStateMachine.begin(model: model) else { return }
+
+        modelDownloadOperation = operation
+        modelDownloadNeedsRetry = true
+        modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
+        publishModelDownloadState()
+
+        let factory = modelDownloaderFactory
+        modelDownloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let downloader = try factory(model)
+                guard self.modelDownloadOperation == operation else { return }
+                if !downloader.isDownloaded {
+                    try await downloader.download { [weak self] progress in
+                        Task { @MainActor in
+                            self?.receiveModelDownloadProgress(progress, operation: operation)
+                        }
+                    }
+                }
+                try Task.checkCancellation()
+                try await downloader.load()
+                try Task.checkCancellation()
+                self.completeModelDownload(downloader, model: model, operation: operation)
+            } catch {
+                self.failModelDownload(error, model: model, operation: operation)
             }
-            try await selected.load()
-            modelReady = true
-            modelProgress = ModelProgress(fraction: 1, status: "Ready")
-        } catch {
-            modelProgress = nil
-            statusMessage = error.localizedDescription
         }
+    }
+
+    func cancelModelDownload() {
+        guard let operation = modelDownloadOperation else { return }
+        modelDownloadStateMachine.cancel(operation)
+        modelDownloadOperation = nil
+        modelDownloadTask?.cancel()
+        modelDownloadTask = nil
+        modelDownloadNeedsRetry = true
+        publishModelDownloadState()
+    }
+
+    func downloadSelectedModel() async {
+        startModelDownload()
+    }
+
+    private func receiveModelDownloadProgress(_ progress: ModelProgress, operation: LifecycleOperation) {
+        guard modelDownloadStateMachine.update(operation, progress: progress) else { return }
+        publishModelDownloadState()
+    }
+
+    private func completeModelDownload(
+        _ downloader: any LocalModelDownloading,
+        model: SpeechModel,
+        operation: LifecycleOperation
+    ) {
+        guard modelDownloadStateMachine.complete(operation) else { return }
+        if let selectedTranscriber = downloader as? any LocalTranscriber {
+            transcriber = selectedTranscriber
+        }
+        modelDownloadOperation = nil
+        modelDownloadTask = nil
+        modelDownloadNeedsRetry = false
+        modelDownloadDefaults?.set(false, forKey: modelDownloadAttemptKey(for: model))
+        publishModelDownloadState()
+    }
+
+    private func failModelDownload(_ error: Error, model: SpeechModel, operation: LifecycleOperation) {
+        guard modelDownloadStateMachine.fail(operation, message: error.localizedDescription) else { return }
+        modelDownloadOperation = nil
+        modelDownloadTask = nil
+        modelDownloadNeedsRetry = true
+        modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
+        publishModelDownloadState()
+        statusMessage = error.localizedDescription
+    }
+
+    private func reconcileModelDownloadCache(_ downloader: any LocalModelDownloading, model: SpeechModel) {
+        modelDownloadTask?.cancel()
+        modelDownloadTask = nil
+        modelDownloadOperation = nil
+        modelDownloadStateMachine = ModelDownloadStateMachine()
+
+        if let operation = modelDownloadStateMachine.begin(model: model) {
+            if downloader.isDownloaded {
+                _ = modelDownloadStateMachine.complete(operation)
+                modelDownloadNeedsRetry = false
+            } else if modelDownloadDefaults?.bool(forKey: modelDownloadAttemptKey(for: model)) == true {
+                _ = modelDownloadStateMachine.fail(
+                    operation,
+                    message: "The previous model download did not finish."
+                )
+                modelDownloadNeedsRetry = true
+            } else {
+                modelDownloadStateMachine.cancel(operation)
+                modelDownloadNeedsRetry = false
+            }
+        }
+        publishModelDownloadState()
+    }
+
+    private func publishModelDownloadState() {
+        modelDownloadState = modelDownloadStateMachine.state
+    }
+
+    private func modelDownloadAttemptKey(for model: SpeechModel) -> String {
+        "Evee.ModelDownloadAttempted.\(model.rawValue)"
     }
 
     func prepareMeetingDiarization() async {
@@ -480,7 +612,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     func refreshPermissionState() {
         accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
-        microphonePermissionGranted = MicrophoneRecorder.isPermissionGranted
+        microphonePermissionGranted = microphonePermissionProvider()
     }
 
     func requestAccessibilityPermission() {
@@ -1255,48 +1387,96 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             statusMessage = "Choose a wake phrase containing at least three characters."
             return
         }
-        guard captureLifecycle == .idle, !hotMicActive else { return }
+        guard captureLifecycle == .idle else {
+            await stopHotMic()
+            return
+        }
         refreshPermissionState()
         guard microphonePermissionGranted else {
+            await stopHotMic()
             statusMessage = "Grant Microphone permission before enabling wake-phrase listening."
             return
         }
+        guard let operation = hotMicStateMachine.beginStart() else { return }
+        publishHotMicState()
 
-        let listener = WakePhraseListener()
+        let listener = wakeListenerFactory()
+        guard hotMicStartIsCurrent(operation, phrase: phrase) else {
+            await listener.stop()
+            return
+        }
         do {
             try await listener.start(
                 deviceUID: settings.inputDeviceUID.isEmpty ? nil : settings.inputDeviceUID,
                 lowLatency: true
             )
-            wakePhraseListener = listener
-            hotMicActive = true
-            hotMicTask = Task { @MainActor [weak self] in
+            guard hotMicStartIsCurrent(operation, phrase: phrase) else {
+                await listener.stop()
+                return
+            }
+
+            let transcriptTask = Task { @MainActor [weak self] in
                 for await transcript in listener.transcripts {
                     guard let self, !Task.isCancelled else { return }
                     let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
                     if normalized.contains(phrase.lowercased()) {
-                        self.hotMicTask = nil
-                        self.hotMicActive = false
-                        await listener.stop()
-                        self.wakePhraseListener = nil
-                        await self.beginDictation()
+                        await self.handleWakePhrase(listener: listener)
                         return
                     }
                 }
             }
+            guard hotMicStartIsCurrent(operation, phrase: phrase), hotMicStateMachine.didStart(operation) else {
+                transcriptTask.cancel()
+                await listener.stop()
+                return
+            }
+            wakePhraseListener = listener
+            hotMicTranscriptTask = transcriptTask
+            publishHotMicState()
         } catch {
-            hotMicActive = false
-            wakePhraseListener = nil
-            statusMessage = "Wake-phrase listening could not start: \(error.localizedDescription)"
+            await listener.stop()
+            if hotMicStateMachine.fail(operation, message: error.localizedDescription) {
+                publishHotMicState()
+                statusMessage = "Wake-phrase listening could not start: \(error.localizedDescription)"
+            }
         }
     }
 
+    func disableHotMic() async {
+        settings.hotMicEnabled = false
+        await stopHotMic()
+    }
+
     private func stopHotMic() async {
-        hotMicTask?.cancel()
-        hotMicTask = nil
-        if let wakePhraseListener { await wakePhraseListener.stop() }
+        hotMicStateMachine.disable()
+        publishHotMicState()
+        hotMicTranscriptTask?.cancel()
+        hotMicTranscriptTask = nil
+        let listener = wakePhraseListener
         wakePhraseListener = nil
-        hotMicActive = false
+        if let listener { await listener.stop() }
+    }
+
+    private func hotMicStartIsCurrent(_ operation: LifecycleOperation, phrase: String) -> Bool {
+        settings.hotMicEnabled
+            && settings.model == .parakeet
+            && settings.wakePhrase.trimmingCharacters(in: .whitespacesAndNewlines) == phrase
+            && captureLifecycle == .idle
+            && hotMicStateMachine.isCurrent(operation)
+    }
+
+    private func handleWakePhrase(listener: any WakePhraseListening) async {
+        guard hotMicState == .active, settings.hotMicEnabled, captureLifecycle == .idle else { return }
+        hotMicStateMachine.disable()
+        publishHotMicState()
+        hotMicTranscriptTask = nil
+        wakePhraseListener = nil
+        await listener.stop()
+        await beginDictation()
+    }
+
+    private func publishHotMicState() {
+        hotMicState = hotMicStateMachine.state
     }
 
     private func stopLiveMeetingTranscription() async {

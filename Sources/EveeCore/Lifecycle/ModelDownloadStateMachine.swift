@@ -8,7 +8,7 @@ public struct LifecycleOperation: Hashable, Sendable {
     }
 }
 
-public enum ModelDownloadState: Sendable {
+public enum ModelDownloadState: Equatable, Sendable {
     case idle
     case downloading(model: SpeechModel, progress: ModelProgress?)
     case ready(model: SpeechModel)

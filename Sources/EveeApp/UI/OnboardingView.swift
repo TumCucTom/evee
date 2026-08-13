@@ -36,9 +36,7 @@ struct OnboardingView: View {
                 .animaCard()
                 .frame(maxWidth: 480)
                 VStack(spacing: 10) {
-                    Button { Task { await store.downloadSelectedModel() } } label: { Text(store.modelProgress?.status ?? "Download local model") }.buttonStyle(AlphaButtonStyle())
-                        .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
-                    if let progress = store.modelProgress { ProgressView(value: progress.fraction).frame(width: 260) }
+                    modelDownloadControl
                     Text("Parakeet v3 · about 735 MB · Apple Silicon").font(.caption).foregroundStyle(.secondary)
                 }
             }.padding(40)
@@ -46,6 +44,55 @@ struct OnboardingView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             store.refreshPermissionState()
         }
+    }
+
+    @ViewBuilder
+    private var modelDownloadControl: some View {
+        switch store.modelDownloadState {
+        case .idle:
+            Button(store.modelDownloadNeedsRetry ? "Retry" : "Download") {
+                store.startModelDownload()
+            }
+            .buttonStyle(AlphaButtonStyle())
+            .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+            .accessibilityLabel(store.modelDownloadNeedsRetry ? "Retry local model download" : "Download local model")
+            .accessibilityValue(store.modelDownloadNeedsRetry ? "Previous download did not finish" : "Not downloaded")
+            .accessibilityHint("Downloads and prepares the selected speech model on this Mac.")
+        case .downloading(_, let progress):
+            Button("Cancel") {
+                store.cancelModelDownload()
+            }
+            .buttonStyle(AlphaButtonStyle())
+            .accessibilityLabel("Cancel local model download")
+            .accessibilityValue(modelDownloadAccessibilityValue(progress))
+            .accessibilityHint("Stops this download without deleting any completed model cache.")
+            if let progress {
+                ProgressView(value: progress.fraction)
+                    .frame(width: 260)
+                    .accessibilityLabel("Local model download progress")
+                    .accessibilityValue(modelDownloadAccessibilityValue(progress))
+            }
+        case .failed(_, let message):
+            Button("Retry") {
+                store.startModelDownload()
+            }
+            .buttonStyle(AlphaButtonStyle())
+            .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+            .accessibilityLabel("Retry local model download")
+            .accessibilityValue(message)
+            .accessibilityHint("Attempts the local model download again.")
+        case .ready:
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Local model ready")
+                .accessibilityValue("Ready")
+                .accessibilityHint("The selected local speech model is downloaded and prepared.")
+        }
+    }
+
+    private func modelDownloadAccessibilityValue(_ progress: ModelProgress?) -> String {
+        guard let progress else { return "Starting" }
+        return "\(Int((progress.fraction * 100).rounded())) percent, \(progress.status)"
     }
 
     private func feature(_ icon: String, _ title: String, _ detail: String) -> some View {
