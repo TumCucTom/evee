@@ -22,7 +22,7 @@ private struct WorkspaceStats: Codable {
 }
 
 private struct SearchHit: Codable {
-    var record: WorkspaceRecord
+    var record: PublicWorkspaceRecord
     var snippet: String
 }
 
@@ -129,14 +129,14 @@ enum EveeMCP {
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
             let records = try await store.search(query, kind: kind, limit: limit)
             return try encode(records.map { record in
-                SearchHit(record: publicRecord(record), snippet: searchSnippet(for: record, query: query))
+                SearchHit(record: PublicWorkspaceRecord(record), snippet: searchSnippet(for: record, query: query))
             })
 
         case "recent_activity":
             let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
             let since = parseDate(arguments["since"] as? String)
             let records = try await store.recent(kind: kind, limit: limit, since: since)
-            return try encode(records.map(publicRecord))
+            return try encode(records.map(PublicWorkspaceRecord.init))
 
         case "ambient_timeline":
             let since = parseDate(arguments["since"] as? String)
@@ -238,16 +238,10 @@ enum EveeMCP {
             guard let id = UUID(uuidString: rawID), let record = try await store.record(id: id), record.kind == kind else {
                 throw MCPFailure(code: -32602, message: "No \(kind.rawValue) exists with that id.")
             }
-            return try encode(publicRecord(record))
+            return try encode(PublicWorkspaceRecord(record))
         }
         let latest = try await store.recent(kind: kind, limit: 1).first
-        return try encode(latest.map(publicRecord))
-    }
-
-    static func publicRecord(_ record: WorkspaceRecord) -> WorkspaceRecord {
-        var copy = record
-        for index in copy.webhookDeliveries.indices { copy.webhookDeliveries[index].payloadBody = nil }
-        return copy
+        return try encode(latest.map(PublicWorkspaceRecord.init))
     }
 
     static func encode<T: Encodable>(_ value: T) throws -> String {

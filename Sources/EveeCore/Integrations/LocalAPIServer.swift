@@ -31,6 +31,11 @@ public final class LocalAPIServer: @unchecked Sendable {
     private var listener: NWListener?
     private var token = ""
     private var currentCredentials: LocalAPICredentials?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var pendingHeaders: Set<ObjectIdentifier> = []
+    private var accessGeneration: UInt64 = 0
+    private let maximumConnections = 32
+    private let headerDeadline: TimeInterval = 5
 
     public init(store: LibraryStore = .shared, secretStore: KeychainSecretStore = KeychainSecretStore()) {
         self.store = store
@@ -47,14 +52,24 @@ public final class LocalAPIServer: @unchecked Sendable {
         stop()
         guard port > 0, let endpointPort = NWEndpoint.Port(rawValue: port) else { throw LocalAPIServerError.invalidPort(port) }
         let tokenValue = try await loadOrCreateToken()
-        stateLock.withLock { token = tokenValue }
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: endpointPort)
         let listener = try NWListener(using: parameters)
-        listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
-        stateLock.withLock { self.listener = listener }
+        let generation = stateLock.withLock {
+            accessGeneration &+= 1
+            token = tokenValue
+            self.listener = listener
+            return accessGeneration
+        }
+        listener.newConnectionHandler = { [weak self, weak listener] connection in
+            guard let self, let listener else {
+                connection.cancel()
+                return
+            }
+            self.accept(connection, listener: listener)
+        }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             listener.stateUpdateHandler = { [weak self, weak listener] state in
@@ -66,7 +81,10 @@ public final class LocalAPIServer: @unchecked Sendable {
                     listener?.stateUpdateHandler = nil
                     if let self, let listener {
                         self.stateLock.withLock {
-                            if self.listener === listener { self.listener = nil }
+                            if self.listener === listener, self.accessGeneration == generation {
+                                self.listener = nil
+                                self.token = ""
+                            }
                         }
                     }
                     continuation.resume(throwing: LocalAPIServerError.listenerFailed(error.localizedDescription))
@@ -74,7 +92,10 @@ public final class LocalAPIServer: @unchecked Sendable {
                     listener?.stateUpdateHandler = nil
                     if let self, let listener {
                         self.stateLock.withLock {
-                            if self.listener === listener { self.listener = nil }
+                            if self.listener === listener, self.accessGeneration == generation {
+                                self.listener = nil
+                                self.token = ""
+                            }
                         }
                     }
                     continuation.resume(throwing: CancellationError())
@@ -90,7 +111,12 @@ public final class LocalAPIServer: @unchecked Sendable {
             baseURL: URL(string: "http://127.0.0.1:\(activePort)")!,
             token: tokenValue
         )
-        stateLock.withLock { currentCredentials = credentials }
+        let isCurrent = stateLock.withLock {
+            guard self.listener === listener, accessGeneration == generation else { return false }
+            currentCredentials = credentials
+            return true
+        }
+        guard isCurrent else { throw CancellationError() }
         return credentials
     }
 
@@ -99,11 +125,19 @@ public final class LocalAPIServer: @unchecked Sendable {
     }
 
     public func stop() {
-        stateLock.withLock {
-            listener?.cancel()
+        let detached = stateLock.withLock { () -> (NWListener?, [NWConnection]) in
+            accessGeneration &+= 1
+            let detachedListener = listener
+            let detachedConnections = Array(connections.values)
             listener = nil
+            connections.removeAll()
+            pendingHeaders.removeAll()
+            token = ""
             currentCredentials = nil
+            return (detachedListener, detachedConnections)
         }
+        detached.0?.cancel()
+        detached.1.forEach { $0.cancel() }
     }
 
     /// Replaces the bearer token without exposing a stale-token window. The
@@ -112,24 +146,29 @@ public final class LocalAPIServer: @unchecked Sendable {
     public func rotateToken() throws -> LocalAPICredentials? {
         let value = try KeychainSecretStore.randomToken()
         try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
-        return stateLock.withLock {
+        let rotated = stateLock.withLock { () -> (LocalAPICredentials?, [NWConnection]) in
+            accessGeneration &+= 1
+            let detachedConnections = Array(connections.values)
+            connections.removeAll()
+            pendingHeaders.removeAll()
             token = value
-            guard var credentials = currentCredentials else { return nil }
+            guard var credentials = currentCredentials else { return (nil, detachedConnections) }
             credentials.token = value
             currentCredentials = credentials
-            return credentials
+            return (credentials, detachedConnections)
         }
+        rotated.1.forEach { $0.cancel() }
+        return rotated.0
     }
 
     /// Revokes the credential and closes the listener. Enabling the API again
     /// creates a fresh token; a revoked token is never silently reused.
     public func revokeToken() throws {
         stop()
-        stateLock.withLock { token = "" }
         try secretStore.delete(KeychainSecretStore.localAPITokenAccount)
     }
 
-    private func accept(_ connection: NWConnection) {
+    private func accept(_ connection: NWConnection, listener: NWListener) {
         // Defence in depth. The listener itself is already bound to 127.0.0.1.
         if case .hostPort(let host, _) = connection.endpoint {
             let peer = String(describing: host).lowercased()
@@ -138,39 +177,73 @@ public final class LocalAPIServer: @unchecked Sendable {
                 return
             }
         }
+        let identifier = ObjectIdentifier(connection)
+        let generation = stateLock.withLock { () -> UInt64? in
+            guard self.listener === listener, connections.count < maximumConnections else {
+                return nil
+            }
+            connections[identifier] = connection
+            pendingHeaders.insert(identifier)
+            return accessGeneration
+        }
+        guard let generation else {
+            connection.cancel()
+            return
+        }
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection, self.isActive(connection, generation: generation) else { return }
+            if case .failed = state { self.finish(connection, generation: generation) }
+            if case .cancelled = state { self.finish(connection, generation: generation) }
+        }
         connection.start(queue: queue)
-        receiveRequest(on: connection, accumulated: Data())
+        queue.asyncAfter(deadline: .now() + headerDeadline) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            self.expireHeader(on: connection, generation: generation)
+        }
+        receiveRequest(on: connection, accumulated: Data(), generation: generation)
     }
 
-    private func receiveRequest(on connection: NWConnection, accumulated: Data) {
+    private func receiveRequest(on connection: NWConnection, accumulated: Data, generation: UInt64) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1_024) { [weak self] data, _, isComplete, error in
             guard let self else { connection.cancel(); return }
-            if error != nil { connection.cancel(); return }
+            guard self.isActive(connection, generation: generation) else { connection.cancel(); return }
+            if error != nil {
+                self.finish(connection, generation: generation)
+                return
+            }
             var requestData = accumulated
             if let data { requestData.append(data) }
             guard requestData.count <= 128 * 1_024 else {
-                self.send(status: 431, json: ["error": "Request headers are too large"], on: connection)
+                self.send(status: 431, json: ["error": "Request headers are too large"], on: connection, generation: generation)
                 return
             }
             if requestData.range(of: Data("\r\n\r\n".utf8)) != nil {
-                guard let request = String(data: requestData, encoding: .utf8) else {
-                    self.send(status: 400, json: ["error": "Request is not valid UTF-8"], on: connection)
+                guard self.completeHeader(on: connection, generation: generation) else {
+                    connection.cancel()
                     return
                 }
-                Task { await self.respond(to: request, on: connection) }
+                guard let request = String(data: requestData, encoding: .utf8) else {
+                    self.send(status: 400, json: ["error": "Request is not valid UTF-8"], on: connection, generation: generation)
+                    return
+                }
+                Task {
+                    guard self.isActive(connection, generation: generation) else { return }
+                    await self.respond(to: request, on: connection, generation: generation)
+                }
             } else if isComplete {
-                self.send(status: 400, json: ["error": "Incomplete request"], on: connection)
+                self.send(status: 400, json: ["error": "Incomplete request"], on: connection, generation: generation)
             } else {
-                self.receiveRequest(on: connection, accumulated: requestData)
+                self.receiveRequest(on: connection, accumulated: requestData, generation: generation)
             }
         }
     }
 
-    private func respond(to request: String, on connection: NWConnection) async {
+    private func respond(to request: String, on connection: NWConnection, generation: UInt64) async {
+        guard isActive(connection, generation: generation) else { return }
         let lines = request.components(separatedBy: "\r\n")
         let parts = (lines.first ?? "").split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count == 3, parts[2].hasPrefix("HTTP/1.") else {
-            send(status: 400, json: ["error": "Malformed request"], on: connection)
+            send(status: 400, json: ["error": "Malformed request"], on: connection, generation: generation)
             return
         }
 
@@ -185,73 +258,80 @@ public final class LocalAPIServer: @unchecked Sendable {
         let suppliedToken = authorization.count == 2 && authorization[0].caseInsensitiveCompare("Bearer") == .orderedSame
             ? authorization[1]
             : ""
-        let expectedToken = stateLock.withLock { token }
+        guard let expectedToken = activeToken(for: connection, generation: generation) else { return }
         guard constantTimeEqual(suppliedToken, expectedToken) else {
-            send(status: 401, json: ["error": "Unauthorised"], on: connection)
+            send(status: 401, json: ["error": "Unauthorised"], on: connection, generation: generation)
             return
         }
 
         let method = String(parts[0]).uppercased()
         let target = String(parts[1])
         guard method == "GET" else {
-            send(status: 405, json: ["error": "Read-only API"], on: connection)
+            send(status: 405, json: ["error": "Read-only API"], on: connection, generation: generation)
             return
         }
 
         do {
             if target == "/health" {
-                send(status: 200, json: ["status": "ok"], on: connection)
+                send(status: 200, json: ["status": "ok"], on: connection, generation: generation)
             } else if target.hasPrefix("/v1/records/") {
                 let rawID = target.replacingOccurrences(of: "/v1/records/", with: "").split(separator: "?")[0]
+                guard isActive(connection, generation: generation) else { return }
                 guard let id = UUID(uuidString: String(rawID)), let record = try await store.record(id: id) else {
-                    send(status: 404, json: ["error": "Record not found"], on: connection)
+                    send(status: 404, json: ["error": "Record not found"], on: connection, generation: generation)
                     return
                 }
-                send(status: 200, encodable: publicRecord(record), on: connection)
+                guard isActive(connection, generation: generation) else { return }
+                send(status: 200, encodable: PublicWorkspaceRecord(record), on: connection, generation: generation)
             } else if target.hasPrefix("/v1/records") {
                 let components = URLComponents(string: "http://localhost\(target)")
                 let query = components?.queryItems?.first(where: { $0.name == "q" })?.value ?? ""
                 let kind = components?.queryItems?.first(where: { $0.name == "kind" })?.value.flatMap(WorkspaceRecordKind.init(rawValue:))
                 let limit = components?.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
-                send(status: 200, encodable: try await store.search(query, kind: kind, limit: limit).map(publicRecord), on: connection)
-            } else if target == "/v1/recovery" {
-                send(status: 200, encodable: try await store.recoverableCaptures(), on: connection)
+                guard isActive(connection, generation: generation) else { return }
+                let records = try await store.search(query, kind: kind, limit: limit)
+                guard isActive(connection, generation: generation) else { return }
+                send(status: 200, encodable: records.map(PublicWorkspaceRecord.init), on: connection, generation: generation)
             } else {
-                send(status: 404, json: ["error": "Not found"], on: connection)
+                send(status: 404, json: ["error": "Not found"], on: connection, generation: generation)
             }
         } catch {
-            send(status: 500, json: ["error": error.localizedDescription], on: connection)
+            guard isActive(connection, generation: generation) else { return }
+            send(status: 500, json: ["error": error.localizedDescription], on: connection, generation: generation)
         }
     }
 
-    private func publicRecord(_ record: WorkspaceRecord) -> WorkspaceRecord {
-        var copy = record
-        for index in copy.webhookDeliveries.indices { copy.webhookDeliveries[index].payloadBody = nil }
-        return copy
-    }
-
-    private func send(status: Int, json: [String: String], on connection: NWConnection) {
+    private func send(status: Int, json: [String: String], on connection: NWConnection, generation: UInt64) {
         let data = (try? JSONSerialization.data(withJSONObject: json)) ?? Data("{}".utf8)
-        send(status: status, body: data, on: connection)
+        send(status: status, body: data, on: connection, generation: generation)
     }
 
-    private func send<T: Encodable>(status: Int, encodable: T, on connection: NWConnection) {
+    private func send<T: Encodable>(status: Int, encodable: T, on connection: NWConnection, generation: UInt64) {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        send(status: status, body: (try? encoder.encode(encodable)) ?? Data("{}".utf8), on: connection)
+        send(status: status, body: (try? encoder.encode(encodable)) ?? Data("{}".utf8), on: connection, generation: generation)
     }
 
-    private func send(status: Int, body: Data, on connection: NWConnection) {
+    private func send(status: Int, body: Data, on connection: NWConnection, generation: UInt64) {
+        guard isActive(connection, generation: generation) else { return }
         let reasons = [
             200: "OK", 400: "Bad Request", 401: "Unauthorised", 404: "Not Found",
             405: "Method Not Allowed", 431: "Request Header Fields Too Large", 500: "Internal Server Error",
         ]
         let header = "HTTP/1.1 \(status) \(reasons[status] ?? "OK")\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: \(body.count)\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n"
-        connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { _ in connection.cancel() })
+        connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { [weak self, weak connection] _ in
+            guard let connection else { return }
+            if let self, self.isActive(connection, generation: generation) {
+                self.finish(connection, generation: generation)
+            } else {
+                connection.cancel()
+            }
+        })
     }
 
     private func loadOrCreateToken() async throws -> String {
         if let value = try secretStore.string(for: KeychainSecretStore.localAPITokenAccount), !value.isEmpty {
+            removeLegacyTokenFile()
             return value
         }
 
@@ -260,12 +340,66 @@ public final class LocalAPIServer: @unchecked Sendable {
         let url = store.rootURL.appendingPathComponent("api.token")
         if let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
             try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
-            try FileManager.default.removeItem(at: url)
+            removeLegacyTokenFile()
             return value
         }
         let value = try KeychainSecretStore.randomToken()
         try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
         return value
+    }
+
+    private func removeLegacyTokenFile() {
+        let url = store.rootURL.appendingPathComponent("api.token")
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func isActive(_ connection: NWConnection, generation: UInt64) -> Bool {
+        stateLock.withLock {
+            accessGeneration == generation && connections[ObjectIdentifier(connection)] === connection
+        }
+    }
+
+    private func activeToken(for connection: NWConnection, generation: UInt64) -> String? {
+        stateLock.withLock {
+            guard accessGeneration == generation,
+                  connections[ObjectIdentifier(connection)] === connection,
+                  !token.isEmpty else { return nil }
+            return token
+        }
+    }
+
+    private func completeHeader(on connection: NWConnection, generation: UInt64) -> Bool {
+        stateLock.withLock {
+            let identifier = ObjectIdentifier(connection)
+            guard accessGeneration == generation, connections[identifier] === connection else { return false }
+            pendingHeaders.remove(identifier)
+            return true
+        }
+    }
+
+    private func expireHeader(on connection: NWConnection, generation: UInt64) {
+        let shouldCancel = stateLock.withLock {
+            let identifier = ObjectIdentifier(connection)
+            guard accessGeneration == generation,
+                  connections[identifier] === connection,
+                  pendingHeaders.contains(identifier) else { return false }
+            connections.removeValue(forKey: identifier)
+            pendingHeaders.remove(identifier)
+            return true
+        }
+        if shouldCancel { connection.cancel() }
+    }
+
+    private func finish(_ connection: NWConnection, generation: UInt64) {
+        let shouldCancel = stateLock.withLock {
+            let identifier = ObjectIdentifier(connection)
+            guard accessGeneration == generation, connections[identifier] === connection else { return false }
+            connections.removeValue(forKey: identifier)
+            pendingHeaders.remove(identifier)
+            return true
+        }
+        if shouldCancel { connection.cancel() }
     }
 
     private func constantTimeEqual(_ lhs: String, _ rhs: String) -> Bool {
