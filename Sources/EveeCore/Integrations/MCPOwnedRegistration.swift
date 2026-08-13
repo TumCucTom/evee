@@ -12,11 +12,20 @@ public struct MCPRegistrationCleanupFailure: Equatable, Sendable {
 }
 
 public struct MCPRevocationOutcome: Equatable, Sendable {
+    public let authorizationDisabled: Bool
     public let removals: [MCPRemovalResult]
+    public let cleanupWarnings: [MCPRegistrationCleanupFailure]
     public let cleanupFailures: [MCPRegistrationCleanupFailure]
 
-    public init(removals: [MCPRemovalResult], cleanupFailures: [MCPRegistrationCleanupFailure]) {
+    public init(
+        authorizationDisabled: Bool,
+        removals: [MCPRemovalResult],
+        cleanupWarnings: [MCPRegistrationCleanupFailure],
+        cleanupFailures: [MCPRegistrationCleanupFailure]
+    ) {
+        self.authorizationDisabled = authorizationDisabled
         self.removals = removals
+        self.cleanupWarnings = cleanupWarnings
         self.cleanupFailures = cleanupFailures
     }
 }
@@ -109,10 +118,12 @@ public enum MCPRegistrationCheckpoint: String, Sendable {
     case transactionLeaseAcquired
     case beforeTargetMutation
     case afterMutationIntent
+    case afterDirectoryCreationBeforeIdentity
     case afterAbsentTargetCreation
     case beforeTargetWrite
     case duringExistingTargetWrite
     case afterTargetWriteBeforeBindingCheck
+    case beforeRetainedFileRewrite
     case afterRevokeJournal
     case afterDisabledSettingsPersistence
     case afterFirstClientMutation
@@ -318,22 +329,36 @@ public enum MCPOwnedRegistration {
             operation: .enable,
             phase: .prepared,
             snapshots: snapshots,
-            createdDirectories: plannedDirectories
+            createdDirectories: plannedDirectories,
+            requiresManifestLoad: false
         )
         try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
 
         do {
             for index in handles.indices {
-                let created = try handles[index].prepareMissingDirectories()
-                for record in created {
-                    if let existing = journal.createdDirectories.firstIndex(where: {
-                        $0.rootPath == record.rootPath && $0.relativePath == record.relativePath
-                    }) {
-                        journal.createdDirectories[existing] = record
-                    } else {
-                        journal.createdDirectories.append(record)
-                    }
-                }
+                try handles[index].prepareMissingDirectories(
+                    beforeCreate: { record in
+                        if let existing = journal.createdDirectories.firstIndex(where: {
+                            $0.rootPath == record.rootPath && $0.relativePath == record.relativePath
+                        }) {
+                            journal.createdDirectories[existing] = record
+                        } else {
+                            journal.createdDirectories.append(record)
+                        }
+                        try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+                    },
+                    afterCreate: { record in
+                        if let existing = journal.createdDirectories.firstIndex(where: {
+                            $0.rootPath == record.rootPath && $0.relativePath == record.relativePath
+                        }) {
+                            journal.createdDirectories[existing] = record
+                        } else {
+                            journal.createdDirectories.append(record)
+                        }
+                        try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+                    },
+                    testing: testing
+                )
                 snapshots[index].parentIdentities = handles[index].parentIdentities
                 journal.snapshots = snapshots
                 try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
@@ -429,7 +454,9 @@ public enum MCPOwnedRegistration {
             )
         } catch {
             return MCPRevocationOutcome(
+                authorizationDisabled: false,
                 removals: [],
+                cleanupWarnings: [],
                 cleanupFailures: [MCPRegistrationCleanupFailure(
                     configurationURL: journalURL(storageRootURL: storageRootURL),
                     message: error.localizedDescription
@@ -437,39 +464,34 @@ public enum MCPOwnedRegistration {
             )
         }
         guard recovery.cleanupFailures.isEmpty else { return recovery }
+        let recoveryWarnings = recovery.cleanupWarnings
 
         let manifestURL = manifestURL(storageRootURL: storageRootURL)
-        let loadedManifest: OwnedRegistrationManifest?
-        do {
-            loadedManifest = try loadDurableIfPresent(
-                OwnedRegistrationManifest.self,
-                from: manifestURL
-            )
-            if let loadedManifest {
-                try validate(manifest: loadedManifest, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
-            }
-        } catch {
-            return MCPRevocationOutcome(
-                removals: [],
-                cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: manifestURL, message: error.localizedDescription)]
-            )
-        }
-        guard let manifest = loadedManifest else {
-            var disabled = settings
-            disabled.mcpEnabled = false
-            try await saveSettings(disabled)
-            return MCPRevocationOutcome(removals: [], cleanupFailures: [])
-        }
-        let journal = RegistrationTransactionJournal(
+        let transactionURL = journalURL(storageRootURL: storageRootURL)
+        let authorizationBarrier = RegistrationTransactionJournal(
             version: 2,
             operation: .revoke,
             phase: .prepared,
-            snapshots: manifest.snapshots,
-            createdDirectories: manifest.createdDirectories
+            snapshots: [],
+            createdDirectories: [],
+            requiresManifestLoad: true
         )
-        let transactionURL = journalURL(storageRootURL: storageRootURL)
-        try writeDurable(journal, to: transactionURL)
+        try writeDurable(authorizationBarrier, to: transactionURL)
         try testing?.hit(.afterRevokeJournal)
+
+        let manifestResult: Result<OwnedRegistrationManifest?, Error>
+        do {
+            let loaded: OwnedRegistrationManifest? = try loadDurableIfPresent(
+                OwnedRegistrationManifest.self,
+                from: manifestURL
+            )
+            if let loaded {
+                try validate(manifest: loaded, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
+            }
+            manifestResult = .success(loaded)
+        } catch {
+            manifestResult = .failure(error)
+        }
 
         var disabled = settings
         disabled.mcpEnabled = false
@@ -489,16 +511,82 @@ public enum MCPOwnedRegistration {
         }
         try testing?.hit(.afterDisabledSettingsPersistence)
 
+        let manifest: OwnedRegistrationManifest
+        switch manifestResult {
+        case .failure(let error):
+            return MCPRevocationOutcome(
+                authorizationDisabled: true,
+                removals: recovery.removals,
+                cleanupWarnings: recoveryWarnings,
+                cleanupFailures: [MCPRegistrationCleanupFailure(
+                    configurationURL: manifestURL,
+                    message: error.localizedDescription
+                )]
+            )
+        case .success(nil):
+            do {
+                try removeDurable(transactionURL)
+                return MCPRevocationOutcome(
+                    authorizationDisabled: true,
+                    removals: recovery.removals,
+                    cleanupWarnings: recoveryWarnings,
+                    cleanupFailures: []
+                )
+            } catch {
+                return MCPRevocationOutcome(
+                    authorizationDisabled: true,
+                    removals: recovery.removals,
+                    cleanupWarnings: recoveryWarnings,
+                    cleanupFailures: [MCPRegistrationCleanupFailure(
+                        configurationURL: transactionURL,
+                        message: error.localizedDescription
+                    )]
+                )
+            }
+        case .success(.some(let loaded)):
+            manifest = loaded
+        }
+
+        let journal = RegistrationTransactionJournal(
+            version: 2,
+            operation: .revoke,
+            phase: .prepared,
+            snapshots: manifest.snapshots,
+            createdDirectories: manifest.createdDirectories,
+            requiresManifestLoad: false
+        )
         do {
-            return try reverseLocked(
+            try writeDurable(journal, to: transactionURL)
+        } catch {
+            return MCPRevocationOutcome(
+                authorizationDisabled: true,
+                removals: recovery.removals,
+                cleanupWarnings: recoveryWarnings,
+                cleanupFailures: [MCPRegistrationCleanupFailure(
+                    configurationURL: transactionURL,
+                    message: error.localizedDescription
+                )]
+            )
+        }
+
+        do {
+            let outcome = try reverseLocked(
                 journal: journal,
                 allowedRootURLs: allowedRootURLs,
                 storageRootURL: storageRootURL,
                 testing: testing
             )
+            return MCPRevocationOutcome(
+                authorizationDisabled: outcome.authorizationDisabled,
+                removals: recovery.removals + outcome.removals,
+                cleanupWarnings: recoveryWarnings + outcome.cleanupWarnings,
+                cleanupFailures: outcome.cleanupFailures
+            )
         } catch {
             return MCPRevocationOutcome(
+                authorizationDisabled: true,
                 removals: [],
+                cleanupWarnings: recoveryWarnings,
                 cleanupFailures: [MCPRegistrationCleanupFailure(
                     configurationURL: transactionURL,
                     message: error.localizedDescription
@@ -518,11 +606,23 @@ public enum MCPOwnedRegistration {
         guard let journal: RegistrationTransactionJournal = try loadDurableIfPresent(
             RegistrationTransactionJournal.self,
             from: url
-        ) else { return MCPRecoveryOutcome(removals: [], cleanupFailures: []) }
+        ) else {
+            return MCPRecoveryOutcome(
+                authorizationDisabled: !settings.mcpEnabled,
+                removals: [],
+                cleanupWarnings: [],
+                cleanupFailures: []
+            )
+        }
         try validate(journal: journal, allowedRootURLs: allowedRootURLs, sourceURL: url)
         if journal.operation == .enable, journal.phase == .committed {
             try removeDurable(url)
-            return MCPRecoveryOutcome(removals: [], cleanupFailures: [])
+            return MCPRecoveryOutcome(
+                authorizationDisabled: !settings.mcpEnabled,
+                removals: [],
+                cleanupWarnings: [],
+                cleanupFailures: []
+            )
         }
         var disabled = settings
         disabled.mcpEnabled = false
@@ -530,8 +630,78 @@ public enum MCPOwnedRegistration {
             try await saveSettings(disabled)
         } catch {
             return MCPRecoveryOutcome(
+                authorizationDisabled: false,
                 removals: [],
+                cleanupWarnings: [],
                 cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: url, message: error.localizedDescription)]
+            )
+        }
+        if journal.operation == .revoke, journal.requiresManifestLoad == true {
+            let manifestURL = manifestURL(storageRootURL: storageRootURL)
+            let manifest: OwnedRegistrationManifest?
+            do {
+                manifest = try loadDurableIfPresent(OwnedRegistrationManifest.self, from: manifestURL)
+                if let manifest {
+                    try validate(manifest: manifest, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
+                }
+            } catch {
+                return MCPRecoveryOutcome(
+                    authorizationDisabled: true,
+                    removals: [],
+                    cleanupWarnings: [],
+                    cleanupFailures: [MCPRegistrationCleanupFailure(
+                        configurationURL: manifestURL,
+                        message: error.localizedDescription
+                    )]
+                )
+            }
+            guard let manifest else {
+                do {
+                    try removeDurable(url)
+                    return MCPRecoveryOutcome(
+                        authorizationDisabled: true,
+                        removals: [],
+                        cleanupWarnings: [],
+                        cleanupFailures: []
+                    )
+                } catch {
+                    return MCPRecoveryOutcome(
+                        authorizationDisabled: true,
+                        removals: [],
+                        cleanupWarnings: [],
+                        cleanupFailures: [MCPRegistrationCleanupFailure(
+                            configurationURL: url,
+                            message: error.localizedDescription
+                        )]
+                    )
+                }
+            }
+            let cleanupJournal = RegistrationTransactionJournal(
+                version: 2,
+                operation: .revoke,
+                phase: .prepared,
+                snapshots: manifest.snapshots,
+                createdDirectories: manifest.createdDirectories,
+                requiresManifestLoad: false
+            )
+            do {
+                try writeDurable(cleanupJournal, to: url)
+            } catch {
+                return MCPRecoveryOutcome(
+                    authorizationDisabled: true,
+                    removals: [],
+                    cleanupWarnings: [],
+                    cleanupFailures: [MCPRegistrationCleanupFailure(
+                        configurationURL: url,
+                        message: error.localizedDescription
+                    )]
+                )
+            }
+            return try reverseLocked(
+                journal: cleanupJournal,
+                allowedRootURLs: allowedRootURLs,
+                storageRootURL: storageRootURL,
+                testing: testing
             )
         }
         return try reverseLocked(
@@ -549,6 +719,7 @@ public enum MCPOwnedRegistration {
         testing: MCPRegistrationTesting?
     ) throws -> MCPRevocationOutcome {
         var removals: [MCPRemovalResult] = []
+        var warnings: [MCPRegistrationCleanupFailure] = []
         var failures: [MCPRegistrationCleanupFailure] = []
         for snapshot in journal.snapshots.reversed() where snapshot.effectiveMutationState != .planned {
             do {
@@ -558,10 +729,11 @@ public enum MCPOwnedRegistration {
                     continue
                 }
                 let handle = try AnchoredTarget.reopen(snapshot: snapshot, allowedRootURLs: allowedRootURLs)
-                let result = try handle.reverse(snapshot: snapshot)
-                if result == .reversed {
+                let result = try handle.reverse(snapshot: snapshot, testing: testing)
+                if result.removedRegistration {
                     removals.append(MCPRemovalResult(configurationURL: snapshot.selectedURL, removedRegistration: true))
                 }
+                if let warning = result.warning { warnings.append(warning) }
             } catch {
                 failures.append(MCPRegistrationCleanupFailure(
                     configurationURL: snapshot.selectedURL,
@@ -573,7 +745,12 @@ public enum MCPOwnedRegistration {
             for directory in journal.createdDirectories.reversed() {
                 do {
                     try testing?.hit(.beforeDirectoryCleanup, url: directory.url)
-                    try removeCreatedDirectoryIfOwned(directory, allowedRootURLs: allowedRootURLs)
+                    if let warning = try inspectCreatedDirectory(
+                        directory,
+                        allowedRootURLs: allowedRootURLs
+                    ) {
+                        warnings.append(warning)
+                    }
                 } catch {
                     failures.append(MCPRegistrationCleanupFailure(
                         configurationURL: directory.url,
@@ -583,13 +760,20 @@ public enum MCPOwnedRegistration {
             }
         }
         guard failures.isEmpty else {
-            return MCPRevocationOutcome(removals: removals.reversed(), cleanupFailures: failures)
+            return MCPRevocationOutcome(
+                authorizationDisabled: true,
+                removals: removals.reversed(),
+                cleanupWarnings: warnings,
+                cleanupFailures: failures
+            )
         }
         let manifest = manifestURL(storageRootURL: storageRootURL)
         if FileManager.default.fileExists(atPath: manifest.path) {
             do { try removeDurable(manifest) } catch {
                 return MCPRevocationOutcome(
+                    authorizationDisabled: true,
                     removals: removals.reversed(),
+                    cleanupWarnings: warnings,
                     cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: manifest, message: error.localizedDescription)]
                 )
             }
@@ -597,11 +781,18 @@ public enum MCPOwnedRegistration {
         let journalURL = journalURL(storageRootURL: storageRootURL)
         do { try removeDurable(journalURL) } catch {
             return MCPRevocationOutcome(
+                authorizationDisabled: true,
                 removals: removals.reversed(),
+                cleanupWarnings: warnings,
                 cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: journalURL, message: error.localizedDescription)]
             )
         }
-        return MCPRevocationOutcome(removals: removals.reversed(), cleanupFailures: [])
+        return MCPRevocationOutcome(
+            authorizationDisabled: true,
+            removals: removals.reversed(),
+            cleanupWarnings: warnings,
+            cleanupFailures: []
+        )
     }
 
     private static func validate(
@@ -649,10 +840,10 @@ public enum MCPOwnedRegistration {
         }
     }
 
-    private static func removeCreatedDirectoryIfOwned(
+    private static func inspectCreatedDirectory(
         _ record: CreatedDirectoryRecord,
         allowedRootURLs: [URL]
-    ) throws {
+    ) throws -> MCPRegistrationCleanupFailure? {
         guard allowedRootURLs.map({ $0.resolvingSymlinksInPath().standardizedFileURL.path }).contains(record.rootPath) else {
             throw MCPOwnedRegistrationError.invalidManifest(record.url)
         }
@@ -660,19 +851,26 @@ public enum MCPOwnedRegistration {
         let planned = try traversal.openDeepestDirectory(relativePath: record.relativePath)
         guard planned.missing.isEmpty else {
             _ = close(planned.descriptor)
-            return
+            return nil
         }
         defer { _ = close(planned.descriptor) }
-        guard let identity = record.identity else { return }
-        guard try descriptorIdentity(planned.descriptor) == identity else {
+        guard record.effectiveState != .planned else { return nil }
+        let observedIdentity = try descriptorIdentity(planned.descriptor)
+        guard let identity = record.identity else {
+            return MCPRegistrationCleanupFailure(
+                configurationURL: record.url,
+                message: "A directory created during local helper registration was retained for manual cleanup (device \(observedIdentity.deviceID), inode \(observedIdentity.fileID))."
+            )
+        }
+        guard observedIdentity == identity else {
             throw MCPOwnedRegistrationError.rollbackFailed(
                 primary: "Created-directory identity conflict.",
                 failures: [record.url.path]
             )
         }
-        throw MCPOwnedRegistrationError.rollbackFailed(
-            primary: "Transaction-created directory retained for manual cleanup because Darwin has no identity-bound directory removal.",
-            failures: [record.url.path]
+        return MCPRegistrationCleanupFailure(
+            configurationURL: record.url,
+            message: "A directory created during local helper registration was retained for manual cleanup."
         )
     }
 }
@@ -686,6 +884,7 @@ private struct RegistrationTransactionJournal: Codable {
     var phase: TransactionPhase
     var snapshots: [ManagedTargetSnapshot]
     var createdDirectories: [CreatedDirectoryRecord]
+    var requiresManifestLoad: Bool?
 }
 
 private struct OwnedRegistrationManifest: Codable {
@@ -713,11 +912,17 @@ private struct CreatedDirectoryRecord: Codable {
     var rootPath: String
     var relativePath: String
     var identity: FileIdentity?
+    var state: DirectoryMutationState?
     var url: URL { URL(fileURLWithPath: rootPath).appendingPathComponent(relativePath, isDirectory: true) }
+
+    var effectiveState: DirectoryMutationState {
+        state ?? (identity == nil ? .planned : .complete)
+    }
 }
 
 private enum ConfigurationFormat: String, Codable { case json, toml }
 private enum TargetMutationState: String, Codable { case planned, intent, complete }
+private enum DirectoryMutationState: String, Codable { case planned, intent, complete }
 
 private struct ManagedTargetSnapshot: Codable {
     var clientName: String
@@ -756,7 +961,10 @@ private struct ManagedTargetSnapshot: Codable {
     }
 }
 
-private enum ReverseResult { case reversed, alreadyReversed }
+private struct ReverseResult {
+    var removedRegistration: Bool
+    var warning: MCPRegistrationCleanupFailure?
+}
 
 private final class AnchoredTarget {
     let rootPath: String
@@ -774,7 +982,7 @@ private final class AnchoredTarget {
         var relative = parentIdentities.last?.relativePath ?? ""
         return missingDirectories.map { component in
             relative = relative.isEmpty ? component : relative + "/" + component
-            return CreatedDirectoryRecord(rootPath: rootPath, relativePath: relative, identity: nil)
+            return CreatedDirectoryRecord(rootPath: rootPath, relativePath: relative, identity: nil, state: .planned)
         }
     }
 
@@ -966,23 +1174,39 @@ private final class AnchoredTarget {
         throw posixError()
     }
 
-    func prepareMissingDirectories() throws -> [CreatedDirectoryRecord] {
-        guard !missingDirectories.isEmpty else { return [] }
+    func prepareMissingDirectories(
+        beforeCreate: (CreatedDirectoryRecord) throws -> Void,
+        afterCreate: (CreatedDirectoryRecord) throws -> Void,
+        testing: MCPRegistrationTesting?
+    ) throws {
+        guard !missingDirectories.isEmpty else { return }
         _ = close(parentDescriptor)
         var current = try traversal.duplicateRoot()
         var relative = ""
         var identities: [ParentIdentity] = [ParentIdentity(relativePath: "", identity: try descriptorIdentity(current))]
-        var created: [CreatedDirectoryRecord] = []
         let allParentComponents = pathComponents(targetRelativePath).dropLast()
         for component in allParentComponents {
             relative = relative.isEmpty ? component : relative + "/" + component
             var next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
             if next < 0, errno == ENOENT {
+                let intent = CreatedDirectoryRecord(
+                    rootPath: rootPath,
+                    relativePath: relative,
+                    identity: nil,
+                    state: .intent
+                )
+                try beforeCreate(intent)
                 guard mkdirat(current, component, 0o700) == 0, fsync(current) == 0 else { _ = close(current); throw posixError() }
+                try testing?.hit(.afterDirectoryCreationBeforeIdentity, url: intent.url)
                 next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
                 guard next >= 0 else { _ = close(current); throw posixError() }
                 let identity = try descriptorIdentity(next)
-                created.append(CreatedDirectoryRecord(rootPath: rootPath, relativePath: relative, identity: identity))
+                try afterCreate(CreatedDirectoryRecord(
+                    rootPath: rootPath,
+                    relativePath: relative,
+                    identity: identity,
+                    state: .complete
+                ))
             } else if next < 0 {
                 _ = close(current)
                 throw posixError()
@@ -993,7 +1217,6 @@ private final class AnchoredTarget {
         }
         parentDescriptor = current
         parentIdentities = identities
-        return created
     }
 
     func verifyCurrentBinding(snapshot: ManagedTargetSnapshot) throws {
@@ -1122,14 +1345,18 @@ private final class AnchoredTarget {
         }
     }
 
-    func reverse(snapshot: ManagedTargetSnapshot) throws -> ReverseResult {
-        let targetName = pathComponents(targetRelativePath).last!
+    func reverse(
+        snapshot: ManagedTargetSnapshot,
+        testing: MCPRegistrationTesting?
+    ) throws -> ReverseResult {
         guard let fd = targetDescriptor else {
-            if !snapshot.existed { return .alreadyReversed }
+            if !snapshot.existed { return ReverseResult(removedRegistration: false, warning: nil) }
             throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
         }
         let current = try readAll(fd)
-        if current == snapshot.beforeData { return .alreadyReversed }
+        if current == snapshot.beforeData {
+            return ReverseResult(removedRegistration: false, warning: retainedFileWarning(snapshot: snapshot))
+        }
         let expectedIdentity = snapshot.registeredIdentity ?? snapshot.originalIdentity
         guard try descriptorIdentity(fd) == expectedIdentity else {
             throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
@@ -1144,11 +1371,14 @@ private final class AnchoredTarget {
                 try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
                 guard fsync(parentDescriptor) == 0 else { throw posixError() }
             } else {
-                guard unlinkat(parentDescriptor, targetName, 0) == 0 else { throw posixError() }
-                try verifyTargetNameAbsent(snapshot: snapshot)
+                try testing?.hit(.beforeRetainedFileRewrite, url: snapshot.selectedURL)
+                try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+                try writeAll(ConfigurationImage.minimalData(format: snapshot.format), descriptor: fd)
+                guard fsync(fd) == 0 else { throw posixError() }
+                try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
                 guard fsync(parentDescriptor) == 0 else { throw posixError() }
             }
-            return .reversed
+            return ReverseResult(removedRegistration: true, warning: retainedFileWarning(snapshot: snapshot))
         }
         let currentOwned: Data?
         do {
@@ -1167,20 +1397,15 @@ private final class AnchoredTarget {
                 guard fsync(fd) == 0 else { throw posixError() }
                 try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
                 guard fsync(parentDescriptor) == 0 else { throw posixError() }
-                return .reversed
+                return ReverseResult(removedRegistration: true, warning: nil)
             }
             throw error
         }
-        if currentOwned == snapshot.beforeOwned { return .alreadyReversed }
+        if currentOwned == snapshot.beforeOwned {
+            return ReverseResult(removedRegistration: false, warning: retainedFileWarning(snapshot: snapshot))
+        }
         guard currentOwned == snapshot.afterOwned else {
             throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
-        }
-        if !snapshot.existed, current == snapshot.afterData {
-            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
-            guard unlinkat(parentDescriptor, targetName, 0) == 0 else { throw posixError() }
-            try verifyTargetNameAbsent(snapshot: snapshot)
-            guard fsync(parentDescriptor) == 0 else { throw posixError() }
-            return .reversed
         }
         let fullRestore = current == snapshot.afterData
         let restored: Data
@@ -1194,27 +1419,24 @@ private final class AnchoredTarget {
                 sourceURL: snapshot.selectedURL
             )
         }
+        if !snapshot.existed {
+            try testing?.hit(.beforeRetainedFileRewrite, url: snapshot.selectedURL)
+        }
         try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
         try writeAll(restored, descriptor: fd)
         if fullRestore { try restoreMetadata(snapshot: snapshot, descriptor: fd) }
         guard fsync(fd) == 0 else { throw posixError() }
         try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
         guard fsync(parentDescriptor) == 0 else { throw posixError() }
-        return .reversed
+        return ReverseResult(removedRegistration: true, warning: retainedFileWarning(snapshot: snapshot))
     }
 
-    private func verifyTargetNameAbsent(snapshot: ManagedTargetSnapshot) throws {
-        _ = try traversal.openDirectory(
-            relativePath: pathComponents(snapshot.targetRelativePath).dropLast().joined(separator: "/"),
-            verify: snapshot.parentIdentities,
-            closeResult: true
+    private func retainedFileWarning(snapshot: ManagedTargetSnapshot) -> MCPRegistrationCleanupFailure? {
+        guard !snapshot.existed else { return nil }
+        return MCPRegistrationCleanupFailure(
+            configurationURL: snapshot.selectedURL,
+            message: "The client configuration file was retained after removing Evee's entry. Remove the file manually if it is no longer needed."
         )
-        let targetName = pathComponents(targetRelativePath).last!
-        var info = stat()
-        guard fstatat(parentDescriptor, targetName, &info, AT_SYMLINK_NOFOLLOW) == -1,
-              errno == ENOENT else {
-            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
-        }
     }
 }
 
@@ -1280,6 +1502,14 @@ private struct ConfigurationImage {
     var afterData: Data
     var beforeOwned: Data?
     var afterOwned: Data
+
+    static func minimalData(format: ConfigurationFormat) -> Data {
+        switch format {
+        case .json: Data("{\n  \"mcpServers\" : {\n\n  }\n}".utf8)
+        case .toml: Data()
+        }
+    }
+
     static func make(
         format: ConfigurationFormat,
         before: Data?,

@@ -1075,11 +1075,12 @@ private func checkMCPRevocation() async throws {
             }
         )
         throw CoreCheckError.assertionFailed("enable settings save failure was ignored")
-    } catch MCPOwnedRegistrationError.rollbackFailed(let primary, let failures) {
-        try require(primary == SyntheticMCPPersistenceError.rejected.localizedDescription, "enable save failure lost its primary error")
-        try require(failures.contains(where: { $0.localizedCaseInsensitiveContains("manual") }), "enable rollback did not report retained transaction-created directories")
+    } catch SyntheticMCPPersistenceError.rejected {
+        // Expected: benign retained files/directories do not replace the primary save error.
     }
-    try require(!FileManager.default.fileExists(atPath: failedSaveConfiguration.path), "enable save failure left a registration")
+    let failedSaveRetained = try JSONSerialization.jsonObject(with: Data(contentsOf: failedSaveConfiguration)) as! [String: Any]
+    let failedSaveServers = failedSaveRetained["mcpServers"] as! [String: Any]
+    try require(failedSaveServers["evee"] == nil, "enable save failure left an Evee registration")
     try require(FileManager.default.fileExists(atPath: failedSaveConfiguration.deletingLastPathComponent().path), "enable rollback unsafely removed a transaction-created directory by name")
     try FileManager.default.removeItem(at: home.appendingPathComponent(".save-failure", isDirectory: true))
     let failedSaveRecovery = try await MCPOwnedRegistration.recover(
@@ -1116,7 +1117,8 @@ private func checkMCPRevocation() async throws {
         settings: rollbackCleanupSettings,
         saveSettings: { _ in }
     )
-    try require(rollbackCleanup.cleanupFailures.contains(where: { $0.message.localizedCaseInsensitiveContains("manual") }), "later rollback did not report retained transaction-created directories")
+    try require(rollbackCleanup.cleanupFailures.isEmpty, "later rollback treated benign residue as a destructive cleanup failure")
+    try require(rollbackCleanup.cleanupWarnings.contains(where: { $0.message.localizedCaseInsensitiveContains("manual") }), "later rollback did not report retained transaction-created directories")
     try require(FileManager.default.fileExists(atPath: failedRestoreConfiguration.deletingLastPathComponent().path), "later cleanup unsafely removed a transaction-created directory by name")
     try FileManager.default.removeItem(at: home.appendingPathComponent(".restore-failure", isDirectory: true))
     let completedRollbackCleanup = try await MCPOwnedRegistration.revoke(
@@ -1307,6 +1309,7 @@ private func checkMCPRevocation() async throws {
         saveSettings: { _ in }
     )
     try require(createdJSONRevoke.cleanupFailures.isEmpty, "new JSON cleanup conflicted with unrelated additions")
+    try require(createdJSONRevoke.cleanupWarnings.contains(where: { $0.configurationURL == createdJSONConfiguration && $0.message.localizedCaseInsensitiveContains("retained") }), "new JSON cleanup did not report its retained file")
     let createdJSONRestored = try JSONSerialization.jsonObject(with: Data(contentsOf: createdJSONConfiguration)) as! [String: Any]
     let createdJSONRestoredServers = createdJSONRestored["mcpServers"] as! [String: Any]
     try require(createdJSONRestored["theme"] as? String == "later" && createdJSONRestoredServers["later"] != nil, "new JSON cleanup discarded unrelated additions")
@@ -1331,9 +1334,45 @@ private func checkMCPRevocation() async throws {
         saveSettings: { _ in }
     )
     try require(createdTOMLRevoke.cleanupFailures.isEmpty, "new TOML cleanup conflicted with unrelated additions")
+    try require(createdTOMLRevoke.cleanupWarnings.contains(where: { $0.configurationURL == createdTOMLConfiguration && $0.message.localizedCaseInsensitiveContains("retained") }), "new TOML cleanup did not report its retained file")
     let createdTOMLRestored = try String(contentsOf: createdTOMLConfiguration)
     try require(createdTOMLRestored.contains("[features]") && createdTOMLRestored.contains("later = true"), "new TOML cleanup discarded unrelated additions")
     try require(!createdTOMLRestored.contains("mcp_servers.evee"), "new TOML cleanup retained the Evee-owned table")
+
+    for (suffix, pathExtension) in [("json", "json"), ("toml", "toml")] {
+        let formerUnlinkConfiguration = createdEditDirectory.appendingPathComponent("former-unlink-\(suffix).\(pathExtension)")
+        let formerUnlinkDetached = createdEditDirectory.appendingPathComponent("former-unlink-\(suffix)-detached.\(pathExtension)")
+        let formerUnlinkReplacement = createdEditDirectory.appendingPathComponent("former-unlink-\(suffix)-replacement.\(pathExtension)")
+        let replacementSentinel = Data((pathExtension == "json" ? "{\"replacement\":\"\(suffix)\"}" : "replacement = \"\(suffix)\"\n").utf8)
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [MCPClientConfiguration(name: "Former unlink \(suffix)", configurationURL: formerUnlinkConfiguration)],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: EveeSettings(),
+            saveSettings: { _ in }
+        )
+        try replacementSentinel.write(to: formerUnlinkReplacement)
+        let formerUnlinkOutcome = try await MCPOwnedRegistration.revoke(
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: accessSettings,
+            saveSettings: { _ in },
+            testing: MCPRegistrationTesting(checkpoint: { checkpoint, url in
+                if checkpoint == .beforeRetainedFileRewrite, url == formerUnlinkConfiguration {
+                    guard link(formerUnlinkConfiguration.path, formerUnlinkDetached.path) == 0,
+                          rename(formerUnlinkReplacement.path, formerUnlinkConfiguration.path) == 0 else {
+                        throw CoreCheckError.assertionFailed("could not inject \(suffix) former-unlink replacement")
+                    }
+                }
+            })
+        )
+        let replacementCurrent = try Data(contentsOf: formerUnlinkConfiguration)
+        try require(replacementCurrent == replacementSentinel, "\(suffix) former-unlink cleanup removed or changed the replacement")
+        try require(formerUnlinkOutcome.cleanupFailures.contains(where: { $0.configurationURL == formerUnlinkConfiguration }), "\(suffix) former-unlink replacement did not retain a binding conflict")
+        try FileManager.default.removeItem(at: MCPOwnedRegistration.manifestURL(storageRootURL: registrationRoot))
+        try FileManager.default.removeItem(at: MCPOwnedRegistration.journalURL(storageRootURL: registrationRoot))
+    }
 
     _ = try await MCPOwnedRegistration.enable(
         clients: [MCPClientConfiguration(name: "Owned conflict", configurationURL: concurrentEditConfiguration)],
@@ -1608,7 +1647,11 @@ private func checkMCPRevocation() async throws {
         saveSettings: { _ in }
     )
     try require(absentIntentRecovery.cleanupFailures.isEmpty, "absent-create recovery failed")
-    try require(!FileManager.default.fileExists(atPath: absentIntentConfiguration.path), "absent-create recovery retained the exact transaction-created empty file")
+    try require(absentIntentRecovery.cleanupWarnings.contains(where: { $0.configurationURL == absentIntentConfiguration }), "absent-create recovery did not report the retained file")
+    try require(FileManager.default.fileExists(atPath: absentIntentConfiguration.path), "absent-create recovery removed the transaction-created file by name")
+    let absentIntentRetained = try JSONSerialization.jsonObject(with: Data(contentsOf: absentIntentConfiguration)) as! [String: Any]
+    let absentIntentServers = absentIntentRetained["mcpServers"] as! [String: Any]
+    try require(absentIntentServers["evee"] == nil, "absent-create recovery retained the Evee entry")
 
     let revokeCrashDirectory = home.appendingPathComponent(".revoke-crash", isDirectory: true)
     try FileManager.default.createDirectory(at: revokeCrashDirectory, withIntermediateDirectories: true)
@@ -1654,6 +1697,37 @@ private func checkMCPRevocation() async throws {
         try require(revokeCrashRestored == revokeCrashBefore, "\(crashCheckpoint.rawValue) revoke recovery did not restore the exact before-image")
         try require(revokeCrashSaves.values.contains(false), "\(crashCheckpoint.rawValue) recovery did not persist fail-closed authorization")
     }
+
+    let mkdirIntentRoot = home.appendingPathComponent(".mkdir-intent", isDirectory: true)
+    let mkdirIntentConfiguration = mkdirIntentRoot.appendingPathComponent("child/mcp.json")
+    do {
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [MCPClientConfiguration(name: "Directory intent", configurationURL: mkdirIntentConfiguration)],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: EveeSettings(),
+            saveSettings: { _ in },
+            testing: MCPRegistrationTesting(crashAt: .afterDirectoryCreationBeforeIdentity)
+        )
+        throw CoreCheckError.assertionFailed("injected directory-creation crash completed enable")
+    } catch MCPRegistrationInjectedCrash.checkpoint(.afterDirectoryCreationBeforeIdentity) {
+        // Expected.
+    }
+    try require(FileManager.default.fileExists(atPath: mkdirIntentRoot.path), "directory crash checkpoint ran before mkdirat")
+    try require(FileManager.default.fileExists(atPath: MCPOwnedRegistration.journalURL(storageRootURL: registrationRoot).path), "directory crash discarded its durable intent")
+    let mkdirIntentRecovery = try await MCPOwnedRegistration.recover(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: EveeSettings(),
+        saveSettings: { _ in }
+    )
+    try require(mkdirIntentRecovery.cleanupFailures.isEmpty, "unbound directory intent became a destructive cleanup failure")
+    try require(mkdirIntentRecovery.cleanupWarnings.contains(where: {
+        $0.configurationURL == mkdirIntentRoot && $0.message.localizedCaseInsensitiveContains("manual")
+    }), "unbound directory residue was silently finalized")
+    try require(FileManager.default.fileExists(atPath: mkdirIntentRoot.path), "recovery removed an unbound directory by name")
+    try require(!FileManager.default.fileExists(atPath: MCPOwnedRegistration.journalURL(storageRootURL: registrationRoot).path), "warning-only directory recovery retained a fail-closed journal")
 
     for crashCheckpoint in [MCPRegistrationCheckpoint.afterFirstClientMutation, .beforeManifestWrite] {
         let crashConfiguration = home.appendingPathComponent(".crash-\(crashCheckpoint.rawValue)/mcp.json")
@@ -1879,6 +1953,82 @@ private func checkMCPRevocation() async throws {
     enabled.mcpEnabled = true
     try await library.save(enabled)
     try await library.upsert(WorkspaceRecord(kind: .memo, title: "Synthetic private workspace", text: "revocation sentinel"))
+
+    let corruptManifestConfiguration = home.appendingPathComponent(".corrupt-manifest/client.json")
+    try FileManager.default.createDirectory(at: corruptManifestConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{\"keep\":\"corrupt-manifest\"}".utf8).write(to: corruptManifestConfiguration)
+    _ = try await MCPOwnedRegistration.enable(
+        clients: [MCPClientConfiguration(name: "Corrupt manifest", configurationURL: corruptManifestConfiguration)],
+        executableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: libraryRoot,
+        settings: enabled,
+        saveSettings: { settings in try await library.save(settings) }
+    )
+    let corruptManifestURL = MCPOwnedRegistration.manifestURL(storageRootURL: libraryRoot)
+    let corruptJournalURL = MCPOwnedRegistration.journalURL(storageRootURL: libraryRoot)
+    try Data("{\"version\":".utf8).write(to: corruptManifestURL)
+    let corruptOutcome = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: libraryRoot,
+        settings: enabled,
+        saveSettings: { settings in try await library.save(settings) }
+    )
+    try require(corruptOutcome.authorizationDisabled, "corrupt manifest cleanup returned without persisted-disabled authorization")
+    try require(corruptOutcome.cleanupFailures.contains(where: { $0.configurationURL == corruptManifestURL }), "corrupt manifest cleanup did not report retained manual action")
+    let corruptPersistedSettings = try await library.loadSettings()
+    try require(!corruptPersistedSettings.mcpEnabled, "corrupt manifest revoke did not persist disabled authorization")
+    try require(FileManager.default.fileExists(atPath: corruptJournalURL.path), "corrupt manifest revoke did not retain its fail-closed barrier")
+    try require(FileManager.default.fileExists(atPath: corruptManifestURL.path), "corrupt manifest revoke discarded the unreadable ownership record")
+
+    let corruptHelper = Process()
+    let corruptInput = Pipe()
+    let corruptOutput = Pipe()
+    let corruptErrors = Pipe()
+    corruptHelper.executableURL = packagedHelper
+    corruptHelper.standardInput = corruptInput
+    corruptHelper.standardOutput = corruptOutput
+    corruptHelper.standardError = corruptErrors
+    var corruptEnvironment = ProcessInfo.processInfo.environment
+    corruptEnvironment["CFFIXED_USER_HOME"] = home.path
+    corruptHelper.environment = corruptEnvironment
+    try corruptHelper.run()
+    try writeMCPRequest([
+        "jsonrpc": "2.0",
+        "id": 49,
+        "method": "tools/call",
+        "params": ["name": "search", "arguments": ["query": "revocation"]],
+    ], to: corruptInput.fileHandleForWriting)
+    let corruptDenied = try readMCPResponse(from: corruptOutput.fileHandleForReading)
+    let corruptDeniedError = corruptDenied["error"] as? [String: Any]
+    try require(corruptDeniedError?["code"] as? Int == -32001, "helper read through a corrupt-manifest revoke barrier")
+    let corruptDeniedText = String(decoding: try JSONSerialization.data(withJSONObject: corruptDenied), as: UTF8.self)
+    try require(!corruptDeniedText.contains("revocation sentinel"), "corrupt-manifest helper denial exposed workspace data")
+    try corruptInput.fileHandleForWriting.close()
+    corruptHelper.waitUntilExit()
+    try require(corruptHelper.terminationStatus == 0, "corrupt-manifest helper failed: \(String(decoding: corruptErrors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))")
+
+    try FileManager.default.removeItem(at: corruptJournalURL)
+    try FileManager.default.removeItem(at: corruptManifestURL)
+    try FileManager.default.removeItem(at: corruptManifestConfiguration)
+    try await library.save(enabled)
+    try Data("{\"version\":".utf8).write(to: corruptManifestURL)
+    do {
+        _ = try await MCPOwnedRegistration.revoke(
+            allowedRootURLs: [home],
+            storageRootURL: libraryRoot,
+            settings: enabled,
+            saveSettings: { _ in throw SyntheticMCPPersistenceError.rejected }
+        )
+        throw CoreCheckError.assertionFailed("corrupt-manifest disable save failure returned a cleanup outcome")
+    } catch SyntheticMCPPersistenceError.rejected {
+        // Expected.
+    }
+    let corruptSaveFailureSettings = try await library.loadSettings()
+    try require(corruptSaveFailureSettings.mcpEnabled, "corrupt-manifest save failure changed persisted authorization")
+    try require(!FileManager.default.fileExists(atPath: corruptJournalURL.path), "corrupt-manifest save failure retained its untouched barrier")
+    try require(FileManager.default.fileExists(atPath: corruptManifestURL.path), "corrupt-manifest save failure removed the ownership record")
+    try FileManager.default.removeItem(at: corruptManifestURL)
 
     let process = Process()
     let input = Pipe()

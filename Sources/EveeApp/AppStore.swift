@@ -276,12 +276,24 @@ final class AppStore: ObservableObject {
                 )
                 settings = try await library.loadSettings()
                 if !recovery.cleanupFailures.isEmpty {
-                    statusMessage = "Local helper access is disabled. An unfinished client registration needs manual cleanup."
+                    statusMessage = recovery.authorizationDisabled
+                        ? "Local helper access is disabled. An unfinished client registration needs manual cleanup."
+                        : "Local helper access remains enabled because the setting could not be saved. Registration recovery needs manual cleanup."
                 }
             } catch {
-                settings.mcpEnabled = false
-                try await library.save(settings)
-                statusMessage = "Local helper access is disabled. Registration recovery needs manual cleanup: \(error.localizedDescription)"
+                let recoveryError = error
+                var disabled = settings
+                disabled.mcpEnabled = false
+                do {
+                    try await library.save(disabled)
+                    settings = disabled
+                    statusMessage = "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                } catch {
+                    settings = (try? await library.loadSettings()) ?? settings
+                    statusMessage = settings.mcpEnabled
+                        ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"
+                        : "Local helper access is disabled. Registration recovery needs manual cleanup: \(recoveryError.localizedDescription)"
+                }
             }
             configuredWebhookDestination = normalizedWebhookDestination(settings.webhookURL)
             try await loadAndMigrateSecrets()
@@ -395,7 +407,9 @@ final class AppStore: ObservableObject {
             settings: settings,
             saveSettings: { [library] settings in try await library.save(settings) }
         )
-        settings.mcpEnabled = false
+        if outcome.authorizationDisabled {
+            settings.mcpEnabled = false
+        }
         return outcome
     }
 

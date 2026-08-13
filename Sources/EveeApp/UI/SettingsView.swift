@@ -411,12 +411,17 @@ struct SettingsView: View {
         do {
             let outcome = try await store.revokeLocalHelperAccess()
             let removed = outcome.removals.filter(\.removedRegistration).count
-            if outcome.cleanupFailures.isEmpty {
+            if !outcome.authorizationDisabled {
+                integrationMessage = outcome.cleanupFailures.isEmpty
+                    ? "Local helper access remains enabled because the setting could not be saved."
+                    : "Local helper access remains enabled. Registration recovery needs manual cleanup."
+            } else if outcome.cleanupFailures.isEmpty, outcome.cleanupWarnings.isEmpty {
                 integrationMessage = removed == 0
                     ? "Local helper access is disabled. No owned client registrations were present."
                     : "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"). Restart them to disconnect."
             } else {
-                integrationMessage = "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"); \(outcome.cleanupFailures.count) \(outcome.cleanupFailures.count == 1 ? "client needs" : "clients need") manual cleanup."
+                let cleanupCount = outcome.cleanupWarnings.count + outcome.cleanupFailures.count
+                integrationMessage = "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"); \(cleanupCount) \(cleanupCount == 1 ? "item needs" : "items need") manual cleanup."
             }
             refreshMCPClients()
         } catch {
