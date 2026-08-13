@@ -23,6 +23,9 @@ struct SettingsView: View {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
+                Text("Default discard shortcut: \(GlobalShortcutDefaults.cancelCaptureDescription)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 KeyboardShortcuts.Recorder("Transform selection:", name: .transformSelection)
                 Picker("Local model", selection: $store.settings.model) {
                     ForEach(SpeechModel.allCases, id: \.self) { model in

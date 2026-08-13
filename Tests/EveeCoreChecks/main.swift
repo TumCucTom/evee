@@ -3796,6 +3796,14 @@ private func checkAccessibilityEvents() throws {
     try require(reducer.receive(.modelReady) == "Local model is ready.", "model readiness was not announced")
 
     try require(reducer.receive(.microphoneSilence) == "No microphone signal has been detected. Check the selected input and mute switch.", "microphone silence was not announced")
+    try require(reducer.receive(.channelFailed(.system, "Synthetic unrelated warning")) == "System audio warning. Synthetic unrelated warning", "unrelated warning was not announced")
+    try require(reducer.receive(.microphoneSilence) == nil, "one silence incident was announced more than once")
+    try require(reducer.receive(.microphoneSignalRestored) == nil, "microphone recovery emitted an announcement")
+    try require(reducer.receive(.microphoneSilence) == "No microphone signal has been detected. Check the selected input and mute switch.", "a later silence incident was suppressed")
+    var simpleSilenceReducer = AccessibilityAnnouncementReducer()
+    _ = simpleSilenceReducer.receive(.microphoneSilence)
+    _ = simpleSilenceReducer.receive(.microphoneSignalRestored)
+    try require(simpleSilenceReducer.receive(.microphoneSilence) != nil, "silence-clear-silence did not begin a new incident")
     try require(reducer.receive(.channelFailed(.system, "Synthetic channel failure")) == "System audio warning. Synthetic channel failure", "channel failure was not announced")
     try require(reducer.receive(.webhookRevoked) == "Meeting webhook access revoked.", "webhook revocation was not announced")
     try require(reducer.receive(.helperRevoked) == "Local helper access revoked.", "helper revocation was not announced")
@@ -3821,6 +3829,14 @@ private func checkSystemVoiceStatus() throws {
 
     let starting = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .disabled, warnings: [])
     try require(starting.phase == .captureStarting && starting.availableActions == [.discard], "capture startup did not expose discard")
+    let startingWithOpenCaptureMicrophone = SystemVoiceStatus.make(
+        capture: .starting(kind: .meeting),
+        hotMic: .disabled,
+        captureMicrophone: .open,
+        warnings: []
+    )
+    try require(startingWithOpenCaptureMicrophone.isMicrophoneOpen, "capture startup hid the microphone while system audio was starting")
+    try require(startingWithOpenCaptureMicrophone.hudTitle.contains("Microphone open"), "capture startup HUD did not expose the open microphone")
     let startingDuringWakeCleanup = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .stopping, warnings: [])
     try require(startingDuringWakeCleanup.isMicrophoneOpen, "capture startup hid a wake microphone that was still closing")
 
@@ -3835,6 +3851,13 @@ private func checkSystemVoiceStatus() throws {
     try require(recording.hudWarning != nil, "capture health warnings were absent from the HUD")
     try require(recording.menuTitle.contains("warning"), "capture health warnings were absent from the menu")
     try require(recording.availableActions == [.stopAndTranscribe, .discard], "recording did not expose stop and discard")
+    let recordingWhileStopAwaits = SystemVoiceStatus.make(
+        capture: .recording(startedAt: .now, level: 0),
+        hotMic: .disabled,
+        captureMicrophone: .stopping,
+        warnings: []
+    )
+    try require(recordingWhileStopAwaits.isMicrophoneOpen, "an awaited recorder stop was presented as already closed")
 
     let processing = SystemVoiceStatus.make(capture: .transcribing, hotMic: .disabled, warnings: [])
     try require(processing.phase == .processing && !processing.isMicrophoneOpen, "transcription status was inaccurate")
@@ -3843,6 +3866,14 @@ private func checkSystemVoiceStatus() throws {
     let failed = SystemVoiceStatus.make(capture: .failed("Synthetic capture failure"), hotMic: .active, warnings: [])
     try require(failed.phase == .failed && !failed.isMicrophoneOpen, "capture failure did not override stale wake state")
     try require(failed.hudDetail.contains("Synthetic capture failure"), "capture failure detail was hidden")
+    let failedWithOpenMicrophone = SystemVoiceStatus.make(
+        capture: .failed("Synthetic stop failure"),
+        hotMic: .disabled,
+        captureMicrophone: .open,
+        warnings: []
+    )
+    try require(failedWithOpenMicrophone.isMicrophoneOpen, "capture failure hid a recorder that did not stop")
+    try require(failedWithOpenMicrophone.hudTitle.contains("Microphone open"), "capture failure did not visibly warn that the microphone remained open")
     let protected = SystemVoiceStatus.make(capture: .checkpointed("Synthetic recovery checkpoint"), hotMic: .disabled, warnings: [])
     try require(protected.phase == .protected && !protected.isMicrophoneOpen, "recovery checkpoint was presented as a live or failed capture")
     try require(protected.menuTitle == "Capture protected", "recovery checkpoint lost its protected status")

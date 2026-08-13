@@ -9,7 +9,7 @@ Base: `d4267e5`
 - Added reducer-backed `AccessibilityStatusEvent` announcements for wake listening, capture, recovery, model downloads, channel health, and integration revocation.
 - Consolidated every `NSAccessibility.post` call into `AccessibilityAnnouncementCoordinator`.
 - Made wake-listener cleanup explicit with a visible `.stopping` phase. The stopped announcement is emitted only after the listener has stopped; stale pending starts cannot publish active state.
-- Kept the HUD status-only. Stop and Discard remain independently labelled menu actions, and Discard has a configurable global Option–Command–Escape default.
+- Kept the HUD status-only. Stop and Discard remain independently labelled menu actions, and Discard has a configurable global Control–Option–Command–Escape default.
 - Preserved the protected recovery presentation as its own system status phase rather than folding it into failure.
 
 ## TDD Evidence
@@ -48,3 +48,33 @@ The checks cover duplicate lifecycle publication, monotonic 10% download milesto
 - An unmodified app/package build is blocked in KeyboardShortcuts 2.4.0 because this Command Line Tools installation cannot load `PreviewsMacros` for dependency `#Preview` declarations.
 - XCTest is unavailable to this toolchain (`no such module 'XCTest'`), so the XCTest targets could not execute locally. Equivalent behavior is covered by the executable core checks.
 - Packaged-app and live VoiceOver verification require an interactive signed macOS build and were not run. No real microphone or user workspace data was used.
+
+## Review Round 1/5
+
+Addressed all five practical findings:
+
+- Added an independent `CaptureMicrophoneState` input to `SystemVoiceStatus`. The app publishes `.open` immediately after microphone startup succeeds, keeps `.stopping` visibly open until the awaited stop completes, and retains microphone-open truth in failure/protected presentations.
+- Moved `.transcribing` publication to the first post-recorder-stop boundary. Stop and Discard disappear before live-transcript cleanup and recovery persistence awaits; `captureStopped` remains after recorder/live cleanup and before persistence.
+- Gated the global discard handler through `systemVoiceStatus.availableActions` and restricted `cancelCapture()` to starting/recording lifecycles. Finishing, transcription, delivery, and existing recovery-discard paths cannot be conflated.
+- Replaced the reserved Option–Command–Escape default with Control–Option–Command–Escape, verified it does not collide with the push-to-talk or transform defaults, and displayed the exact default in Settings.
+- Added a microphone-signal-restored reducer event. Repeated publications during one silence incident remain suppressed; silence→clear→silence announces the new incident exactly once.
+
+TDD additions include executable reducer/status contracts plus app lifecycle contracts that suspend system-audio startup and recovery persistence. The suspended-persistence contract verifies processing state, empty actions, rejected shortcut/direct cancellation, retained source audio, failure presentation, and discoverable recovery audio.
+
+Review verification:
+
+```text
+accessibility-events: passed
+accessibility-copy: passed
+system-voice-status: passed
+hot-mic-race: passed
+lifecycle-state: passed
+termination-checkpoint: passed
+quit-track-independence: passed
+```
+
+- All 34 `evee-core-checks` filters passed sequentially.
+- `swift build --target EveeCore --jobs 2` passed.
+- `swift build --target EveeApp --jobs 2` passed with the same temporary preview-only dependency guard described above; the checkout was restored clean.
+- The new app lifecycle/shortcut test source passed a synthetic XCTest-module typecheck. Native XCTest execution remains blocked because this Command Line Tools installation has no `XCTest` module.
+- `git diff --check` and the direct accessibility-post/HUD-control source scans passed. No real microphone or user data was used.

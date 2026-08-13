@@ -18,6 +18,17 @@ public enum SystemVoiceAction: Hashable, Sendable {
     case discard
 }
 
+public enum CaptureMicrophoneState: Equatable, Sendable {
+    case closed
+    case starting
+    case open
+    case stopping
+
+    public var isOpen: Bool {
+        self == .open || self == .stopping
+    }
+}
+
 public enum CaptureHealthReason: Equatable, Sendable {
     case silence
     case unavailable
@@ -62,75 +73,100 @@ public struct SystemVoiceStatus: Equatable, Sendable {
     public static func make(
         capture: CaptureState,
         hotMic: HotMicState,
+        captureMicrophone suppliedCaptureMicrophone: CaptureMicrophoneState? = nil,
         warnings: [CaptureHealthWarning]
     ) -> SystemVoiceStatus {
+        let captureMicrophone = suppliedCaptureMicrophone ?? defaultCaptureMicrophone(for: capture)
         let warningSuffix = warnings.isEmpty ? "" : " · warning"
         let warningDetail = warnings.map(\.message).joined(separator: " ")
 
         switch capture {
         case .starting:
-            let wakeMicrophoneIsClosing = hotMic == .active || hotMic == .stopping
+            let microphoneIsOpen = captureMicrophone.isOpen || hotMic == .active || hotMic == .stopping
             return Self(
                 phase: .captureStarting,
-                isMicrophoneOpen: wakeMicrophoneIsClosing,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Starting capture\(warningSuffix)",
-                hudTitle: wakeMicrophoneIsClosing ? "Microphone open · Starting capture" : "Starting capture",
+                hudTitle: microphoneIsOpen ? "Microphone open · Starting capture" : "Starting capture",
                 hudDetail: detail("Preparing local audio. Use Discard in the Evee menu or your cancel shortcut.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: [.discard]
             )
         case .recording:
+            let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .recording,
-                isMicrophoneOpen: true,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Recording\(warningSuffix)",
-                hudTitle: "Microphone open · Recording",
+                hudTitle: microphoneIsOpen ? "Microphone open · Recording" : "Recording",
                 hudDetail: detail("Use Stop and transcribe or Discard in the Evee menu and configured shortcuts.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: [.stopAndTranscribe, .discard]
             )
         case .transcribing:
+            let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .processing,
-                isMicrophoneOpen: false,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Transcribing locally\(warningSuffix)",
-                hudTitle: "Transcribing locally",
-                hudDetail: detail("The microphone is closed. You can keep working.", warning: warningDetail),
+                hudTitle: microphoneIsOpen ? "Microphone open · Transcribing locally" : "Transcribing locally",
+                hudDetail: detail(
+                    microphoneIsOpen ? "The microphone has not closed. Evee is still processing locally." : "The microphone is closed. You can keep working.",
+                    warning: warningDetail
+                ),
                 warnings: warnings,
                 availableActions: []
             )
         case .delivering:
+            let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .delivering,
-                isMicrophoneOpen: false,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Delivering text\(warningSuffix)",
-                hudTitle: "Delivering text",
-                hudDetail: detail("The microphone is closed. Evee is finishing the requested delivery.", warning: warningDetail),
+                hudTitle: microphoneIsOpen ? "Microphone open · Delivering text" : "Delivering text",
+                hudDetail: detail(
+                    microphoneIsOpen ? "The microphone has not closed. Evee is finishing the requested delivery." : "The microphone is closed. Evee is finishing the requested delivery.",
+                    warning: warningDetail
+                ),
                 warnings: warnings,
                 availableActions: []
             )
         case .checkpointed(let message):
+            let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .protected,
-                isMicrophoneOpen: false,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Capture protected",
-                hudTitle: "Capture protected",
-                hudDetail: message,
+                hudTitle: microphoneIsOpen ? "Microphone open · Capture protected" : "Capture protected",
+                hudDetail: microphoneIsOpen ? "The microphone has not closed. \(message)" : message,
                 warnings: warnings,
                 availableActions: []
             )
         case .failed(let message):
+            let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .failed,
-                isMicrophoneOpen: false,
+                isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Capture needs attention",
-                hudTitle: "Capture needs attention",
-                hudDetail: message,
+                hudTitle: microphoneIsOpen ? "Microphone open · Capture needs attention" : "Capture needs attention",
+                hudDetail: microphoneIsOpen ? "The microphone has not closed. \(message)" : message,
                 warnings: warnings,
                 availableActions: []
             )
         case .idle:
             break
+        }
+
+        if captureMicrophone.isOpen {
+            return Self(
+                phase: .failed,
+                isMicrophoneOpen: true,
+                menuTitle: "Microphone needs attention",
+                hudTitle: "Microphone open · Capture needs attention",
+                hudDetail: "The capture microphone has not closed.",
+                warnings: warnings,
+                availableActions: []
+            )
         }
 
         switch hotMic {
@@ -189,5 +225,10 @@ public struct SystemVoiceStatus: Equatable, Sendable {
 
     private static func detail(_ status: String, warning: String) -> String {
         warning.isEmpty ? status : "\(warning) \(status)"
+    }
+
+    private static func defaultCaptureMicrophone(for capture: CaptureState) -> CaptureMicrophoneState {
+        if case .recording = capture { return .open }
+        return .closed
     }
 }

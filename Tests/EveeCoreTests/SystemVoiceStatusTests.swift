@@ -45,6 +45,32 @@ final class SystemVoiceStatusTests: XCTestCase {
         XCTAssertTrue(status.hudTitle.contains("Microphone open"))
     }
 
+    func testCaptureStartupKeepsRecorderOpenWhileSystemAudioStarts() {
+        let status = SystemVoiceStatus.make(
+            capture: .starting(kind: .meeting),
+            hotMic: .disabled,
+            captureMicrophone: .open,
+            warnings: []
+        )
+
+        XCTAssertEqual(status.phase, .captureStarting)
+        XCTAssertTrue(status.isMicrophoneOpen)
+        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(status.availableActions, [.discard])
+    }
+
+    func testAwaitedRecorderStopRemainsOpenUntilCompletion() {
+        let status = SystemVoiceStatus.make(
+            capture: .recording(startedAt: .now, level: 0),
+            hotMic: .disabled,
+            captureMicrophone: .stopping,
+            warnings: []
+        )
+
+        XCTAssertTrue(status.isMicrophoneOpen)
+        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+    }
+
     func testCaptureStatusOverridesWakeAndMapsPostCapturePhases() {
         let processing = SystemVoiceStatus.make(capture: .transcribing, hotMic: .active, warnings: [])
         let delivering = SystemVoiceStatus.make(capture: .delivering, hotMic: .active, warnings: [])
@@ -69,5 +95,18 @@ final class SystemVoiceStatusTests: XCTestCase {
         XCTAssertEqual(status.phase, .protected)
         XCTAssertFalse(status.isMicrophoneOpen)
         XCTAssertEqual(status.menuTitle, "Capture protected")
+    }
+
+    func testStopFailureDoesNotClaimTheMicrophoneClosed() {
+        let status = SystemVoiceStatus.make(
+            capture: .failed("Recorder did not stop"),
+            hotMic: .disabled,
+            captureMicrophone: .open,
+            warnings: []
+        )
+
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertTrue(status.isMicrophoneOpen)
+        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
     }
 }

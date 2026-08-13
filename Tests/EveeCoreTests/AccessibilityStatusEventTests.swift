@@ -36,4 +36,17 @@ final class AccessibilityStatusEventTests: XCTestCase {
         XCTAssertEqual(reducer.receive(.webhookRevoked), "Meeting webhook access revoked.")
         XCTAssertEqual(reducer.receive(.helperRevoked), "Local helper access revoked.")
     }
+
+    func testSilenceDeduplicationResetsOnlyAfterSignalRecovery() {
+        var reducer = AccessibilityAnnouncementReducer()
+
+        XCTAssertEqual(reducer.receive(.microphoneSilence), "No microphone signal has been detected. Check the selected input and mute switch.")
+        XCTAssertNil(reducer.receive(.microphoneSignalRestored))
+        XCTAssertEqual(reducer.receive(.microphoneSilence), "No microphone signal has been detected. Check the selected input and mute switch.")
+        XCTAssertEqual(reducer.receive(.channelFailed(.system, "Channel error")), "System audio warning. Channel error")
+        XCTAssertNil(reducer.receive(.microphoneSilence))
+        XCTAssertNil(reducer.receive(.microphoneSignalRestored))
+        XCTAssertEqual(reducer.receive(.microphoneSilence), "No microphone signal has been detected. Check the selected input and mute switch.")
+        XCTAssertNil(reducer.receive(.microphoneSilence))
+    }
 }

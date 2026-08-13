@@ -10,6 +10,7 @@ public enum AccessibilityStatusEvent: Equatable, Sendable {
     case captureRecovered
     case captureFailed(String)
     case microphoneSilence
+    case microphoneSignalRestored
     case channelFailed(AudioTrackRole, String)
     case modelDownloadStarted
     case modelDownloadProgress(Double)
@@ -23,10 +24,22 @@ public enum AccessibilityStatusEvent: Equatable, Sendable {
 public struct AccessibilityAnnouncementReducer: Sendable {
     private var lastEvent: AccessibilityStatusEvent?
     private var lastProgressBucket = 0
+    private var microphoneSilenceActive = false
 
     public init() {}
 
     public mutating func receive(_ event: AccessibilityStatusEvent) -> String? {
+        if event == .microphoneSignalRestored {
+            microphoneSilenceActive = false
+            if lastEvent == .microphoneSilence { lastEvent = nil }
+            return nil
+        }
+
+        if event == .microphoneSilence {
+            guard !microphoneSilenceActive else { return nil }
+            microphoneSilenceActive = true
+        }
+
         if case .modelDownloadProgress(let fraction) = event {
             guard fraction.isFinite else { return nil }
             let boundedFraction = min(1, max(0, fraction))
@@ -58,6 +71,8 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Capture failed. \(message)"
         case .microphoneSilence:
             return "No microphone signal has been detected. Check the selected input and mute switch."
+        case .microphoneSignalRestored:
+            return nil
         case .channelFailed(let role, let message):
             return "\(role.rawValue.capitalized) audio warning. \(message)"
         case .modelDownloadStarted:
