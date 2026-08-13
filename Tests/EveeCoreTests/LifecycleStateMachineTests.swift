@@ -2,16 +2,20 @@ import XCTest
 @testable import EveeCore
 
 final class LifecycleStateMachineTests: XCTestCase {
-    func testModelDownloadRejectsStaleCallbacksAfterCancellation() throws {
+    func testModelDownloadRetainsCancellationUntilProviderAcknowledges() throws {
         var download = ModelDownloadStateMachine()
         let first = try XCTUnwrap(download.begin(model: .parakeet))
 
         XCTAssertNil(download.begin(model: .parakeet))
-        download.cancel(first)
+        XCTAssertTrue(download.requestCancellation(first))
 
+        XCTAssertEqual(download.state, .cancelling(model: .parakeet))
+        XCTAssertNil(download.begin(model: .parakeet))
         XCTAssertFalse(download.update(first, progress: ModelProgress(fraction: 0.5, status: "Synthetic progress")))
         XCTAssertFalse(download.complete(first))
-        XCTAssertTrue(download.isIdle)
+        XCTAssertTrue(download.acknowledgeCancellation(first, message: "Download cancelled. Retry when ready."))
+        XCTAssertEqual(download.state, .failed(model: .parakeet, message: "Download cancelled. Retry when ready."))
+        XCTAssertNotNil(download.begin(model: .parakeet))
     }
 
     func testModelDownloadCanRetryAfterFailure() throws {

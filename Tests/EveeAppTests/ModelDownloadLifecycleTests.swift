@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class ModelDownloadLifecycleTests: XCTestCase {
-    func testRepeatedStartIsSingleFlightAndCancellationRejectsLateCompletion() async {
+    func testNonCooperativeCancellationBlocksRetryUntilProviderExits() async {
         let fake = DelayedModelDownloader()
         let store = AppStore(modelDownloaderFactory: { _ in fake }, modelDownloadDefaults: nil)
 
@@ -12,13 +12,30 @@ final class ModelDownloadLifecycleTests: XCTestCase {
         store.startModelDownload()
         await fake.waitUntilStarted(count: 1)
 
-        let startCount = await fake.startCount
-        XCTAssertEqual(startCount, 1)
+        let initialStartCount = await fake.startCount
+        XCTAssertEqual(initialStartCount, 1)
         store.cancelModelDownload()
-        await fake.finish()
-        await Task.yield()
+        XCTAssertEqual(store.modelDownloadState, .cancelling(model: .parakeet))
 
-        XCTAssertEqual(store.modelDownloadState, .idle)
+        store.startModelDownload()
+        store.startModelDownload()
+        await Task.yield()
+        let cancellingStartCount = await fake.startCount
+        XCTAssertEqual(cancellingStartCount, 1)
+        XCTAssertEqual(store.modelDownloadState, .cancelling(model: .parakeet))
+
+        await fake.finish()
+        await waitUntil {
+            if case .failed(model: .parakeet, _) = store.modelDownloadState { return true }
+            return false
+        }
+
+        store.startModelDownload()
+        await fake.waitUntilStarted(count: 2)
+        let retryStartCount = await fake.startCount
+        XCTAssertEqual(retryStartCount, 2)
+        await fake.finish()
+        await waitUntil { store.modelDownloadState == .ready(model: .parakeet) }
     }
 
     func testRetryStartsOneNewOperationAndPublishesReady() async {
@@ -29,7 +46,10 @@ final class ModelDownloadLifecycleTests: XCTestCase {
         await fake.waitUntilStarted(count: 1)
         store.cancelModelDownload()
         await fake.finish()
-        await Task.yield()
+        await waitUntil {
+            if case .failed(model: .parakeet, _) = store.modelDownloadState { return true }
+            return false
+        }
 
         store.startModelDownload()
         store.startModelDownload()

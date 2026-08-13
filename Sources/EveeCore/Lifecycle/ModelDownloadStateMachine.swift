@@ -11,6 +11,7 @@ public struct LifecycleOperation: Hashable, Sendable {
 public enum ModelDownloadState: Equatable, Sendable {
     case idle
     case downloading(model: SpeechModel, progress: ModelProgress?)
+    case cancelling(model: SpeechModel)
     case ready(model: SpeechModel)
     case failed(model: SpeechModel, message: String)
 }
@@ -33,7 +34,7 @@ public struct ModelDownloadStateMachine: Sendable {
             break
         case .ready(let readyModel) where readyModel != model:
             break
-        case .downloading, .ready:
+        case .downloading, .cancelling, .ready:
             return nil
         }
 
@@ -43,10 +44,28 @@ public struct ModelDownloadStateMachine: Sendable {
         return operation
     }
 
-    public mutating func cancel(_ operation: LifecycleOperation) {
-        guard self.operation == operation else { return }
+    public mutating func requestCancellation(_ operation: LifecycleOperation) -> Bool {
+        guard self.operation == operation,
+              case .downloading(let model, _) = state else { return false }
+        state = .cancelling(model: model)
+        return true
+    }
+
+    public func cancellationRequested(_ operation: LifecycleOperation) -> Bool {
+        guard self.operation == operation,
+              case .cancelling = state else { return false }
+        return true
+    }
+
+    public mutating func acknowledgeCancellation(
+        _ operation: LifecycleOperation,
+        message: String
+    ) -> Bool {
+        guard self.operation == operation,
+              case .cancelling(let model) = state else { return false }
         self.operation = nil
-        state = .idle
+        state = .failed(model: model, message: message)
+        return true
     }
 
     public mutating func update(_ operation: LifecycleOperation, progress: ModelProgress) -> Bool {

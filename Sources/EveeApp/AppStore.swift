@@ -114,6 +114,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 fraction: progress?.fraction ?? 0,
                 status: progress?.status ?? "Starting"
             )
+        case .cancelling:
+            .cancelling
         case .failed(_, let message):
             .failed(message)
         case .ready:
@@ -721,21 +723,27 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                             self?.receiveModelDownloadProgress(progress, operation: operation)
                         }
                 }
+                if Task.isCancelled || self.modelDownloadStateMachine.cancellationRequested(operation) {
+                    self.finishModelDownloadCancellation(model: model, operation: operation)
+                    return
+                }
                 self.completeModelDownload(downloader, model: model, operation: operation)
             } catch {
-                self.failModelDownload(error, model: model, operation: operation)
+                if Task.isCancelled || self.modelDownloadStateMachine.cancellationRequested(operation) {
+                    self.finishModelDownloadCancellation(model: model, operation: operation)
+                } else {
+                    self.failModelDownload(error, model: model, operation: operation)
+                }
             }
         }
     }
 
     func cancelModelDownload() {
         guard let operation = modelDownloadOperation else { return }
-        modelDownloadStateMachine.cancel(operation)
-        modelDownloadOperation = nil
-        modelDownloadTask?.cancel()
-        modelDownloadTask = nil
+        guard modelDownloadStateMachine.requestCancellation(operation) else { return }
         modelDownloadNeedsRetry = true
         publishModelDownloadState()
+        modelDownloadTask?.cancel()
     }
 
     func downloadSelectedModel() async {
@@ -761,6 +769,20 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloadNeedsRetry = false
         modelsRequiringRepair.remove(model)
         modelDownloadDefaults?.set(false, forKey: modelDownloadAttemptKey(for: model))
+        publishModelDownloadState()
+    }
+
+    private func finishModelDownloadCancellation(
+        model: SpeechModel,
+        operation: LifecycleOperation
+    ) {
+        let message = "The model download was interrupted. Retry when ready."
+        guard modelDownloadStateMachine.acknowledgeCancellation(operation, message: message) else { return }
+        modelDownloadOperation = nil
+        modelDownloadTask = nil
+        modelDownloadNeedsRetry = true
+        modelsRequiringRepair.insert(model)
+        modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
     }
 
@@ -808,7 +830,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 modelDownloadNeedsRetry = true
                 modelsRequiringRepair.insert(model)
             } else {
-                modelDownloadStateMachine.cancel(operation)
+                modelDownloadStateMachine = ModelDownloadStateMachine()
                 modelDownloadNeedsRetry = false
             }
         }

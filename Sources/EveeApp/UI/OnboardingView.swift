@@ -23,19 +23,26 @@ struct OnboardingView: View {
                 .accessibilityHidden(true)
 
             GeometryReader { proxy in
+                let layout = OnboardingLayoutMode.forViewportHeight(proxy.size.height)
                 ScrollView {
-                    ViewThatFits(in: .vertical) {
-                        onboardingContent(spacing: 22, padding: 40, showsFeatures: true)
-                            .frame(minHeight: proxy.size.height)
-                        onboardingContent(spacing: 14, padding: 20, showsFeatures: false)
-                            .frame(minHeight: proxy.size.height)
-                    }
+                    onboardingContent(
+                        spacing: layout == .spacious ? 22 : 14,
+                        padding: layout == .spacious ? 40 : 20,
+                        showsFeatures: layout == .spacious
+                    )
+                    .frame(minHeight: proxy.size.height)
                     .frame(maxWidth: .infinity)
                 }
             }
         }
         .onAppear(perform: restoreFocus)
         .onChange(of: presentation.focusTarget) { _, _ in restoreFocus() }
+        .onChange(of: presentation.modelAction) { previousAction, _ in
+            guard let target = presentation.focusRestorationTarget(
+                previousModelAction: previousAction
+            ) else { return }
+            restoreFocus(to: target)
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             store.refreshPermissionState()
             restoreFocus()
@@ -115,29 +122,14 @@ struct OnboardingView: View {
     @ViewBuilder
     private var modelDownloadControl: some View {
         switch presentation.modelAction {
-        case .download, .retry:
-            Button(presentation.modelActionTitle ?? "Download") {
-                store.startModelDownload()
+        case .download, .cancel, .retry:
+            modelActionButton
+            if presentation.modelAction == .cancel {
+                ProgressView(value: store.modelProgress?.fraction ?? 0)
+                    .frame(width: 260)
+                    .accessibilityLabel("Local model download progress")
+                    .accessibilityValue(presentation.modelAccessibilityValue ?? "Starting")
             }
-            .buttonStyle(AlphaButtonStyle())
-            .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
-            .focused($focusedTarget, equals: .modelAction)
-            .accessibilityLabel(presentation.modelAccessibilityLabel)
-            .accessibilityValue(presentation.modelAccessibilityValue ?? "")
-            .accessibilityHint(presentation.modelAccessibilityHint)
-        case .cancel:
-            Button(presentation.modelActionTitle ?? "Cancel") {
-                store.cancelModelDownload()
-            }
-            .buttonStyle(AlphaButtonStyle())
-            .focused($focusedTarget, equals: .modelAction)
-            .accessibilityLabel(presentation.modelAccessibilityLabel)
-            .accessibilityValue(presentation.modelAccessibilityValue ?? "")
-            .accessibilityHint(presentation.modelAccessibilityHint)
-            ProgressView(value: store.modelProgress?.fraction ?? 0)
-                .frame(width: 260)
-                .accessibilityLabel("Local model download progress")
-                .accessibilityValue(presentation.modelAccessibilityValue ?? "Starting")
         case .none:
             if case .cancelling = onboardingModelState {
                 ProgressView()
@@ -154,6 +146,25 @@ struct OnboardingView: View {
         }
     }
 
+    private var modelActionButton: some View {
+        Button(presentation.modelActionTitle ?? "Download") {
+            switch presentation.modelAction {
+            case .download, .retry:
+                store.startModelDownload()
+            case .cancel:
+                store.cancelModelDownload()
+            case .none:
+                break
+            }
+        }
+        .buttonStyle(AlphaButtonStyle())
+        .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+        .focused($focusedTarget, equals: .modelAction)
+        .accessibilityLabel(presentation.modelAccessibilityLabel)
+        .accessibilityValue(presentation.modelAccessibilityValue ?? "")
+        .accessibilityHint(presentation.modelAccessibilityHint)
+    }
+
     private var onboardingModelState: OnboardingModelState {
         switch store.modelDownloadState {
         case .idle:
@@ -162,6 +173,7 @@ struct OnboardingView: View {
                 : .idle
         case .downloading(_, let progress):
             .downloading(fraction: progress?.fraction ?? 0, status: progress?.status ?? "Starting")
+        case .cancelling: .cancelling
         case .failed(_, let message): .failed(message)
         case .ready: .ready
         }
@@ -218,8 +230,12 @@ struct OnboardingView: View {
     }
 
     private func restoreFocus() {
+        restoreFocus(to: presentation.focusTarget)
+    }
+
+    private func restoreFocus(to target: OnboardingFocusTarget) {
         DispatchQueue.main.async {
-            focusedTarget = presentation.focusTarget
+            focusedTarget = target
         }
     }
 }

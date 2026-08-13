@@ -28,6 +28,15 @@ public enum ModelOnboardingAction: Equatable, Sendable {
     case none
 }
 
+public enum OnboardingLayoutMode: Equatable, Sendable {
+    case compact
+    case spacious
+
+    public static func forViewportHeight(_ height: CGFloat) -> Self {
+        height < 720 ? .compact : .spacious
+    }
+}
+
 public struct OnboardingPresentation: Equatable, Sendable {
     public let focusTarget: OnboardingFocusTarget
     public let microphoneActionTitle: String
@@ -124,5 +133,14 @@ public struct OnboardingPresentation: Equatable, Sendable {
             modelAccessibilityValue = "Ready"
             modelAccessibilityHint = "The selected local speech model is downloaded and prepared."
         }
+    }
+
+    public func focusRestorationTarget(
+        previousModelAction: ModelOnboardingAction
+    ) -> OnboardingFocusTarget? {
+        guard focusTarget == .modelAction,
+              modelAction != .none,
+              modelAction != previousModelAction else { return nil }
+        return .modelAction
     }
 }

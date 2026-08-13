@@ -361,6 +361,16 @@ private func checkOnboardingPresentation() throws {
         model: .failed("The previous model download did not finish.")
     )
     try require(failed.modelAction == .retry, "interrupted download did not expose retry")
+    try require(OnboardingLayoutMode.forViewportHeight(640) == .compact, "short viewport did not choose compact onboarding")
+    try require(OnboardingLayoutMode.forViewportHeight(720) == .spacious, "tall viewport did not choose spacious onboarding")
+    try require(
+        downloading.focusRestorationTarget(previousModelAction: .download) == .modelAction,
+        "download-to-cancel transition did not restore stable model focus"
+    )
+    try require(
+        failed.focusRestorationTarget(previousModelAction: .none) == .modelAction,
+        "cancelling-to-retry transition did not restore stable model focus"
+    )
     print("onboarding-presentation: passed")
 }
 
@@ -941,9 +951,12 @@ private func checkLifecycleState() throws {
     var download = ModelDownloadStateMachine()
     let first = try unwrapped(download.begin(model: .parakeet), "model download did not start")
     try require(download.begin(model: .parakeet) == nil, "model download allowed a concurrent operation")
-    download.cancel(first)
+    try require(download.requestCancellation(first), "model download did not publish cancellation")
+    try require(download.state == .cancelling(model: .parakeet), "model cancellation was not visible")
+    try require(download.begin(model: .parakeet) == nil, "model download restarted before cancellation acknowledgement")
     try require(!download.update(first, progress: ModelProgress(fraction: 0.5, status: "Synthetic progress")), "cancelled model download accepted stale progress")
     try require(!download.complete(first), "cancelled model download accepted stale completion")
+    try require(download.acknowledgeCancellation(first, message: "Interrupted"), "model cancellation was not acknowledged")
 
     var hotMic = HotMicStateMachine()
     let start = try unwrapped(hotMic.beginStart(), "hot mic did not begin starting")
@@ -978,17 +991,21 @@ private func checkModelDownloadLifecycle() throws {
     let cancelled = try unwrapped(download.begin(model: .parakeet), "model download did not start")
     try require(download.begin(model: .parakeet) == nil, "model download allowed a concurrent operation")
 
-    download.cancel(cancelled)
+    try require(download.requestCancellation(cancelled), "model download did not enter cancelling")
+    try require(download.state == .cancelling(model: .parakeet), "model download did not publish cancelling")
+    try require(download.begin(model: .parakeet) == nil, "model download allowed retry before cancellation acknowledgement")
     try require(
         !download.update(cancelled, progress: ModelProgress(fraction: 0.5, status: "Synthetic late progress")),
         "cancelled model download accepted late progress"
     )
     try require(!download.complete(cancelled), "cancelled model download accepted late completion")
-    try require(download.isIdle, "cancelled model download did not return to idle")
+    try require(download.acknowledgeCancellation(cancelled, message: "Download interrupted. Retry when ready."), "model download did not acknowledge cancellation")
+    try require(download.begin(model: .parakeet) != nil, "acknowledged cancellation did not permit retry")
 
-    let failed = try unwrapped(download.begin(model: .qwen3), "model download retry setup did not start")
-    try require(download.fail(failed, message: "Synthetic failure"), "model download failure was not recorded")
-    try require(download.begin(model: .qwen3) != nil, "model download failure did not permit retry")
+    var failedDownload = ModelDownloadStateMachine()
+    let failed = try unwrapped(failedDownload.begin(model: .qwen3), "model download retry setup did not start")
+    try require(failedDownload.fail(failed, message: "Synthetic failure"), "model download failure was not recorded")
+    try require(failedDownload.begin(model: .qwen3) != nil, "model download failure did not permit retry")
 
     var modelSwitch = ModelDownloadStateMachine()
     let readyA = try unwrapped(modelSwitch.begin(model: .parakeet), "model A did not start")

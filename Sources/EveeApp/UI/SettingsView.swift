@@ -393,7 +393,7 @@ struct SettingsView: View {
                 store.startModelDownload()
             }
         }
-        .disabled(selectedModelReady || !store.isSpeechModelSupported(store.settings.model))
+        .disabled(selectedModelReady || isModelCancellationPending || !store.isSpeechModelSupported(store.settings.model))
         .accessibilityLabel(modelDownloadAccessibilityLabel)
         .accessibilityValue(store.onboardingPresentation.modelAccessibilityValue ?? "")
         .accessibilityHint(store.onboardingPresentation.modelAccessibilityHint)
@@ -401,18 +401,25 @@ struct SettingsView: View {
 
     private var modelDownloadButtonTitle: String {
         if selectedModelReady { return "Downloaded" }
+        if isModelCancellationPending { return "Cancelling…" }
         if isModelDownloading { return "Cancel" }
         return store.modelDownloadNeedsRetry ? "Retry" : "Download"
     }
 
     private var modelDownloadAccessibilityLabel: String {
         if selectedModelReady { return "Selected local model is downloaded" }
+        if isModelCancellationPending { return "Cancelling local model download" }
         if isModelDownloading { return "Cancel local model download" }
         return store.modelDownloadNeedsRetry ? "Retry local model download" : "Download local model"
     }
 
     private var isModelDownloading: Bool {
         if case .downloading = store.modelDownloadState { return true }
+        return false
+    }
+
+    private var isModelCancellationPending: Bool {
+        if case .cancelling = store.modelDownloadState { return true }
         return false
     }
 
