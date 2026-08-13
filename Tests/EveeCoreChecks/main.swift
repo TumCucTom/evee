@@ -4,9 +4,78 @@ import Foundation
 import Network
 
 private enum CoreCheckError: Error {
+    case assertionFailed(String)
     case connectionFailed(String)
     case listenerFailed(String)
     case timedOut
+}
+
+private enum SyntheticSecretStoreError: Error {
+    case deletionFailed
+}
+
+private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private let enteredRead = DispatchSemaphore(value: 0)
+    private let releaseRead = DispatchSemaphore(value: 0)
+    private var value: String?
+    private let failsDeletion: Bool
+
+    init(value: String?, failsDeletion: Bool = false) {
+        self.value = value
+        self.failsDeletion = failsDeletion
+    }
+
+    func string(for account: String) throws -> String? {
+        enteredRead.signal()
+        releaseRead.wait()
+        return lock.withLock { value }
+    }
+
+    func set(_ value: String, for account: String) throws {
+        lock.withLock { self.value = value }
+    }
+
+    func delete(_ account: String) throws {
+        if failsDeletion { throw SyntheticSecretStoreError.deletionFailed }
+        lock.withLock { value = nil }
+    }
+
+    func waitForRead() -> Bool {
+        enteredRead.wait(timeout: .now() + 2) == .success
+    }
+
+    func resumeRead() {
+        releaseRead.signal()
+    }
+}
+
+private final class MemorySecretStore: LocalAPISecretStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    private let failsDeletion: Bool
+
+    init(value: String?, failsDeletion: Bool = false) {
+        self.value = value
+        self.failsDeletion = failsDeletion
+    }
+
+    func string(for account: String) throws -> String? {
+        lock.withLock { value }
+    }
+
+    func set(_ value: String, for account: String) throws {
+        lock.withLock { self.value = value }
+    }
+
+    func delete(_ account: String) throws {
+        if failsDeletion { throw SyntheticSecretStoreError.deletionFailed }
+        lock.withLock { value = nil }
+    }
+}
+
+private func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
+    guard condition() else { throw CoreCheckError.assertionFailed(message) }
 }
 
 private func withTimeout<T: Sendable>(
@@ -250,7 +319,222 @@ private func checkAPILimits() async throws {
     }
     precondition(String(decoding: retainedResponse, as: UTF8.self).contains("401 Unauthorised"))
 
+    let oversized = try await connect(to: credentials, label: "com.tumcuctom.evee.core-checks.oversized")
+    defer { oversized.cancel() }
+    let oversizedHeader = "GET /health HTTP/1.1\r\nX-Fill: " + String(repeating: "x", count: 129 * 1_024)
+    await sendBestEffort(Data(oversizedHeader.utf8), on: oversized)
+    let oversizedResponse = try await withTimeout(seconds: 2, onTimeout: { oversized.cancel() }) {
+        await receiveAll(on: oversized)
+    }
+    precondition(String(decoding: oversizedResponse, as: UTF8.self).contains("431 Request Header Fields Too Large"))
+
     print("api-limits: passed")
+}
+
+private func checkAPIStartRaces() async throws {
+    for action in ["cancel", "stop", "revoke"] {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-api-start-race-\(UUID().uuidString)", isDirectory: true)
+        let store = LibraryStore(rootURL: root)
+        let secretStore = BlockingSecretStore(value: "old-token")
+        let server = LocalAPIServer(store: store, secretStore: secretStore)
+        let port = try availablePort()
+        defer {
+            server.stop()
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let startTask = Task { try await server.startWithCredentials(port: port) }
+        let didEnterRead = await Task.detached { secretStore.waitForRead() }.value
+        try require(didEnterRead, "start did not reach credential loading")
+
+        var revokeTask: Task<Void, Error>?
+        switch action {
+        case "cancel":
+            startTask.cancel()
+        case "stop":
+            server.stop()
+        default:
+            revokeTask = Task.detached { try server.revokeToken() }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        secretStore.resumeRead()
+
+        let startResult = await startTask.result
+        if let revokeTask { _ = try await revokeTask.value }
+        if case .success = startResult {
+            throw CoreCheckError.assertionFailed("\(action) allowed an in-flight start to publish credentials")
+        }
+        try require(server.credentials() == nil, "\(action) left credentials active")
+    }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-api-start-superseded-\(UUID().uuidString)", isDirectory: true)
+    let store = LibraryStore(rootURL: root)
+    let secretStore = BlockingSecretStore(value: "old-token")
+    let server = LocalAPIServer(store: store, secretStore: secretStore)
+    defer {
+        server.stop()
+        try? FileManager.default.removeItem(at: root)
+    }
+    let firstStart = Task { try await server.startWithCredentials(port: try availablePort()) }
+    let firstReadStarted = await Task.detached { secretStore.waitForRead() }.value
+    try require(firstReadStarted, "first start did not reach credential loading")
+    let secondStart = Task { try await server.startWithCredentials(port: try availablePort()) }
+    try await Task.sleep(nanoseconds: 100_000_000)
+    secretStore.resumeRead()
+    let firstResult = await firstStart.result
+    let secondReadStarted = await Task.detached { secretStore.waitForRead() }.value
+    try require(secondReadStarted, "second start did not reach credential loading")
+    secretStore.resumeRead()
+    let secondResult = await secondStart.result
+    if case .success = firstResult {
+        throw CoreCheckError.assertionFailed("a superseded start published credentials")
+    }
+    if case .failure(let error) = secondResult { throw error }
+
+    print("api-start-races: passed")
+}
+
+private func checkAPIRevocationPersistence() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-api-revoke-persistence-\(UUID().uuidString)", isDirectory: true)
+    let store = LibraryStore(rootURL: root)
+    let oldToken = "old-revoked-token"
+    let secretStore = MemorySecretStore(value: oldToken, failsDeletion: true)
+    let server = LocalAPIServer(store: store, secretStore: secretStore)
+    defer {
+        server.stop()
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    _ = try await server.startWithCredentials(port: try availablePort())
+    do {
+        try server.revokeToken()
+        throw CoreCheckError.assertionFailed("synthetic deletion failure was not surfaced")
+    } catch SyntheticSecretStoreError.deletionFailed {
+        // Expected: the durable token must still have been replaced first.
+    }
+
+    let restarted = LocalAPIServer(store: store, secretStore: secretStore)
+    defer { restarted.stop() }
+    let credentials = try await restarted.startWithCredentials(port: try availablePort())
+    try require(credentials.token != oldToken, "failed deletion allowed the revoked token to be reused")
+
+    let connection = try await connect(to: credentials, label: "com.tumcuctom.evee.core-checks.revoke-persistence")
+    defer { connection.cancel() }
+    let request = "GET /health HTTP/1.1\r\nAuthorization: Bearer \(oldToken)\r\n\r\n"
+    try await send(Data(request.utf8), on: connection)
+    let response = try await withTimeout(seconds: 2, onTimeout: { connection.cancel() }) {
+        await receiveAll(on: connection)
+    }
+    try require(String(decoding: response, as: UTF8.self).contains("401 Unauthorised"), "old token was accepted")
+
+    print("api-revoke-persistence: passed")
+}
+
+private func checkAPIPublicErrors() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-api-error-\(UUID().uuidString)")
+    try Data("synthetic obstruction".utf8).write(to: root)
+    let store = LibraryStore(rootURL: root)
+    let secretStore = MemorySecretStore(value: "synthetic-token")
+    let server = LocalAPIServer(store: store, secretStore: secretStore)
+    defer {
+        server.stop()
+        try? FileManager.default.removeItem(at: root)
+    }
+    let credentials = try await server.startWithCredentials(port: try availablePort())
+    let connection = try await connect(to: credentials, label: "com.tumcuctom.evee.core-checks.public-error")
+    defer { connection.cancel() }
+    let request = "GET /v1/records?q=synthetic HTTP/1.1\r\nAuthorization: Bearer \(credentials.token)\r\n\r\n"
+    try await send(Data(request.utf8), on: connection)
+    let response = try await withTimeout(seconds: 2, onTimeout: { connection.cancel() }) {
+        await receiveAll(on: connection)
+    }
+    let responseText = String(decoding: response, as: UTF8.self)
+    try require(responseText.contains("\"error\":\"Internal server error\""), "500 response did not use fixed public text")
+    try require(!responseText.contains(root.path), "500 response exposed a storage path")
+
+    print("api-public-errors: passed")
+}
+
+private func checkMCPPublicOutput() async throws {
+    let syntheticHome = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-mcp-output-\(UUID().uuidString)", isDirectory: true)
+    let libraryRoot = syntheticHome
+        .appendingPathComponent("Library/Application Support/Evee", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: syntheticHome) }
+
+    let visibleText = String(repeating: "a", count: 110)
+        + " boundary "
+        + String(repeating: "b", count: 180)
+    let record = WorkspaceRecord(
+        kind: .meeting,
+        title: "Synthetic MCP",
+        text: visibleText,
+        rawText: "Private raw",
+        audioRelativePath: "Audio/private.caf",
+        notes: "Allowed notes outside snippet",
+        recoverySourceID: UUID(),
+        context: WorkspaceContext(selectedText: "Private selection")
+    )
+    try await LibraryStore(rootURL: libraryRoot).upsert(record)
+
+    let executable = Bundle.main.executableURL!
+        .deletingLastPathComponent()
+        .appendingPathComponent("evee-mcp")
+    try require(FileManager.default.isExecutableFile(atPath: executable.path), "build evee-mcp before running mcp-public-output")
+
+    let process = Process()
+    let input = Pipe()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = executable
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = errors
+    var environment = ProcessInfo.processInfo.environment
+    environment["CFFIXED_USER_HOME"] = syntheticHome.path
+    process.environment = environment
+    try process.run()
+
+    let request: [String: Any] = [
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": [
+            "name": "search",
+            "arguments": ["query": "boundary", "limit": 5],
+        ],
+    ]
+    input.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: request) + Data("\n".utf8))
+    try input.fileHandleForWriting.close()
+    let responseData = output.fileHandleForReading.readDataToEndOfFile()
+    let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    try require(process.terminationStatus == 0, "evee-mcp failed: \(String(decoding: errorData, as: UTF8.self))")
+
+    let response = try JSONSerialization.jsonObject(with: responseData) as! [String: Any]
+    let result = response["result"] as! [String: Any]
+    let content = result["content"] as! [[String: Any]]
+    let publicText = content[0]["text"] as! String
+    let hits = try JSONSerialization.jsonObject(with: Data(publicText.utf8)) as! [[String: Any]]
+    try require(hits.count == 1, "MCP search did not return the synthetic record")
+    let hit = hits[0]
+    let publicRecord = hit["record"] as! [String: Any]
+    let snippet = hit["snippet"] as! String
+
+    for forbidden in ["rawText", "audioRelativePath", "audioTracks", "recoverySourceID", "webhookDeliveries", "operation", "context"] {
+        try require(publicRecord[forbidden] == nil, "MCP output exposed \(forbidden)")
+    }
+    try require(publicRecord["text"] as? String == visibleText, "MCP output omitted requested record text")
+    try require(snippet.contains("boundary"), "MCP snippet omitted the query boundary")
+    try require(snippet.count <= 248, "MCP snippet exceeded its public boundary")
+    try require(!snippet.contains("Allowed notes outside snippet"), "MCP snippet crossed its query boundary")
+    try require(!publicText.contains("Private raw") && !publicText.contains("private.caf") && !publicText.contains("Private selection"), "MCP output exposed private persistence data")
+
+    print("mcp-public-output: passed")
 }
 
 let arguments = CommandLine.arguments.dropFirst()
@@ -264,7 +548,15 @@ if arguments == ["--filter", "context-policy"] {
     try await checkAPIRotation()
 } else if arguments == ["--filter", "api-limits"] {
     try await checkAPILimits()
+} else if arguments == ["--filter", "api-start-races"] {
+    try await checkAPIStartRaces()
+} else if arguments == ["--filter", "api-revoke-persistence"] {
+    try await checkAPIRevocationPersistence()
+} else if arguments == ["--filter", "api-public-errors"] {
+    try await checkAPIPublicErrors()
+} else if arguments == ["--filter", "mcp-public-output"] {
+    try await checkMCPPublicOutput()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output>\n", stderr)
     exit(EXIT_FAILURE)
 }

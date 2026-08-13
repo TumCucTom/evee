@@ -25,19 +25,21 @@ public enum LocalAPIServerError: LocalizedError, Sendable {
 
 public final class LocalAPIServer: @unchecked Sendable {
     private let store: LibraryStore
-    private let secretStore: KeychainSecretStore
+    private let secretStore: any LocalAPISecretStore
     private let queue = DispatchQueue(label: "com.tumcuctom.evee.api")
     private let stateLock = NSLock()
+    private let credentialLock = NSLock()
     private var listener: NWListener?
     private var token = ""
     private var currentCredentials: LocalAPICredentials?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var pendingHeaders: Set<ObjectIdentifier> = []
     private var accessGeneration: UInt64 = 0
+    private var revocationInProgress = false
     private let maximumConnections = 32
     private let headerDeadline: TimeInterval = 5
 
-    public init(store: LibraryStore = .shared, secretStore: KeychainSecretStore = KeychainSecretStore()) {
+    public init(store: LibraryStore = .shared, secretStore: any LocalAPISecretStore = KeychainSecretStore()) {
         self.store = store
         self.secretStore = secretStore
     }
@@ -49,75 +51,129 @@ public final class LocalAPIServer: @unchecked Sendable {
 
     /// Starts a truly loopback-bound listener and returns everything needed to configure a client.
     public func startWithCredentials(port: UInt16) async throws -> LocalAPICredentials {
-        stop()
-        guard port > 0, let endpointPort = NWEndpoint.Port(rawValue: port) else { throw LocalAPIServerError.invalidPort(port) }
-        let tokenValue = try await loadOrCreateToken()
-
-        let parameters = NWParameters.tcp
-        parameters.allowLocalEndpointReuse = true
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: endpointPort)
-        let listener = try NWListener(using: parameters)
-        let generation = stateLock.withLock {
-            accessGeneration &+= 1
-            token = tokenValue
-            self.listener = listener
-            return accessGeneration
+        guard let generation = reserveStart() else { throw CancellationError() }
+        return try await withTaskCancellationHandler {
+            try await startOwned(port: port, generation: generation)
+        } onCancel: {
+            self.cancelAccess(ifOwnedBy: generation)
         }
-        listener.newConnectionHandler = { [weak self, weak listener] connection in
-            guard let self, let listener else {
-                connection.cancel()
-                return
+    }
+
+    private func startOwned(port: UInt16, generation: UInt64) async throws -> LocalAPICredentials {
+        guard port > 0, let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            cancelAccess(ifOwnedBy: generation)
+            throw LocalAPIServerError.invalidPort(port)
+        }
+
+        do {
+            try Task.checkCancellation()
+            let tokenValue = try await loadOrCreateToken()
+            try Task.checkCancellation()
+            guard ownsAccess(generation) else { throw CancellationError() }
+
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: endpointPort)
+            let listener = try NWListener(using: parameters)
+            guard install(listener: listener, token: tokenValue, generation: generation) else {
+                listener.cancel()
+                throw CancellationError()
             }
-            self.accept(connection, listener: listener)
-        }
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            listener.stateUpdateHandler = { [weak self, weak listener] state in
-                switch state {
-                case .ready:
-                    listener?.stateUpdateHandler = nil
-                    continuation.resume()
-                case .failed(let error):
-                    listener?.stateUpdateHandler = nil
-                    if let self, let listener {
-                        self.stateLock.withLock {
-                            if self.listener === listener, self.accessGeneration == generation {
-                                self.listener = nil
-                                self.token = ""
-                            }
-                        }
-                    }
-                    continuation.resume(throwing: LocalAPIServerError.listenerFailed(error.localizedDescription))
-                case .cancelled:
-                    listener?.stateUpdateHandler = nil
-                    if let self, let listener {
-                        self.stateLock.withLock {
-                            if self.listener === listener, self.accessGeneration == generation {
-                                self.listener = nil
-                                self.token = ""
-                            }
-                        }
-                    }
-                    continuation.resume(throwing: CancellationError())
-                default:
-                    break
+            listener.newConnectionHandler = { [weak self, weak listener] connection in
+                guard let self, let listener else {
+                    connection.cancel()
+                    return
                 }
+                self.accept(connection, listener: listener)
             }
-            listener.start(queue: queue)
-        }
 
-        let activePort = listener.port?.rawValue ?? port
-        let credentials = LocalAPICredentials(
-            baseURL: URL(string: "http://127.0.0.1:\(activePort)")!,
-            token: tokenValue
-        )
-        let isCurrent = stateLock.withLock {
-            guard self.listener === listener, accessGeneration == generation else { return false }
-            currentCredentials = credentials
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                listener.stateUpdateHandler = { [weak self, weak listener] state in
+                    switch state {
+                    case .ready:
+                        listener?.stateUpdateHandler = nil
+                        continuation.resume()
+                    case .failed(let error):
+                        listener?.stateUpdateHandler = nil
+                        if let self { self.cancelAccess(ifOwnedBy: generation) }
+                        continuation.resume(throwing: LocalAPIServerError.listenerFailed(error.localizedDescription))
+                    case .cancelled:
+                        listener?.stateUpdateHandler = nil
+                        if let self { self.cancelAccess(ifOwnedBy: generation) }
+                        continuation.resume(throwing: CancellationError())
+                    default:
+                        break
+                    }
+                }
+                listener.start(queue: queue)
+            }
+
+            try Task.checkCancellation()
+            let activePort = listener.port?.rawValue ?? port
+            let credentials = LocalAPICredentials(
+                baseURL: URL(string: "http://127.0.0.1:\(activePort)")!,
+                token: tokenValue
+            )
+            let isCurrent = stateLock.withLock {
+                guard self.listener === listener, accessGeneration == generation else { return false }
+                currentCredentials = credentials
+                return true
+            }
+            guard isCurrent else { throw CancellationError() }
+            return credentials
+        } catch {
+            cancelAccess(ifOwnedBy: generation)
+            throw error
+        }
+    }
+
+    private func reserveStart() -> UInt64? {
+        let reserved = stateLock.withLock { () -> (UInt64, NWListener?, [NWConnection])? in
+            guard !revocationInProgress else { return nil }
+            accessGeneration &+= 1
+            let generation = accessGeneration
+            let detachedListener = listener
+            let detachedConnections = Array(connections.values)
+            listener = nil
+            connections.removeAll()
+            pendingHeaders.removeAll()
+            token = ""
+            currentCredentials = nil
+            return (generation, detachedListener, detachedConnections)
+        }
+        reserved?.1?.cancel()
+        reserved?.2.forEach { $0.cancel() }
+        return reserved?.0
+    }
+
+    private func install(listener: NWListener, token: String, generation: UInt64) -> Bool {
+        stateLock.withLock {
+            guard accessGeneration == generation, self.listener == nil else { return false }
+            self.listener = listener
+            self.token = token
             return true
         }
-        guard isCurrent else { throw CancellationError() }
-        return credentials
+    }
+
+    private func ownsAccess(_ generation: UInt64) -> Bool {
+        stateLock.withLock { accessGeneration == generation }
+    }
+
+    private func cancelAccess(ifOwnedBy generation: UInt64) {
+        let detached = stateLock.withLock { () -> (NWListener?, [NWConnection])? in
+            guard accessGeneration == generation else { return nil }
+            accessGeneration &+= 1
+            let detachedListener = listener
+            let detachedConnections = Array(connections.values)
+            listener = nil
+            connections.removeAll()
+            pendingHeaders.removeAll()
+            token = ""
+            currentCredentials = nil
+            return (detachedListener, detachedConnections)
+        }
+        detached?.0?.cancel()
+        detached?.1.forEach { $0.cancel() }
     }
 
     public func credentials() -> LocalAPICredentials? {
@@ -145,7 +201,9 @@ public final class LocalAPIServer: @unchecked Sendable {
     @discardableResult
     public func rotateToken() throws -> LocalAPICredentials? {
         let value = try KeychainSecretStore.randomToken()
-        try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+        try credentialLock.withLock {
+            try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+        }
         let rotated = stateLock.withLock { () -> (LocalAPICredentials?, [NWConnection]) in
             accessGeneration &+= 1
             let detachedConnections = Array(connections.values)
@@ -164,8 +222,34 @@ public final class LocalAPIServer: @unchecked Sendable {
     /// Revokes the credential and closes the listener. Enabling the API again
     /// creates a fresh token; a revoked token is never silently reused.
     public func revokeToken() throws {
-        stop()
-        try secretStore.delete(KeychainSecretStore.localAPITokenAccount)
+        beginRevocation()
+        defer { endRevocation() }
+        let replacement = try KeychainSecretStore.randomToken()
+        try credentialLock.withLock {
+            try secretStore.set(replacement, for: KeychainSecretStore.localAPITokenAccount)
+            try secretStore.delete(KeychainSecretStore.localAPITokenAccount)
+        }
+    }
+
+    private func beginRevocation() {
+        let detached = stateLock.withLock { () -> (NWListener?, [NWConnection]) in
+            revocationInProgress = true
+            accessGeneration &+= 1
+            let detachedListener = listener
+            let detachedConnections = Array(connections.values)
+            listener = nil
+            connections.removeAll()
+            pendingHeaders.removeAll()
+            token = ""
+            currentCredentials = nil
+            return (detachedListener, detachedConnections)
+        }
+        detached.0?.cancel()
+        detached.1.forEach { $0.cancel() }
+    }
+
+    private func endRevocation() {
+        stateLock.withLock { revocationInProgress = false }
     }
 
     private func accept(_ connection: NWConnection, listener: NWListener) {
@@ -297,7 +381,7 @@ public final class LocalAPIServer: @unchecked Sendable {
             }
         } catch {
             guard isActive(connection, generation: generation) else { return }
-            send(status: 500, json: ["error": error.localizedDescription], on: connection, generation: generation)
+            send(status: 500, json: ["error": "Internal server error"], on: connection, generation: generation)
         }
     }
 
@@ -330,22 +414,30 @@ public final class LocalAPIServer: @unchecked Sendable {
     }
 
     private func loadOrCreateToken() async throws -> String {
-        if let value = try secretStore.string(for: KeychainSecretStore.localAPITokenAccount), !value.isEmpty {
+        if let value = try credentialLock.withLock({
+            try secretStore.string(for: KeychainSecretStore.localAPITokenAccount)
+        }), !value.isEmpty {
             removeLegacyTokenFile()
             return value
         }
 
         // One-time migration from the private token file used by early builds.
         try await store.prepare()
-        let url = store.rootURL.appendingPathComponent("api.token")
-        if let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+        return try credentialLock.withLock {
+            if let value = try secretStore.string(for: KeychainSecretStore.localAPITokenAccount), !value.isEmpty {
+                removeLegacyTokenFile()
+                return value
+            }
+            let url = store.rootURL.appendingPathComponent("api.token")
+            if let value = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
+                removeLegacyTokenFile()
+                return value
+            }
+            let value = try KeychainSecretStore.randomToken()
             try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
-            removeLegacyTokenFile()
             return value
         }
-        let value = try KeychainSecretStore.randomToken()
-        try secretStore.set(value, for: KeychainSecretStore.localAPITokenAccount)
-        return value
     }
 
     private func removeLegacyTokenFile() {

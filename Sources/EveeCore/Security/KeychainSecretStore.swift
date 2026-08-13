@@ -1,6 +1,12 @@
 import Foundation
 import Security
 
+public protocol LocalAPISecretStore: Sendable {
+    func string(for account: String) throws -> String?
+    func set(_ value: String, for account: String) throws
+    func delete(_ account: String) throws
+}
+
 public enum KeychainSecretStoreError: LocalizedError, Sendable {
     case invalidEncoding
     case operationFailed(OSStatus)
@@ -22,7 +28,7 @@ public enum KeychainSecretStoreError: LocalizedError, Sendable {
 
 /// Small, injectable boundary around the user's login Keychain. Secrets are
 /// device-bound and are unavailable to cloud backups or other user accounts.
-public struct KeychainSecretStore: Sendable {
+public struct KeychainSecretStore: LocalAPISecretStore, Sendable {
     public static let webhookSigningSecretAccount = "meeting-webhook-signing-secret"
     public static let localAPITokenAccount = "local-api-token"
 
