@@ -108,6 +108,13 @@ public enum MCPAuthorization {
 public enum MCPRegistrationCheckpoint: String, Sendable {
     case transactionLeaseAcquired
     case beforeTargetMutation
+    case afterMutationIntent
+    case afterAbsentTargetCreation
+    case beforeTargetWrite
+    case duringExistingTargetWrite
+    case afterTargetWriteBeforeBindingCheck
+    case afterRevokeJournal
+    case afterDisabledSettingsPersistence
     case afterFirstClientMutation
     case beforeManifestWrite
     case beforeDirectoryCleanup
@@ -333,10 +340,19 @@ public enum MCPOwnedRegistration {
 
                 try testing?.hit(.beforeTargetMutation, url: snapshots[index].selectedURL)
                 try handles[index].verifyCurrentBinding(snapshot: snapshots[index])
+                snapshots[index].mutationState = .intent
+                journal.snapshots = snapshots
+                try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+                try testing?.hit(.afterMutationIntent, url: snapshots[index].selectedURL)
                 try handles[index].prepareTarget(snapshot: &snapshots[index])
                 journal.snapshots = snapshots
                 try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
-                try handles[index].writeRegistration(snapshot: &snapshots[index])
+                if !snapshots[index].existed {
+                    try testing?.hit(.afterAbsentTargetCreation, url: snapshots[index].selectedURL)
+                }
+                try testing?.hit(.beforeTargetWrite, url: snapshots[index].selectedURL)
+                try handles[index].writeRegistration(snapshot: &snapshots[index], testing: testing)
+                snapshots[index].mutationState = .complete
                 journal.snapshots = snapshots
                 journal.phase = .clientsMutated
                 try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
@@ -402,16 +418,12 @@ public enum MCPOwnedRegistration {
         defer { lease.release() }
         try testing?.hit(.transactionLeaseAcquired)
 
-        var disabled = settings
-        disabled.mcpEnabled = false
-        try await saveSettings(disabled)
-
         let recovery: MCPRecoveryOutcome
         do {
             recovery = try await recoverLocked(
                 allowedRootURLs: allowedRootURLs,
                 storageRootURL: storageRootURL,
-                settings: disabled,
+                settings: settings,
                 saveSettings: saveSettings,
                 testing: testing
             )
@@ -427,19 +439,26 @@ public enum MCPOwnedRegistration {
         guard recovery.cleanupFailures.isEmpty else { return recovery }
 
         let manifestURL = manifestURL(storageRootURL: storageRootURL)
-        let manifest: OwnedRegistrationManifest
+        let loadedManifest: OwnedRegistrationManifest?
         do {
-            guard let loaded: OwnedRegistrationManifest = try loadDurableIfPresent(
+            loadedManifest = try loadDurableIfPresent(
                 OwnedRegistrationManifest.self,
                 from: manifestURL
-            ) else { return MCPRevocationOutcome(removals: [], cleanupFailures: []) }
-            try validate(manifest: loaded, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
-            manifest = loaded
+            )
+            if let loadedManifest {
+                try validate(manifest: loadedManifest, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
+            }
         } catch {
             return MCPRevocationOutcome(
                 removals: [],
                 cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: manifestURL, message: error.localizedDescription)]
             )
+        }
+        guard let manifest = loadedManifest else {
+            var disabled = settings
+            disabled.mcpEnabled = false
+            try await saveSettings(disabled)
+            return MCPRevocationOutcome(removals: [], cleanupFailures: [])
         }
         let journal = RegistrationTransactionJournal(
             version: 2,
@@ -448,8 +467,29 @@ public enum MCPOwnedRegistration {
             snapshots: manifest.snapshots,
             createdDirectories: manifest.createdDirectories
         )
+        let transactionURL = journalURL(storageRootURL: storageRootURL)
+        try writeDurable(journal, to: transactionURL)
+        try testing?.hit(.afterRevokeJournal)
+
+        var disabled = settings
+        disabled.mcpEnabled = false
         do {
-            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+            try await saveSettings(disabled)
+        } catch {
+            let primary = error
+            do {
+                try removeDurable(transactionURL)
+            } catch {
+                throw MCPOwnedRegistrationError.rollbackFailed(
+                    primary: primary.localizedDescription,
+                    failures: ["Fail-closed revoke journal cleanup: \(error.localizedDescription)"]
+                )
+            }
+            throw primary
+        }
+        try testing?.hit(.afterDisabledSettingsPersistence)
+
+        do {
             return try reverseLocked(
                 journal: journal,
                 allowedRootURLs: allowedRootURLs,
@@ -460,7 +500,7 @@ public enum MCPOwnedRegistration {
             return MCPRevocationOutcome(
                 removals: [],
                 cleanupFailures: [MCPRegistrationCleanupFailure(
-                    configurationURL: journalURL(storageRootURL: storageRootURL),
+                    configurationURL: transactionURL,
                     message: error.localizedDescription
                 )]
             )
@@ -510,9 +550,13 @@ public enum MCPOwnedRegistration {
     ) throws -> MCPRevocationOutcome {
         var removals: [MCPRemovalResult] = []
         var failures: [MCPRegistrationCleanupFailure] = []
-        for snapshot in journal.snapshots.reversed() where snapshot.mutationApplied {
+        for snapshot in journal.snapshots.reversed() where snapshot.effectiveMutationState != .planned {
             do {
                 try testing?.beforeRestore(snapshot.selectedURL)
+                if !snapshot.existed,
+                   try AnchoredTarget.targetIsAbsent(snapshot: snapshot, allowedRootURLs: allowedRootURLs) {
+                    continue
+                }
                 let handle = try AnchoredTarget.reopen(snapshot: snapshot, allowedRootURLs: allowedRootURLs)
                 let result = try handle.reverse(snapshot: snapshot)
                 if result == .reversed {
@@ -626,16 +670,10 @@ public enum MCPOwnedRegistration {
                 failures: [record.url.path]
             )
         }
-        let parts = pathComponents(record.relativePath)
-        guard let name = parts.last else { throw MCPOwnedRegistrationError.invalidManifest(record.url) }
-        let parentPath = parts.dropLast().joined(separator: "/")
-        let parent = try traversal.openDirectory(relativePath: parentPath, verify: nil)
-        defer { _ = close(parent.descriptor) }
-        guard unlinkat(parent.descriptor, name, AT_REMOVEDIR) == 0 else {
-            if errno == ENOTEMPTY { return }
-            throw posixError()
-        }
-        guard fsync(parent.descriptor) == 0 else { throw posixError() }
+        throw MCPOwnedRegistrationError.rollbackFailed(
+            primary: "Transaction-created directory retained for manual cleanup because Darwin has no identity-bound directory removal.",
+            failures: [record.url.path]
+        )
     }
 }
 
@@ -679,6 +717,7 @@ private struct CreatedDirectoryRecord: Codable {
 }
 
 private enum ConfigurationFormat: String, Codable { case json, toml }
+private enum TargetMutationState: String, Codable { case planned, intent, complete }
 
 private struct ManagedTargetSnapshot: Codable {
     var clientName: String
@@ -691,6 +730,7 @@ private struct ManagedTargetSnapshot: Codable {
     var format: ConfigurationFormat
     var existed: Bool
     var mutationApplied: Bool
+    var mutationState: TargetMutationState?
     var originalIdentity: FileIdentity?
     var registeredIdentity: FileIdentity?
     var beforeData: Data?
@@ -709,6 +749,10 @@ private struct ManagedTargetSnapshot: Codable {
 
     var selectedURL: URL {
         URL(fileURLWithPath: rootPath).appendingPathComponent(selectedRelativePath)
+    }
+
+    var effectiveMutationState: TargetMutationState {
+        mutationState ?? (mutationApplied ? .complete : .planned)
     }
 }
 
@@ -851,6 +895,7 @@ private final class AnchoredTarget {
             format: format,
             existed: data != nil,
             mutationApplied: false,
+            mutationState: .planned,
             originalIdentity: descriptor == nil ? nil : FileIdentity(info),
             registeredIdentity: nil,
             beforeData: data,
@@ -896,6 +941,29 @@ private final class AnchoredTarget {
         )
         try handle.verifyCurrentBinding(snapshot: snapshot)
         return handle
+    }
+
+    static func targetIsAbsent(
+        snapshot: ManagedTargetSnapshot,
+        allowedRootURLs: [URL]
+    ) throws -> Bool {
+        guard allowedRootURLs.map({ $0.resolvingSymlinksInPath().standardizedFileURL.path }).contains(snapshot.rootPath) else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+        }
+        let traversal = try DirectoryTraversal(rootPath: snapshot.rootPath)
+        let targetParts = pathComponents(snapshot.targetRelativePath)
+        guard let targetName = targetParts.last else {
+            throw MCPOwnedRegistrationError.invalidManifest(snapshot.selectedURL)
+        }
+        let parent = try traversal.openDeepestDirectory(
+            relativePath: targetParts.dropLast().joined(separator: "/")
+        )
+        defer { _ = close(parent.descriptor) }
+        if !parent.missing.isEmpty { return true }
+        var info = stat()
+        if fstatat(parent.descriptor, targetName, &info, AT_SYMLINK_NOFOLLOW) == 0 { return false }
+        if errno == ENOENT { return true }
+        throw posixError()
     }
 
     func prepareMissingDirectories() throws -> [CreatedDirectoryRecord] {
@@ -950,14 +1018,41 @@ private final class AnchoredTarget {
             if let expected, identity != expected {
                 throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
             }
+            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expected)
         }
     }
 
-    func writeRegistration(snapshot: inout ManagedTargetSnapshot) throws {
+    func writeRegistration(
+        snapshot: inout ManagedTargetSnapshot,
+        testing: MCPRegistrationTesting?
+    ) throws {
         guard let fd = targetDescriptor else { throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL) }
-        try writeAll(snapshot.afterData, descriptor: fd)
+        try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: snapshot.registeredIdentity)
+        if snapshot.existed, let testing {
+            try writeWithPartialCheckpoint(
+                snapshot.afterData,
+                descriptor: fd,
+                url: snapshot.selectedURL,
+                testing: testing
+            )
+        } else {
+            try writeAll(snapshot.afterData, descriptor: fd)
+        }
         guard fchmod(fd, 0o600) == 0 else { throw posixError("fchmod client") }
         guard fsync(fd) == 0 else { throw posixError("fsync client") }
+        try testing?.hit(.afterTargetWriteBeforeBindingCheck, url: snapshot.selectedURL)
+        do {
+            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: snapshot.registeredIdentity)
+        } catch {
+            if let beforeData = snapshot.beforeData {
+                try writeAll(beforeData, descriptor: fd)
+                try restoreMetadata(snapshot: snapshot, descriptor: fd)
+            } else {
+                guard ftruncate(fd, 0) == 0 else { throw posixError("restore created client") }
+            }
+            guard fsync(fd) == 0, fsync(parentDescriptor) == 0 else { throw posixError("restore client") }
+            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
+        }
         guard fsync(parentDescriptor) == 0 else { throw posixError("fsync client directory") }
         snapshot.registeredIdentity = try descriptorIdentity(fd)
         if snapshot.existed, snapshot.registeredIdentity != snapshot.originalIdentity {
@@ -981,6 +1076,52 @@ private final class AnchoredTarget {
         snapshot.mutationApplied = true
     }
 
+    private func verifyTargetNameBinding(
+        snapshot: ManagedTargetSnapshot,
+        expectedIdentity: FileIdentity?
+    ) throws {
+        if let expectedLink = snapshot.symlinkIdentity {
+            let selectedParts = pathComponents(snapshot.selectedRelativePath)
+            guard let selectedName = selectedParts.last else {
+                throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+            }
+            let selectedParent = try traversal.openDirectory(
+                relativePath: selectedParts.dropLast().joined(separator: "/"),
+                verify: nil
+            )
+            defer { _ = close(selectedParent.descriptor) }
+            var linkInfo = stat()
+            guard fstatat(selectedParent.descriptor, selectedName, &linkInfo, AT_SYMLINK_NOFOLLOW) == 0,
+                  linkInfo.st_mode & S_IFMT == S_IFLNK,
+                  FileIdentity(linkInfo) == expectedLink,
+                  try readLink(at: selectedParent.descriptor, name: selectedName) == snapshot.symlinkDestination else {
+                throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+            }
+        }
+        _ = try traversal.openDirectory(
+            relativePath: pathComponents(snapshot.targetRelativePath).dropLast().joined(separator: "/"),
+            verify: snapshot.parentIdentities,
+            closeResult: true
+        )
+        guard let fd = targetDescriptor, let expectedIdentity else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+        }
+        let targetName = pathComponents(targetRelativePath).last!
+        var namedInfo = stat()
+        guard fstatat(parentDescriptor, targetName, &namedInfo, AT_SYMLINK_NOFOLLOW) == 0,
+              namedInfo.st_mode & S_IFMT == S_IFREG,
+              FileIdentity(namedInfo) == expectedIdentity,
+              try descriptorIdentity(fd) == expectedIdentity else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+        }
+        let reopened = openat(parentDescriptor, targetName, O_RDONLY | O_NOFOLLOW)
+        guard reopened >= 0 else { throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL) }
+        defer { _ = close(reopened) }
+        guard try descriptorIdentity(reopened) == expectedIdentity else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+        }
+    }
+
     func reverse(snapshot: ManagedTargetSnapshot) throws -> ReverseResult {
         let targetName = pathComponents(targetRelativePath).last!
         guard let fd = targetDescriptor else {
@@ -989,20 +1130,56 @@ private final class AnchoredTarget {
         }
         let current = try readAll(fd)
         if current == snapshot.beforeData { return .alreadyReversed }
-        guard try descriptorIdentity(fd) == snapshot.registeredIdentity else {
+        let expectedIdentity = snapshot.registeredIdentity ?? snapshot.originalIdentity
+        guard try descriptorIdentity(fd) == expectedIdentity else {
             throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
         }
-        let currentOwned = try ConfigurationImage.ownedRepresentation(
-            format: snapshot.format,
-            data: current,
-            sourceURL: snapshot.selectedURL
-        )
+        if snapshot.effectiveMutationState == .intent,
+           snapshot.afterData.starts(with: current) {
+            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+            if snapshot.existed, let beforeData = snapshot.beforeData {
+                try writeAll(beforeData, descriptor: fd)
+                try restoreMetadata(snapshot: snapshot, descriptor: fd)
+                guard fsync(fd) == 0 else { throw posixError() }
+                try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+                guard fsync(parentDescriptor) == 0 else { throw posixError() }
+            } else {
+                guard unlinkat(parentDescriptor, targetName, 0) == 0 else { throw posixError() }
+                try verifyTargetNameAbsent(snapshot: snapshot)
+                guard fsync(parentDescriptor) == 0 else { throw posixError() }
+            }
+            return .reversed
+        }
+        let currentOwned: Data?
+        do {
+            currentOwned = try ConfigurationImage.ownedRepresentation(
+                format: snapshot.format,
+                data: current,
+                sourceURL: snapshot.selectedURL
+            )
+        } catch {
+            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+            if snapshot.effectiveMutationState == .intent,
+               snapshot.existed,
+               let beforeData = snapshot.beforeData {
+                try writeAll(beforeData, descriptor: fd)
+                try restoreMetadata(snapshot: snapshot, descriptor: fd)
+                guard fsync(fd) == 0 else { throw posixError() }
+                try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+                guard fsync(parentDescriptor) == 0 else { throw posixError() }
+                return .reversed
+            }
+            throw error
+        }
         if currentOwned == snapshot.beforeOwned { return .alreadyReversed }
         guard currentOwned == snapshot.afterOwned else {
             throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
         }
-        if !snapshot.existed {
-            guard unlinkat(parentDescriptor, targetName, 0) == 0, fsync(parentDescriptor) == 0 else { throw posixError() }
+        if !snapshot.existed, current == snapshot.afterData {
+            try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+            guard unlinkat(parentDescriptor, targetName, 0) == 0 else { throw posixError() }
+            try verifyTargetNameAbsent(snapshot: snapshot)
+            guard fsync(parentDescriptor) == 0 else { throw posixError() }
             return .reversed
         }
         let fullRestore = current == snapshot.afterData
@@ -1017,10 +1194,27 @@ private final class AnchoredTarget {
                 sourceURL: snapshot.selectedURL
             )
         }
+        try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
         try writeAll(restored, descriptor: fd)
         if fullRestore { try restoreMetadata(snapshot: snapshot, descriptor: fd) }
-        guard fsync(fd) == 0, fsync(parentDescriptor) == 0 else { throw posixError() }
+        guard fsync(fd) == 0 else { throw posixError() }
+        try verifyTargetNameBinding(snapshot: snapshot, expectedIdentity: expectedIdentity)
+        guard fsync(parentDescriptor) == 0 else { throw posixError() }
         return .reversed
+    }
+
+    private func verifyTargetNameAbsent(snapshot: ManagedTargetSnapshot) throws {
+        _ = try traversal.openDirectory(
+            relativePath: pathComponents(snapshot.targetRelativePath).dropLast().joined(separator: "/"),
+            verify: snapshot.parentIdentities,
+            closeResult: true
+        )
+        let targetName = pathComponents(targetRelativePath).last!
+        var info = stat()
+        guard fstatat(parentDescriptor, targetName, &info, AT_SYMLINK_NOFOLLOW) == -1,
+              errno == ENOENT else {
+            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
+        }
     }
 }
 
@@ -1355,7 +1549,26 @@ private func readAll(_ descriptor: Int32) throws -> Data {
 
 private func writeAll(_ data: Data, descriptor: Int32) throws {
     guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) >= 0 else { throw posixError() }
-    try data.withUnsafeBytes { rawBuffer in
+    try writeBuffer(data, descriptor: descriptor)
+}
+
+private func writeWithPartialCheckpoint(
+    _ data: Data,
+    descriptor: Int32,
+    url: URL,
+    testing: MCPRegistrationTesting
+) throws {
+    guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) >= 0 else { throw posixError() }
+    let split = max(1, data.count / 2)
+    try writeBuffer(data.prefix(split), descriptor: descriptor)
+    guard fsync(descriptor) == 0 else { throw posixError("fsync partial client") }
+    try testing.hit(.duringExistingTargetWrite, url: url)
+    try writeBuffer(data.dropFirst(split), descriptor: descriptor)
+}
+
+private func writeBuffer<C: Collection>(_ data: C, descriptor: Int32) throws where C.Element == UInt8 {
+    let bytes = Data(data)
+    try bytes.withUnsafeBytes { rawBuffer in
         guard var pointer = rawBuffer.baseAddress else { return }
         var remaining = rawBuffer.count
         while remaining > 0 {
