@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct MCPRegistrationResult: Equatable, Sendable {
@@ -37,12 +38,15 @@ public enum MCPRegistrationError: LocalizedError, Sendable {
     case executableMissing(URL)
     case executableNotRunnable(URL)
     case invalidConfiguration(URL)
+    case rollbackFailed(primary: String, failures: [String])
 
     public var errorDescription: String? {
         switch self {
         case .executableMissing(let url): return "The Evee MCP helper is missing at \(url.path)."
         case .executableNotRunnable(let url): return "The Evee MCP helper is not executable at \(url.path)."
         case .invalidConfiguration(let url): return "The MCP configuration at \(url.path) is not a supported configuration."
+        case .rollbackFailed(let primary, let failures):
+            return "Registration failed: \(primary) Rollback also failed: \(failures.joined(separator: "; "))"
         }
     }
 }
@@ -108,7 +112,17 @@ public enum MCPRegistration {
                 try writeConfiguration(at: client.configurationURL, executableURL: executable)
             }
         } catch {
-            for snapshot in snapshots.reversed() { try? snapshot.restore() }
+            var failures: [String] = []
+            for snapshot in snapshots.reversed() {
+                do {
+                    try snapshot.restore()
+                } catch {
+                    failures.append("\(snapshot.url.path): \(error.localizedDescription)")
+                }
+            }
+            if !failures.isEmpty {
+                throw MCPRegistrationError.rollbackFailed(primary: error.localizedDescription, failures: failures)
+            }
             throw error
         }
     }
@@ -152,8 +166,7 @@ public enum MCPRegistration {
         root["mcpServers"] = servers
 
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try writePrivate(data, to: url)
         return MCPRegistrationResult(configurationURL: url, executableURL: executable, replacedExistingRegistration: replaced)
     }
 
@@ -221,8 +234,32 @@ public enum MCPRegistration {
     }
 
     private static func writePrivate(_ data: Data, to url: URL) throws {
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1 else {
+            throw MCPRegistrationError.invalidConfiguration(url)
+        }
+        guard ftruncate(descriptor, 0) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try data.withUnsafeBytes { buffer in
+            guard var pointer = buffer.baseAddress else { return }
+            var remaining = buffer.count
+            while remaining > 0 {
+                let count = Darwin.write(descriptor, pointer, remaining)
+                guard count >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                pointer = pointer.advanced(by: count)
+                remaining -= count
+            }
+        }
+        guard fchmod(descriptor, 0o600) == 0, fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     private static func writeCodexConfiguration(at url: URL, executable: URL) throws -> MCPRegistrationResult {
@@ -322,7 +359,7 @@ private struct ConfigurationSnapshot {
 
     func restore() throws {
         if let data {
-            try data.write(to: url, options: .atomic)
+            try data.write(to: url)
             if let permissions {
                 try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
             }

@@ -409,14 +409,20 @@ struct SettingsView: View {
 
     private func revokeMCP() async {
         do {
-            let results = try await store.revokeLocalHelperAccess()
-            let removed = results.filter(\.removedRegistration).count
-            integrationMessage = removed == 0
-                ? "Local helper access is disabled. No Evee registrations were present."
-                : "Local helper access is disabled. Removed Evee from \(removed) \(removed == 1 ? "client" : "clients"). Restart them to disconnect."
+            let outcome = try await store.revokeLocalHelperAccess()
+            let removed = outcome.removals.filter(\.removedRegistration).count
+            if outcome.cleanupFailures.isEmpty {
+                integrationMessage = removed == 0
+                    ? "Local helper access is disabled. No owned client registrations were present."
+                    : "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"). Restart them to disconnect."
+            } else {
+                integrationMessage = "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"); \(outcome.cleanupFailures.count) \(outcome.cleanupFailures.count == 1 ? "client needs" : "clients need") manual cleanup."
+            }
             refreshMCPClients()
         } catch {
-            integrationMessage = "Local helper access is disabled, but registration cleanup failed: \(error.localizedDescription)"
+            integrationMessage = store.settings.mcpEnabled
+                ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"
+                : "Local helper access is disabled, but registration cleanup failed: \(error.localizedDescription)"
         }
     }
 

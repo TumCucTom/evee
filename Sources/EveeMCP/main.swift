@@ -86,21 +86,29 @@ enum EveeMCP {
                 continue
             }
 
+            var authorizationLease: MCPAuthorizationLease?
             do {
+                if method == "initialize" || method == "tools/call" {
+                    let storageRootURL = await LibraryStore.shared.rootURL
+                    authorizationLease = try MCPAuthorization.sharedLease(storageRootURL: storageRootURL)
+                    try await requireEnabledAccess()
+                    if method == "tools/call" { try await suspendReadLeaseForTestingIfRequested() }
+                }
                 let result = try await handle(method: method, params: params)
+                if authorizationLease != nil { try await requireEnabledAccess() }
                 write(["jsonrpc": "2.0", "id": id, "result": result])
             } catch let error as MCPFailure {
                 write(["jsonrpc": "2.0", "id": id, "error": ["code": error.code, "message": error.message]])
             } catch {
                 write(["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": error.localizedDescription]])
             }
+            authorizationLease?.release()
         }
     }
 
     static func handle(method: String, params: [String: Any]) async throws -> Any {
         switch method {
         case "initialize":
-            try await requireEnabledAccess()
             return [
                 "protocolVersion": protocolVersion,
                 "capabilities": ["tools": ["listChanged": false]],
@@ -111,7 +119,6 @@ enum EveeMCP {
         case "tools/list":
             return ["tools": toolDefinitions]
         case "tools/call":
-            try await requireEnabledAccess()
             guard let name = params["name"] as? String else {
                 throw MCPFailure(code: -32602, message: "tools/call requires a tool name.")
             }
@@ -125,7 +132,6 @@ enum EveeMCP {
                 arguments = [:]
             }
             let text = try await callTool(name: name, arguments: arguments)
-            try await requireEnabledAccess()
             return ["content": [["type": "text", "text": text]]]
         default:
             throw MCPFailure(code: -32601, message: "Method not found: \(method)")
@@ -274,6 +280,18 @@ enum EveeMCP {
         guard try await LibraryStore.shared.loadSettings().mcpEnabled else {
             throw MCPFailure(code: -32001, message: disabledAccessMessage)
         }
+    }
+
+    static func suspendReadLeaseForTestingIfRequested() async throws {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        guard let acquiredPath = environment["EVEE_MCP_TEST_LEASE_ACQUIRED_PATH"],
+              let releasePath = environment["EVEE_MCP_TEST_LEASE_RELEASE_PATH"] else { return }
+        try Data().write(to: URL(fileURLWithPath: acquiredPath), options: .atomic)
+        while !FileManager.default.fileExists(atPath: releasePath) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #endif
     }
 
     static func validatedLimit(_ value: Any?) throws -> Int {

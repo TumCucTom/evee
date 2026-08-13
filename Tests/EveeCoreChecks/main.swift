@@ -1,4 +1,4 @@
-import EveeCore
+@_spi(Testing) import EveeCore
 import Darwin
 import Foundation
 import Network
@@ -16,6 +16,11 @@ private enum SyntheticSecretStoreError: Error {
 
 private enum SyntheticWebhookPersistenceError: Error {
     case rejected
+}
+
+private enum SyntheticMCPPersistenceError: Error {
+    case rejected
+    case restoreRejected
 }
 
 private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
@@ -1020,6 +1025,237 @@ private func checkMCPRevocation() async throws {
     try Data("#!/bin/sh\n".utf8).write(to: executable)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
 
+    let registrationRoot = support.appendingPathComponent("Evee", isDirectory: true)
+    let selectedConfiguration = home.appendingPathComponent(".selected/mcp.json")
+    let manualConfiguration = home.appendingPathComponent(".manual/mcp.json")
+    try FileManager.default.createDirectory(at: selectedConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: manualConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let selectedOriginal = Data("{\"theme\":\"dark\",\"mcpServers\":{\"evee\":{\"command\":\"prior\",\"args\":[\"keep\"]},\"other\":{\"command\":\"other\"}}}".utf8)
+    let manualOriginal = Data("{\"mcpServers\":{\"evee\":{\"command\":\"manual\"}}}".utf8)
+    try selectedOriginal.write(to: selectedConfiguration)
+    try manualOriginal.write(to: manualConfiguration)
+    var accessSettings = EveeSettings()
+    let ownedResults = try await MCPOwnedRegistration.enable(
+        clients: [MCPClientConfiguration(name: "Selected", configurationURL: selectedConfiguration)],
+        executableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: accessSettings,
+        saveSettings: { settings in
+            try require(settings.mcpEnabled, "enable persisted disabled authorization")
+        }
+    )
+    try require(ownedResults.count == 1 && ownedResults[0].replacedExistingRegistration, "selected pre-existing registration was not recorded")
+    accessSettings.mcpEnabled = true
+    let ownedRevocation = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: accessSettings,
+        saveSettings: { settings in
+            try require(!settings.mcpEnabled, "revoke did not persist fail-closed authorization first")
+        }
+    )
+    try require(ownedRevocation.cleanupFailures.isEmpty, "selected registration cleanup failed")
+    let selectedRestored = try Data(contentsOf: selectedConfiguration)
+    let manualRestored = try Data(contentsOf: manualConfiguration)
+    try require(selectedRestored == selectedOriginal, "selected pre-existing registration was not restored exactly")
+    try require(manualRestored == manualOriginal, "unselected markerless registration was changed")
+    try require(!FileManager.default.fileExists(atPath: MCPOwnedRegistration.manifestURL(storageRootURL: registrationRoot).path), "owned manifest remained after successful revoke")
+
+    let failedSaveConfiguration = home.appendingPathComponent(".save-failure/new/client.json")
+    do {
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [MCPClientConfiguration(name: "Save failure", configurationURL: failedSaveConfiguration)],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: EveeSettings(),
+            saveSettings: { settings in
+                if settings.mcpEnabled { throw SyntheticMCPPersistenceError.rejected }
+            }
+        )
+        throw CoreCheckError.assertionFailed("enable settings save failure was ignored")
+    } catch SyntheticMCPPersistenceError.rejected {
+        // Expected.
+    }
+    try require(!FileManager.default.fileExists(atPath: failedSaveConfiguration.path), "enable save failure left a registration")
+    try require(!FileManager.default.fileExists(atPath: failedSaveConfiguration.deletingLastPathComponent().path), "enable rollback left a transaction-created directory")
+
+    let failedRestoreConfiguration = home.appendingPathComponent(".restore-failure/new/client.json")
+    do {
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [MCPClientConfiguration(name: "Restore failure", configurationURL: failedRestoreConfiguration)],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: EveeSettings(),
+            saveSettings: { settings in
+                if settings.mcpEnabled { throw SyntheticMCPPersistenceError.rejected }
+            },
+            testing: MCPRegistrationTesting(beforeRestore: { _ in throw SyntheticMCPPersistenceError.restoreRejected })
+        )
+        throw CoreCheckError.assertionFailed("injected rollback failure was ignored")
+    } catch MCPOwnedRegistrationError.rollbackFailed(_, let failures) {
+        try require(failures.count == 1 && failures[0].contains(failedRestoreConfiguration.path), "rollback did not aggregate the restore failure")
+    }
+    try require(FileManager.default.fileExists(atPath: failedRestoreConfiguration.path), "failed rollback was reported without its unrestored file")
+    var rollbackCleanupSettings = EveeSettings()
+    rollbackCleanupSettings.mcpEnabled = true
+    let rollbackCleanup = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: rollbackCleanupSettings,
+        saveSettings: { _ in }
+    )
+    try require(rollbackCleanup.cleanupFailures.isEmpty, "a later revoke could not finish an injected failed rollback")
+    try require(!FileManager.default.fileExists(atPath: failedRestoreConfiguration.deletingLastPathComponent().path), "later cleanup left a transaction-created directory")
+
+    _ = try await MCPOwnedRegistration.enable(
+        clients: [MCPClientConfiguration(name: "Selected", configurationURL: selectedConfiguration)],
+        executableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: EveeSettings(),
+        saveSettings: { _ in }
+    )
+    do {
+        _ = try await MCPOwnedRegistration.revoke(
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: accessSettings,
+            saveSettings: { _ in throw SyntheticMCPPersistenceError.rejected }
+        )
+        throw CoreCheckError.assertionFailed("disable settings save failure was ignored")
+    } catch SyntheticMCPPersistenceError.rejected {
+        // Expected.
+    }
+    try require(FileManager.default.fileExists(atPath: MCPOwnedRegistration.manifestURL(storageRootURL: registrationRoot).path), "failed disable discarded ownership manifest")
+    let stillRegisteredRoot = try JSONSerialization.jsonObject(with: Data(contentsOf: selectedConfiguration)) as! [String: Any]
+    let stillRegisteredServers = stillRegisteredRoot["mcpServers"] as! [String: Any]
+    let stillRegisteredEvee = stillRegisteredServers["evee"] as! [String: Any]
+    try require(stillRegisteredEvee["command"] as? String == executable.path, "failed disable cleaned registration despite remaining enabled")
+    _ = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: accessSettings,
+        saveSettings: { _ in }
+    )
+
+    let metadataDirectory = home.appendingPathComponent(".metadata", isDirectory: true)
+    let metadataTarget = metadataDirectory.appendingPathComponent("actual.json")
+    let metadataLink = metadataDirectory.appendingPathComponent("linked.json")
+    try FileManager.default.createDirectory(at: metadataDirectory, withIntermediateDirectories: true)
+    let metadataOriginal = Data("{\"mcpServers\":{\"other\":{\"command\":\"other\"}}}".utf8)
+    try metadataOriginal.write(to: metadataTarget)
+    try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: metadataTarget.path)
+    let metadataAttributeName = "user.evee.core-check"
+    let metadataAttributeValue = Data("preserved".utf8)
+    let metadataAttributeWrite = metadataAttributeValue.withUnsafeBytes {
+        setxattr(metadataTarget.path, metadataAttributeName, $0.baseAddress, metadataAttributeValue.count, 0, 0)
+    }
+    try require(metadataAttributeWrite == 0, "test could not set synthetic configuration metadata")
+    try FileManager.default.createSymbolicLink(atPath: metadataLink.path, withDestinationPath: "actual.json")
+    let targetAttributes = try FileManager.default.attributesOfItem(atPath: metadataTarget.path)
+    let targetInode = targetAttributes[.systemFileNumber] as? NSNumber
+    _ = try await MCPOwnedRegistration.enable(
+        clients: [MCPClientConfiguration(name: "Linked", configurationURL: metadataLink)],
+        executableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: EveeSettings(),
+        saveSettings: { _ in }
+    )
+    _ = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: accessSettings,
+        saveSettings: { _ in }
+    )
+    let restoredAttributes = try FileManager.default.attributesOfItem(atPath: metadataTarget.path)
+    try require((restoredAttributes[.systemFileNumber] as? NSNumber) == targetInode, "registration replaced the existing target file identity")
+    try require((restoredAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o640, "registration did not restore the target mode")
+    let restoredLinkDestination = try FileManager.default.destinationOfSymbolicLink(atPath: metadataLink.path)
+    let restoredMetadata = try Data(contentsOf: metadataTarget)
+    let restoredAttributeSize = getxattr(metadataTarget.path, metadataAttributeName, nil, 0, 0, 0)
+    var restoredAttribute = Data(count: max(0, restoredAttributeSize))
+    let restoredAttributeCapacity = restoredAttribute.count
+    let restoredAttributeRead = restoredAttribute.withUnsafeMutableBytes {
+        getxattr(metadataTarget.path, metadataAttributeName, $0.baseAddress, restoredAttributeCapacity, 0, 0)
+    }
+    try require(restoredLinkDestination == "actual.json", "registration replaced or changed the configuration symlink")
+    try require(restoredMetadata == metadataOriginal, "symlink target content was not restored")
+    try require(restoredAttributeRead == metadataAttributeValue.count && restoredAttribute == metadataAttributeValue, "registration did not preserve target extended attributes")
+
+    let escapedTarget = root.appendingPathComponent("outside-home.json")
+    let escapedLink = metadataDirectory.appendingPathComponent("escaped.json")
+    let escapedOriginal = Data("{\"outside\":true}".utf8)
+    try escapedOriginal.write(to: escapedTarget)
+    try FileManager.default.createSymbolicLink(atPath: escapedLink.path, withDestinationPath: escapedTarget.path)
+    do {
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [MCPClientConfiguration(name: "Escaped", configurationURL: escapedLink)],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: registrationRoot,
+            settings: EveeSettings(),
+            saveSettings: { _ in }
+        )
+        throw CoreCheckError.assertionFailed("registration accepted a symlink escaping the approved configuration root")
+    } catch MCPOwnedRegistrationError.unsafeConfiguration {
+        // Expected.
+    }
+    let escapedRestored = try Data(contentsOf: escapedTarget)
+    try require(escapedRestored == escapedOriginal, "rejected symlink escape changed its target")
+
+    let partialGood = metadataDirectory.appendingPathComponent("partial-good.json")
+    let partialTarget = metadataDirectory.appendingPathComponent("partial-target.json")
+    let partialAlternate = metadataDirectory.appendingPathComponent("partial-alternate.json")
+    let partialLink = metadataDirectory.appendingPathComponent("partial-link.json")
+    let partialGoodOriginal = Data("{\"keep\":\"good\"}".utf8)
+    let partialTargetOriginal = Data("{\"keep\":\"linked\"}".utf8)
+    try partialGoodOriginal.write(to: partialGood)
+    try partialTargetOriginal.write(to: partialTarget)
+    try Data("{\"keep\":\"alternate\"}".utf8).write(to: partialAlternate)
+    try FileManager.default.createSymbolicLink(atPath: partialLink.path, withDestinationPath: "partial-target.json")
+    _ = try await MCPOwnedRegistration.enable(
+        clients: [
+            MCPClientConfiguration(name: "Partial good", configurationURL: partialGood),
+            MCPClientConfiguration(name: "Partial linked", configurationURL: partialLink),
+        ],
+        executableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: EveeSettings(),
+        saveSettings: { _ in }
+    )
+    try FileManager.default.removeItem(at: partialLink)
+    try FileManager.default.createSymbolicLink(atPath: partialLink.path, withDestinationPath: "partial-alternate.json")
+    let partialOutcome = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: accessSettings,
+        saveSettings: { settings in
+            try require(!settings.mcpEnabled, "partial cleanup ran before fail-closed persistence")
+        }
+    )
+    try require(partialOutcome.removals.count == 1 && partialOutcome.cleanupFailures.count == 1, "partial cleanup did not accurately separate restored and failed targets")
+    let partialGoodRestored = try Data(contentsOf: partialGood)
+    try require(partialGoodRestored == partialGoodOriginal, "partial revoke did not restore its safe target")
+    try require(FileManager.default.fileExists(atPath: MCPOwnedRegistration.manifestURL(storageRootURL: registrationRoot).path), "partial cleanup discarded the remaining ownership snapshot")
+    try FileManager.default.removeItem(at: partialLink)
+    try FileManager.default.createSymbolicLink(atPath: partialLink.path, withDestinationPath: "partial-target.json")
+    var alreadyDisabled = accessSettings
+    alreadyDisabled.mcpEnabled = false
+    let completedPartialCleanup = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: registrationRoot,
+        settings: alreadyDisabled,
+        saveSettings: { _ in }
+    )
+    try require(completedPartialCleanup.cleanupFailures.isEmpty, "retry did not complete partial cleanup")
+    let partialTargetRestored = try Data(contentsOf: partialTarget)
+    try require(partialTargetRestored == partialTargetOriginal, "retry did not restore the previously unsafe target")
+
     let firstTransactionalConfiguration = root.appendingPathComponent("transaction/first.json")
     let secondTransactionalConfiguration = root.appendingPathComponent("transaction/second.json")
     try FileManager.default.createDirectory(at: firstTransactionalConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1104,23 +1340,71 @@ private func checkMCPRevocation() async throws {
         try require(!responseText.contains("revocation sentinel"), "malformed \(name) arguments broadened into workspace data")
     }
 
-    enabled.mcpEnabled = false
-    try await library.save(enabled)
+    try input.fileHandleForWriting.close()
+    process.waitUntilExit()
+    try require(process.terminationStatus == 0, "evee-mcp failed: \(String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))")
+
+    let leaseAcquired = root.appendingPathComponent("lease-acquired")
+    let releaseLease = root.appendingPathComponent("release-lease")
+    let revokeReturned = root.appendingPathComponent("revoke-returned")
+    let raceProcess = Process()
+    let raceInput = Pipe()
+    let raceOutput = Pipe()
+    let raceErrors = Pipe()
+    raceProcess.executableURL = packagedHelper
+    raceProcess.standardInput = raceInput
+    raceProcess.standardOutput = raceOutput
+    raceProcess.standardError = raceErrors
+    environment["EVEE_MCP_TEST_LEASE_ACQUIRED_PATH"] = leaseAcquired.path
+    environment["EVEE_MCP_TEST_LEASE_RELEASE_PATH"] = releaseLease.path
+    raceProcess.environment = environment
+    try raceProcess.run()
     try writeMCPRequest([
         "jsonrpc": "2.0",
         "id": 6,
         "method": "tools/call",
         "params": ["name": "search", "arguments": ["query": "revocation"]],
-    ], to: input.fileHandleForWriting)
-    let revoked = try readMCPResponse(from: output.fileHandleForReading)
+    ], to: raceInput.fileHandleForWriting)
+    let leaseDeadline = Date().addingTimeInterval(5)
+    while !FileManager.default.fileExists(atPath: leaseAcquired.path), Date() < leaseDeadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try require(FileManager.default.fileExists(atPath: leaseAcquired.path), "helper did not acquire its workspace read lease")
+    let revokeTask = Task {
+        let outcome = try await MCPOwnedRegistration.revoke(
+            allowedRootURLs: [home],
+            storageRootURL: libraryRoot,
+            settings: enabled,
+            saveSettings: { settings in try await library.save(settings) }
+        )
+        try Data().write(to: revokeReturned)
+        return outcome
+    }
+    try await Task.sleep(for: .milliseconds(150))
+    try require(!FileManager.default.fileExists(atPath: revokeReturned.path), "revoke returned while an earlier workspace read lease was suspended")
+    try Data().write(to: releaseLease)
+    let preRevokeRead = try readMCPResponse(from: raceOutput.fileHandleForReading)
+    let preRevokeText = String(decoding: try JSONSerialization.data(withJSONObject: preRevokeRead), as: UTF8.self)
+    try require(preRevokeText.contains("revocation sentinel"), "the read that began before revoke acquired exclusivity did not complete")
+    let raceRevocation = try await revokeTask.value
+    try require(raceRevocation.cleanupFailures.isEmpty, "authorization-only revoke reported cleanup failures")
+    try require(FileManager.default.fileExists(atPath: revokeReturned.path), "revoke did not return after the earlier read released its lease")
+
+    try writeMCPRequest([
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": ["name": "search", "arguments": ["query": "revocation"]],
+    ], to: raceInput.fileHandleForWriting)
+    let revoked = try readMCPResponse(from: raceOutput.fileHandleForReading)
     let error = revoked["error"] as? [String: Any]
     try require(error?["code"] as? Int == -32001, "revoked helper did not return the access-disabled error")
     try require((error?["message"] as? String)?.localizedCaseInsensitiveContains("enable local helper access in Evee") == true, "revoked helper error did not explain how to enable access")
     let revokedResponse = String(decoding: try JSONSerialization.data(withJSONObject: revoked), as: UTF8.self)
     try require(!revokedResponse.contains("revocation sentinel"), "revoked helper exposed workspace data")
-    try input.fileHandleForWriting.close()
-    process.waitUntilExit()
-    try require(process.terminationStatus == 0, "evee-mcp failed: \(String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))")
+    try raceInput.fileHandleForWriting.close()
+    raceProcess.waitUntilExit()
+    try require(raceProcess.terminationStatus == 0, "evee-mcp race process failed: \(String(decoding: raceErrors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))")
 
     let disabledProcess = Process()
     let disabledInput = Pipe()
@@ -1131,7 +1415,7 @@ private func checkMCPRevocation() async throws {
     disabledProcess.standardError = Pipe()
     disabledProcess.environment = environment
     try disabledProcess.run()
-    try writeMCPRequest(["jsonrpc": "2.0", "id": 7, "method": "initialize", "params": [:]], to: disabledInput.fileHandleForWriting)
+    try writeMCPRequest(["jsonrpc": "2.0", "id": 8, "method": "initialize", "params": [:]], to: disabledInput.fileHandleForWriting)
     try disabledInput.fileHandleForWriting.close()
     let disabledInitialize = try readMCPResponse(from: disabledOutput.fileHandleForReading)
     disabledProcess.waitUntilExit()

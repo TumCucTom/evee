@@ -356,36 +356,30 @@ final class AppStore: ObservableObject {
     }
 
     func enableLocalHelperAccess(for clients: [MCPClientConfiguration]) async throws -> [MCPRegistrationResult] {
-        let results = try MCPRegistration.writeConfigurations(
-            for: clients,
-            executableURL: MCPRegistration.bundledExecutableURL()
+        let rootURL = await library.rootURL
+        let results = try await MCPOwnedRegistration.enable(
+            clients: clients,
+            executableURL: MCPRegistration.bundledExecutableURL(),
+            allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+            storageRootURL: rootURL,
+            settings: settings,
+            saveSettings: { [library] settings in try await library.save(settings) }
         )
         guard !results.isEmpty else { return [] }
         settings.mcpEnabled = true
-        do {
-            try await library.save(settings)
-            return results
-        } catch {
-            settings.mcpEnabled = false
-            throw error
-        }
+        return results
     }
 
-    func revokeLocalHelperAccess() async throws -> [MCPRemovalResult] {
-        let clients = MCPRegistration.detectedClients()
-        var results: [MCPRemovalResult] = []
-        var cleanupError: Error?
-        for client in clients {
-            do {
-                results.append(try MCPRegistration.removeConfiguration(at: client.configurationURL))
-            } catch {
-                cleanupError = cleanupError ?? error
-            }
-        }
+    func revokeLocalHelperAccess() async throws -> MCPRevocationOutcome {
+        let rootURL = await library.rootURL
+        let outcome = try await MCPOwnedRegistration.revoke(
+            allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+            storageRootURL: rootURL,
+            settings: settings,
+            saveSettings: { [library] settings in try await library.save(settings) }
+        )
         settings.mcpEnabled = false
-        try await library.save(settings)
-        if let cleanupError { throw cleanupError }
-        return results
+        return outcome
     }
 
     func downloadSelectedModel() async {
