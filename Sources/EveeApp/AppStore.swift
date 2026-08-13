@@ -355,6 +355,39 @@ final class AppStore: ObservableObject {
         } catch { statusMessage = error.localizedDescription }
     }
 
+    func enableLocalHelperAccess(for clients: [MCPClientConfiguration]) async throws -> [MCPRegistrationResult] {
+        let results = try MCPRegistration.writeConfigurations(
+            for: clients,
+            executableURL: MCPRegistration.bundledExecutableURL()
+        )
+        guard !results.isEmpty else { return [] }
+        settings.mcpEnabled = true
+        do {
+            try await library.save(settings)
+            return results
+        } catch {
+            settings.mcpEnabled = false
+            throw error
+        }
+    }
+
+    func revokeLocalHelperAccess() async throws -> [MCPRemovalResult] {
+        let clients = MCPRegistration.detectedClients()
+        var results: [MCPRemovalResult] = []
+        var cleanupError: Error?
+        for client in clients {
+            do {
+                results.append(try MCPRegistration.removeConfiguration(at: client.configurationURL))
+            } catch {
+                cleanupError = cleanupError ?? error
+            }
+        }
+        settings.mcpEnabled = false
+        try await library.save(settings)
+        if let cleanupError { throw cleanupError }
+        return results
+    }
+
     func downloadSelectedModel() async {
         do {
             let selected = try TranscriberFactory.make(settings.model)

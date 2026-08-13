@@ -7,8 +7,42 @@ bin_dir="$(swift build --show-bin-path)"
 helper="$bin_dir/evee-mcp"
 test -x "$helper"
 
+smoke_home="${CFFIXED_USER_HOME:-}"
+owns_smoke_home=false
+if [[ -z "$smoke_home" ]]; then
+  smoke_home="$(mktemp -d /tmp/evee-mcp-smoke.XXXXXX)"
+  owns_smoke_home=true
+fi
+if [[ "$smoke_home" == "$HOME" || "$smoke_home" == "/" ]]; then
+  echo "MCP smoke requires an isolated temporary home" >&2
+  exit 1
+fi
+export CFFIXED_USER_HOME="$smoke_home"
+
+settings_dir="$smoke_home/Library/Application Support/Evee"
+mkdir -p "$settings_dir"
+chmod 700 "$settings_dir"
+python3 - "$settings_dir/settings.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({
+        "schemaVersion": 2,
+        "updatedAt": "2026-08-13T00:00:00Z",
+        "settings": {"mcpEnabled": True},
+    }, handle)
+PY
+chmod 600 "$settings_dir/settings.json"
+
 response_file="$(mktemp)"
-trap 'rm -f "$response_file"' EXIT
+cleanup() {
+  rm -f "$response_file"
+  if [[ "$owns_smoke_home" == true ]]; then
+    rm -rf "$smoke_home"
+  fi
+}
+trap cleanup EXIT
 
 python3 - <<'PY' | "$helper" >"$response_file"
 import json

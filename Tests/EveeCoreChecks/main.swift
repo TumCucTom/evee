@@ -902,7 +902,11 @@ private func checkMCPPublicOutput() async throws {
         recoverySourceID: UUID(),
         context: WorkspaceContext(selectedText: "Private selection")
     )
-    try await LibraryStore(rootURL: libraryRoot).upsert(record)
+    let library = LibraryStore(rootURL: libraryRoot)
+    var settings = EveeSettings()
+    settings.mcpEnabled = true
+    try await library.save(settings)
+    try await library.upsert(record)
 
     let executable = Bundle.main.executableURL!
         .deletingLastPathComponent()
@@ -960,6 +964,183 @@ private func checkMCPPublicOutput() async throws {
     print("mcp-public-output: passed")
 }
 
+private func readMCPResponse(from handle: FileHandle) throws -> [String: Any] {
+    let data = handle.availableData
+    try require(!data.isEmpty, "evee-mcp closed without a response")
+    let line: Data
+    if let newline = data.firstIndex(of: 0x0A) {
+        line = data.subdata(in: data.startIndex..<newline)
+    } else {
+        line = data
+    }
+    guard let response = try JSONSerialization.jsonObject(with: line) as? [String: Any] else {
+        throw CoreCheckError.assertionFailed("evee-mcp returned a non-object response")
+    }
+    return response
+}
+
+private func writeMCPRequest(_ request: [String: Any], to handle: FileHandle) throws {
+    try handle.write(contentsOf: JSONSerialization.data(withJSONObject: request) + Data("\n".utf8))
+}
+
+private func checkMCPRevocation() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-mcp-revocation-\(UUID().uuidString)", isDirectory: true)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+    let codexDirectory = home.appendingPathComponent(".codex", isDirectory: true)
+    let codexConfiguration = codexDirectory.appendingPathComponent("config.toml")
+    let jsonConfiguration = root.appendingPathComponent("client/config.json")
+    let executable = root.appendingPathComponent("Helpers/evee-mcp")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let legacy = try JSONDecoder().decode(EveeSettings.self, from: Data("{}".utf8))
+    try require(!legacy.mcpEnabled, "legacy settings enabled local helper access")
+
+    try FileManager.default.createDirectory(at: jsonConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{\"display\":\"compact\",\"mcpServers\":{\"evee\":{\"command\":\"old\"},\"other\":{\"command\":\"other\"}}}".utf8).write(to: jsonConfiguration)
+    let removal = try MCPRegistration.removeConfiguration(at: jsonConfiguration)
+    try require(removal.removedRegistration, "JSON Evee registration was not removed")
+    let jsonRoot = try JSONSerialization.jsonObject(with: Data(contentsOf: jsonConfiguration)) as! [String: Any]
+    let servers = jsonRoot["mcpServers"] as! [String: Any]
+    try require(servers["evee"] == nil, "JSON Evee registration remained")
+    try require(servers["other"] != nil && jsonRoot["display"] as? String == "compact", "JSON removal changed unrelated configuration")
+
+    try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    let noClients = MCPRegistration.detectedClients(fileManager: .default, homeURL: home, applicationSupportURL: support)
+    try require(noClients.isEmpty, "empty synthetic home detected a fallback MCP client")
+    let noWrites = try MCPRegistration.writeDetectedClientConfigurations(fileManager: .default, homeURL: home, applicationSupportURL: support)
+    try require(noWrites.isEmpty, "empty synthetic home produced fallback registration results")
+    try require(!FileManager.default.fileExists(atPath: support.appendingPathComponent("Claude/claude_desktop_config.json").path), "fallback Claude configuration was written")
+
+    try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let originalCodex = "model = \"gpt-test\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+    try Data(originalCodex.utf8).write(to: codexConfiguration)
+    try Data("#!/bin/sh\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+    let firstTransactionalConfiguration = root.appendingPathComponent("transaction/first.json")
+    let secondTransactionalConfiguration = root.appendingPathComponent("transaction/second.json")
+    try FileManager.default.createDirectory(at: firstTransactionalConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: firstTransactionalConfiguration.deletingLastPathComponent().path)
+    let originalFirstConfiguration = Data("{\"keep\":true,\"mcpServers\":{\"other\":{\"command\":\"other\"}}}".utf8)
+    let originalSecondConfiguration = Data("[]".utf8)
+    try originalFirstConfiguration.write(to: firstTransactionalConfiguration)
+    try originalSecondConfiguration.write(to: secondTransactionalConfiguration)
+    do {
+        _ = try MCPRegistration.writeConfigurations(
+            for: [
+                MCPClientConfiguration(name: "First", configurationURL: firstTransactionalConfiguration),
+                MCPClientConfiguration(name: "Second", configurationURL: secondTransactionalConfiguration),
+            ],
+            executableURL: executable
+        )
+        throw CoreCheckError.assertionFailed("invalid later client configuration did not fail registration")
+    } catch MCPRegistrationError.invalidConfiguration {
+        // Expected.
+    }
+    let restoredFirstConfiguration = try Data(contentsOf: firstTransactionalConfiguration)
+    let restoredSecondConfiguration = try Data(contentsOf: secondTransactionalConfiguration)
+    try require(restoredFirstConfiguration == originalFirstConfiguration, "failed registration did not restore an earlier client exactly")
+    try require(restoredSecondConfiguration == originalSecondConfiguration, "failed registration changed the rejecting client")
+    let transactionDirectoryPermissions = try FileManager.default.attributesOfItem(atPath: firstTransactionalConfiguration.deletingLastPathComponent().path)[.posixPermissions] as? NSNumber
+    try require(transactionDirectoryPermissions?.intValue == 0o755, "registration changed permissions on an existing client directory")
+
+    let codexClients = MCPRegistration.detectedClients(fileManager: .default, homeURL: home, applicationSupportURL: support)
+    try require(codexClients.map(\.name) == ["Codex"], "Codex configuration was not detected exactly")
+    _ = try MCPRegistration.writeConfiguration(at: codexConfiguration, executableURL: executable)
+    let registeredCodex = try String(contentsOf: codexConfiguration)
+    try require(registeredCodex.contains("[mcp_servers.evee]"), "Codex Evee table was not registered")
+    let codexRemoval = try MCPRegistration.removeConfiguration(at: codexConfiguration)
+    try require(codexRemoval.removedRegistration, "Codex Evee table was not removed")
+    let restoredCodex = try String(contentsOf: codexConfiguration)
+    try require(restoredCodex == originalCodex, "Codex round trip changed unrelated configuration")
+
+    let packagedHelper = Bundle.main.executableURL!
+        .deletingLastPathComponent()
+        .appendingPathComponent("evee-mcp")
+    try require(FileManager.default.isExecutableFile(atPath: packagedHelper.path), "build evee-mcp before running mcp-revocation")
+    let libraryRoot = support.appendingPathComponent("Evee", isDirectory: true)
+    let library = LibraryStore(rootURL: libraryRoot)
+    var enabled = EveeSettings()
+    enabled.mcpEnabled = true
+    try await library.save(enabled)
+    try await library.upsert(WorkspaceRecord(kind: .memo, title: "Synthetic private workspace", text: "revocation sentinel"))
+
+    let process = Process()
+    let input = Pipe()
+    let output = Pipe()
+    let errors = Pipe()
+    process.executableURL = packagedHelper
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = errors
+    var environment = ProcessInfo.processInfo.environment
+    environment["CFFIXED_USER_HOME"] = home.path
+    process.environment = environment
+    try process.run()
+    try writeMCPRequest(["jsonrpc": "2.0", "id": 1, "method": "initialize", "params": [:]], to: input.fileHandleForWriting)
+    let initialized = try readMCPResponse(from: output.fileHandleForReading)
+    try require(initialized["error"] == nil, "enabled helper rejected initialize")
+
+    let invalidCalls: [(Int, String, [String: Any])] = [
+        (2, "search", ["query": "revocation", "kind": "unknown"]),
+        (3, "recent_activity", ["since": "not-a-date"]),
+        (4, "recent_activity", ["limit": 0]),
+        (5, "get_memo", ["id": "not-a-uuid"]),
+    ]
+    for (identifier, name, arguments) in invalidCalls {
+        try writeMCPRequest([
+            "jsonrpc": "2.0",
+            "id": identifier,
+            "method": "tools/call",
+            "params": ["name": name, "arguments": arguments],
+        ], to: input.fileHandleForWriting)
+        let response = try readMCPResponse(from: output.fileHandleForReading)
+        let invalidError = response["error"] as? [String: Any]
+        try require(invalidError?["code"] as? Int == -32602, "malformed \(name) arguments did not return invalid parameters")
+        let responseText = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+        try require(!responseText.contains("revocation sentinel"), "malformed \(name) arguments broadened into workspace data")
+    }
+
+    enabled.mcpEnabled = false
+    try await library.save(enabled)
+    try writeMCPRequest([
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": ["name": "search", "arguments": ["query": "revocation"]],
+    ], to: input.fileHandleForWriting)
+    let revoked = try readMCPResponse(from: output.fileHandleForReading)
+    let error = revoked["error"] as? [String: Any]
+    try require(error?["code"] as? Int == -32001, "revoked helper did not return the access-disabled error")
+    try require((error?["message"] as? String)?.localizedCaseInsensitiveContains("enable local helper access in Evee") == true, "revoked helper error did not explain how to enable access")
+    let revokedResponse = String(decoding: try JSONSerialization.data(withJSONObject: revoked), as: UTF8.self)
+    try require(!revokedResponse.contains("revocation sentinel"), "revoked helper exposed workspace data")
+    try input.fileHandleForWriting.close()
+    process.waitUntilExit()
+    try require(process.terminationStatus == 0, "evee-mcp failed: \(String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))")
+
+    let disabledProcess = Process()
+    let disabledInput = Pipe()
+    let disabledOutput = Pipe()
+    disabledProcess.executableURL = packagedHelper
+    disabledProcess.standardInput = disabledInput
+    disabledProcess.standardOutput = disabledOutput
+    disabledProcess.standardError = Pipe()
+    disabledProcess.environment = environment
+    try disabledProcess.run()
+    try writeMCPRequest(["jsonrpc": "2.0", "id": 7, "method": "initialize", "params": [:]], to: disabledInput.fileHandleForWriting)
+    try disabledInput.fileHandleForWriting.close()
+    let disabledInitialize = try readMCPResponse(from: disabledOutput.fileHandleForReading)
+    disabledProcess.waitUntilExit()
+    let disabledError = disabledInitialize["error"] as? [String: Any]
+    try require(disabledError?["code"] as? Int == -32001, "disabled helper accepted initialize")
+
+    print("mcp-revocation: passed")
+}
+
 let arguments = CommandLine.arguments.dropFirst()
 if arguments == ["--filter", "context-policy"] {
     checkContextPolicy()
@@ -979,6 +1160,8 @@ if arguments == ["--filter", "context-policy"] {
     try await checkAPIPublicErrors()
 } else if arguments == ["--filter", "mcp-public-output"] {
     try await checkMCPPublicOutput()
+} else if arguments == ["--filter", "mcp-revocation"] {
+    try await checkMCPRevocation()
 } else if arguments == ["--filter", "webhook-generation"] {
     try await checkWebhookGeneration()
 } else if arguments == ["--filter", "webhook-signature"] {
@@ -986,6 +1169,6 @@ if arguments == ["--filter", "context-policy"] {
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|webhook-generation|webhook-signature|webhook-transactions>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|webhook-generation|webhook-signature|webhook-transactions>\n", stderr)
     exit(EXIT_FAILURE)
 }

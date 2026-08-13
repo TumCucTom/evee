@@ -11,6 +11,8 @@ struct SettingsView: View {
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
     @State private var integrationMessage: String?
+    @State private var detectedMCPClients: [MCPClientConfiguration] = []
+    @State private var selectedMCPClientIDs: Set<String> = []
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newLinkPhrase = ""
     @State private var newLinkDestination = ""
@@ -238,14 +240,43 @@ struct SettingsView: View {
             }
 
             Section("MCP") {
-                Text("Register Evee with detected local MCP clients so local agents can search your voice workspace. Existing server entries are preserved.")
+                Text("Local helper access lets the selected apps search your Evee workspace. It is off by default and can be revoked at any time without changing unrelated client settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack {
-                    Button("Register detected clients", action: registerMCP)
-                    if let integrationMessage {
-                        Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
+                if detectedMCPClients.isEmpty {
+                    Text("No supported local clients were detected. Evee will not create a fallback configuration.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(detectedMCPClients) { client in
+                        Toggle(isOn: mcpSelectionBinding(for: client)) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(client.name)
+                                Text(client.configurationURL.path)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .disabled(store.settings.mcpEnabled)
                     }
+                }
+                HStack {
+                    if store.settings.mcpEnabled {
+                        Label("Local helper access enabled", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Button("Revoke access", role: .destructive) {
+                            Task { await revokeMCP() }
+                        }
+                    } else {
+                        Button("Enable selected clients") {
+                            Task { await registerMCP() }
+                        }
+                        .disabled(selectedMCPClientIDs.isEmpty)
+                    }
+                }
+                if let integrationMessage {
+                    Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                 }
             }
 
@@ -290,6 +321,7 @@ struct SettingsView: View {
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()
+            refreshMCPClients()
         }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
@@ -341,17 +373,50 @@ struct SettingsView: View {
         selectedModelReady = (try? TranscriberFactory.make(store.settings.model).isDownloaded) == true
     }
 
-    private func registerMCP() {
+    private func refreshMCPClients() {
+        detectedMCPClients = MCPRegistration.detectedClients()
+        selectedMCPClientIDs = Set(detectedMCPClients.map(\.id))
+    }
+
+    private func mcpSelectionBinding(for client: MCPClientConfiguration) -> Binding<Bool> {
+        Binding(
+            get: { selectedMCPClientIDs.contains(client.id) },
+            set: { selected in
+                if selected {
+                    selectedMCPClientIDs.insert(client.id)
+                } else {
+                    selectedMCPClientIDs.remove(client.id)
+                }
+            }
+        )
+    }
+
+    private func registerMCP() async {
         let mcpURL = MCPRegistration.bundledExecutableURL()
         guard FileManager.default.isExecutableFile(atPath: mcpURL.path) else {
             integrationMessage = "The MCP helper is not bundled in this installation."
             return
         }
+        let selected = detectedMCPClients.filter { selectedMCPClientIDs.contains($0.id) }
+        guard !selected.isEmpty else { return }
         do {
-            let results = try MCPRegistration.writeDetectedClientConfigurations()
-            integrationMessage = "Registered \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
+            let results = try await store.enableLocalHelperAccess(for: selected)
+            integrationMessage = "Enabled \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
         } catch {
             integrationMessage = "Registration failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func revokeMCP() async {
+        do {
+            let results = try await store.revokeLocalHelperAccess()
+            let removed = results.filter(\.removedRegistration).count
+            integrationMessage = removed == 0
+                ? "Local helper access is disabled. No Evee registrations were present."
+                : "Local helper access is disabled. Removed Evee from \(removed) \(removed == 1 ? "client" : "clients"). Restart them to disconnect."
+            refreshMCPClients()
+        } catch {
+            integrationMessage = "Local helper access is disabled, but registration cleanup failed: \(error.localizedDescription)"
         }
     }
 

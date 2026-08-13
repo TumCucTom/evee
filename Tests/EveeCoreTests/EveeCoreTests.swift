@@ -66,8 +66,18 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(settings.languageCode, "en")
         XCTAssertEqual(settings.model, .parakeet)
         XCTAssertFalse(settings.localAPIEnabled)
+        XCTAssertFalse(settings.mcpEnabled)
         XCTAssertTrue(settings.dictionary.isEmpty)
         XCTAssertFalse(settings.audioCuesEnabled)
+    }
+
+    func testMCPEnabledPreferenceRoundTrips() throws {
+        var settings = EveeSettings()
+        settings.mcpEnabled = true
+
+        let restored = try JSONDecoder().decode(EveeSettings.self, from: JSONEncoder().encode(settings))
+
+        XCTAssertTrue(restored.mcpEnabled)
     }
 
     func testAudioCuePreferenceRoundTrips() throws {
@@ -212,6 +222,80 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertNotNil(servers["evee"])
         let permissions = try FileManager.default.attributesOfItem(atPath: configuration.path)[.posixPermissions] as? NSNumber
         XCTAssertEqual(permissions?.intValue, 0o600)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testMCPRemovalPreservesUnrelatedJSONConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let configuration = root.appendingPathComponent("client/config.json")
+        try FileManager.default.createDirectory(at: configuration.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{\"theme\":\"quiet\",\"mcpServers\":{\"evee\":{\"command\":\"old\"},\"other\":{\"command\":\"other\"}}}".utf8).write(to: configuration)
+
+        let result = try MCPRegistration.removeConfiguration(at: configuration)
+
+        XCTAssertTrue(result.removedRegistration)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: configuration)) as? [String: Any])
+        XCTAssertEqual(object["theme"] as? String, "quiet")
+        let servers = try XCTUnwrap(object["mcpServers"] as? [String: Any])
+        XCTAssertNil(servers["evee"])
+        XCTAssertNotNil(servers["other"])
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testMCPDetectionHasNoFallbackAndDoesNotWriteConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+
+        let detected = MCPRegistration.detectedClients(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        let results = try MCPRegistration.writeDetectedClientConfigurations(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+
+        XCTAssertTrue(detected.isEmpty)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: support.appendingPathComponent("Claude/claude_desktop_config.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".codex/config.toml").path))
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testMCPDetectsCodexAndRoundTripPreservesUnrelatedTOMLExactly() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let codexDirectory = home.appendingPathComponent(".codex", isDirectory: true)
+        let configuration = codexDirectory.appendingPathComponent("config.toml")
+        let executable = root.appendingPathComponent("Helpers/evee-mcp")
+        try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = "model = \"gpt-test\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        try Data(original.utf8).write(to: configuration)
+        try Data("#!/bin/sh\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let detected = MCPRegistration.detectedClients(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        XCTAssertEqual(detected.map(\.name), ["Codex"])
+        XCTAssertEqual(detected.first?.configurationURL, configuration)
+
+        _ = try MCPRegistration.writeConfiguration(at: configuration, executableURL: executable)
+        let registered = try String(contentsOf: configuration, encoding: .utf8)
+        XCTAssertTrue(registered.contains("[mcp_servers.evee]"))
+        XCTAssertTrue(registered.contains("command = \"") && registered.contains(executable.path))
+
+        let removal = try MCPRegistration.removeConfiguration(at: configuration)
+        XCTAssertTrue(removal.removedRegistration)
+        XCTAssertEqual(try String(contentsOf: configuration, encoding: .utf8), original)
         try? FileManager.default.removeItem(at: root)
     }
 

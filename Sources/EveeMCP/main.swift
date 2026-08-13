@@ -69,6 +69,7 @@ private struct PublicConfiguration: Codable {
 @main
 enum EveeMCP {
     static let protocolVersion = "2025-03-26"
+    static let disabledAccessMessage = "Local helper access is disabled. Enable local helper access in Evee and try again."
 
     static func main() async {
         while let line = readLine() {
@@ -99,6 +100,7 @@ enum EveeMCP {
     static func handle(method: String, params: [String: Any]) async throws -> Any {
         switch method {
         case "initialize":
+            try await requireEnabledAccess()
             return [
                 "protocolVersion": protocolVersion,
                 "capabilities": ["tools": ["listChanged": false]],
@@ -109,11 +111,22 @@ enum EveeMCP {
         case "tools/list":
             return ["tools": toolDefinitions]
         case "tools/call":
+            try await requireEnabledAccess()
             guard let name = params["name"] as? String else {
                 throw MCPFailure(code: -32602, message: "tools/call requires a tool name.")
             }
-            let arguments = params["arguments"] as? [String: Any] ?? [:]
-            return ["content": [["type": "text", "text": try await callTool(name: name, arguments: arguments)]]]
+            let arguments: [String: Any]
+            if let rawArguments = params["arguments"] {
+                guard let decoded = rawArguments as? [String: Any] else {
+                    throw MCPFailure(code: -32602, message: "tools/call arguments must be an object.")
+                }
+                arguments = decoded
+            } else {
+                arguments = [:]
+            }
+            let text = try await callTool(name: name, arguments: arguments)
+            try await requireEnabledAccess()
+            return ["content": [["type": "text", "text": text]]]
         default:
             throw MCPFailure(code: -32601, message: "Method not found: \(method)")
         }
@@ -121,30 +134,33 @@ enum EveeMCP {
 
     static func callTool(name: String, arguments: [String: Any]) async throws -> String {
         let store = LibraryStore.shared
-        let limit = max(1, min(arguments["limit"] as? Int ?? 20, 200))
+        let limit = try validatedLimit(arguments["limit"])
 
         switch name {
         case "search":
-            let query = arguments["query"] as? String ?? ""
-            let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
+            guard let query = arguments["query"] as? String,
+                  !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPFailure(code: -32602, message: "search requires a non-empty query.")
+            }
+            let kind = try validatedKind(arguments["kind"])
             let records = try await store.search(query, kind: kind, limit: limit)
             return try encode(records.map { record in
                 SearchHit(record: PublicWorkspaceRecord(record), snippet: searchSnippet(for: record, query: query))
             })
 
         case "recent_activity":
-            let kind = (arguments["kind"] as? String).flatMap(WorkspaceRecordKind.init(rawValue:))
-            let since = parseDate(arguments["since"] as? String)
+            let kind = try validatedKind(arguments["kind"])
+            let since = try validatedDate(arguments["since"])
             let records = try await store.recent(kind: kind, limit: limit, since: since)
             return try encode(records.map(PublicWorkspaceRecord.init))
 
         case "ambient_timeline":
-            let since = parseDate(arguments["since"] as? String)
+            let since = try validatedDate(arguments["since"])
             let timeline = try await WorkspaceIntelligenceStore.shared.timeline(since: since, limit: limit)
             return try encode(timeline)
 
         case "ambient_app_usage":
-            let since = parseDate(arguments["since"] as? String)
+            let since = try validatedDate(arguments["since"])
             let usage = try await WorkspaceIntelligenceStore.shared.applicationUsage(since: since, limit: limit)
             return try encode(usage)
 
@@ -234,8 +250,11 @@ enum EveeMCP {
     }
 
     static func encodeRecord(kind: WorkspaceRecordKind, arguments: [String: Any], store: LibraryStore) async throws -> String {
-        if let rawID = arguments["id"] as? String {
-            guard let id = UUID(uuidString: rawID), let record = try await store.record(id: id), record.kind == kind else {
+        if let rawID = arguments["id"] {
+            guard let identifier = rawID as? String, let id = UUID(uuidString: identifier) else {
+                throw MCPFailure(code: -32602, message: "id must be a valid UUID.")
+            }
+            guard let record = try await store.record(id: id), record.kind == kind else {
                 throw MCPFailure(code: -32602, message: "No \(kind.rawValue) exists with that id.")
             }
             return try encode(PublicWorkspaceRecord(record))
@@ -251,9 +270,34 @@ enum EveeMCP {
         return String(decoding: try encoder.encode(value), as: UTF8.self)
     }
 
-    static func parseDate(_ value: String?) -> Date? {
+    static func requireEnabledAccess() async throws {
+        guard try await LibraryStore.shared.loadSettings().mcpEnabled else {
+            throw MCPFailure(code: -32001, message: disabledAccessMessage)
+        }
+    }
+
+    static func validatedLimit(_ value: Any?) throws -> Int {
+        guard let value else { return 20 }
+        guard !(value is Bool), let limit = value as? Int, (1...200).contains(limit) else {
+            throw MCPFailure(code: -32602, message: "limit must be an integer from 1 through 200.")
+        }
+        return limit
+    }
+
+    static func validatedKind(_ value: Any?) throws -> WorkspaceRecordKind? {
         guard let value else { return nil }
-        return ISO8601DateFormatter().date(from: value)
+        guard let rawKind = value as? String, let kind = WorkspaceRecordKind(rawValue: rawKind) else {
+            throw MCPFailure(code: -32602, message: "kind must be dictation, meeting, or memo.")
+        }
+        return kind
+    }
+
+    static func validatedDate(_ value: Any?) throws -> Date? {
+        guard let value else { return nil }
+        guard let rawDate = value as? String, let date = ISO8601DateFormatter().date(from: rawDate) else {
+            throw MCPFailure(code: -32602, message: "since must be an ISO 8601 date and time.")
+        }
+        return date
     }
 
     static func searchSnippet(for record: WorkspaceRecord, query: String) -> String {

@@ -484,6 +484,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var meetingDiarizationEnabled = false
     public var liveMeetingTranscriptionEnabled = true
     public var localAPIEnabled = false
+    public var mcpEnabled = false
     public var localAPIPort: UInt16 = 4739
     public var webhookURL = ""
     /// Only populated while decoding settings written by older Evee builds. New
@@ -512,7 +513,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled, liveMeetingTranscriptionEnabled
-        case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
+        case localAPIEnabled, mcpEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
         case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled, hotMicEnabled, wakePhrase
         case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks, historyRetentionDays
     }
@@ -528,6 +529,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         meetingDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingDiarizationEnabled) ?? false
         liveMeetingTranscriptionEnabled = try values.decodeIfPresent(Bool.self, forKey: .liveMeetingTranscriptionEnabled) ?? true
         localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
+        mcpEnabled = try values.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? false
         localAPIPort = try values.decodeIfPresent(UInt16.self, forKey: .localAPIPort) ?? 4_739
         webhookURL = try values.decodeIfPresent(String.self, forKey: .webhookURL) ?? ""
         webhookSecret = try values.decodeIfPresent(String.self, forKey: .webhookSecret) ?? ""
@@ -561,6 +563,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(meetingDiarizationEnabled, forKey: .meetingDiarizationEnabled)
         try values.encode(liveMeetingTranscriptionEnabled, forKey: .liveMeetingTranscriptionEnabled)
         try values.encode(localAPIEnabled, forKey: .localAPIEnabled)
+        try values.encode(mcpEnabled, forKey: .mcpEnabled)
         try values.encode(localAPIPort, forKey: .localAPIPort)
         try values.encode(webhookURL, forKey: .webhookURL)
         try values.encode(defaultTone, forKey: .defaultTone)
