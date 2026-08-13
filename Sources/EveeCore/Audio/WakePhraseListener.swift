@@ -47,10 +47,7 @@ public actor WakePhraseListener: WakePhraseListening {
                 await manager.streamAudio(copied.buffer)
             }
         }
-        relay.set { buffer in
-            guard let copied = CopiedAudioBuffer(copying: buffer) else { return }
-            mailbox.send(copied)
-        }
+        relay.set { mailbox.send($0) }
         let relay = self.relay
         input.installTap(onBus: 0, bufferSize: lowLatency ? 256 : 1_024, format: format) { buffer, _ in
             relay.publishCopy(of: buffer)
@@ -72,7 +69,7 @@ public actor WakePhraseListener: WakePhraseListening {
             }
         } catch {
             input.removeTap(onBus: 0)
-            relay.set(nil)
+            relay.detachAndWait()
             mailbox.close(mode: .discard)
             await audioConsumerTask.value
             await session.cleanup()
@@ -84,11 +81,12 @@ public actor WakePhraseListener: WakePhraseListening {
         guard isRunning || manager != nil else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
-        relay.set(nil)
+        relay.detachAndWait()
         audioMailbox?.close(mode: .discard)
         if let audioConsumerTask { await audioConsumerTask.value }
-        if let manager { _ = try? await manager.finish() }
+        if let manager { await manager.cancel() }
         updateTask?.cancel()
+        if let updateTask { await updateTask.value }
         updateTask = nil
         audioConsumerTask = nil
         audioMailbox = nil

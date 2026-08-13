@@ -1339,7 +1339,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             liveMeetingUpdateTask = Task { @MainActor [weak self] in
                 for await update in live.updates {
                     guard let self, !Task.isCancelled else { return }
-                    if update.isConfirmed {
+                    if update.isFinal {
+                        self.liveMeetingTranscript.removeAll { $0.channel == update.channel }
+                    } else if update.isConfirmed {
                         self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
                     } else {
                         self.liveMeetingTranscript.removeAll { !$0.isConfirmed && $0.channel == update.channel }
@@ -1485,7 +1487,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         if let liveMeetingTranscriber {
             await liveMeetingTranscriber.stop(discardPendingAudio: discardPendingAudio)
         }
-        liveMeetingUpdateTask?.cancel()
+        if discardPendingAudio {
+            liveMeetingUpdateTask?.cancel()
+        }
+        if let liveMeetingUpdateTask { await liveMeetingUpdateTask.value }
         liveMeetingUpdateTask = nil
         liveMeetingTranscriber = nil
     }

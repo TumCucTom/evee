@@ -76,7 +76,7 @@ public final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelega
 
     public override init() {}
 
-    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+    public func setBufferHandler(_ handler: (@Sendable (CopiedAudioBuffer) -> Void)?) {
         bufferRelay.set(handler)
     }
 

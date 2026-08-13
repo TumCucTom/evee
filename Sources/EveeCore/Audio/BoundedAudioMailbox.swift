@@ -108,6 +108,16 @@ public final class BoundedAudioMailbox<Element: Sendable>: @unchecked Sendable {
         lock.withLock { overwrittenCount }
     }
 
+    public var metrics: AudioMailboxMetrics {
+        lock.withLock {
+            AudioMailboxMetrics(
+                depth: storedCount,
+                peakDepth: maximumDepth,
+                droppedCount: overwrittenCount
+            )
+        }
+    }
+
     private func removeFirstLocked() -> Element {
         let element = storage[readIndex]!
         storage[readIndex] = nil
@@ -120,6 +130,18 @@ public final class BoundedAudioMailbox<Element: Sendable>: @unchecked Sendable {
         for index in storage.indices { storage[index] = nil }
         readIndex = 0
         storedCount = 0
+    }
+}
+
+public struct AudioMailboxMetrics: Equatable, Sendable {
+    public var depth: Int
+    public var peakDepth: Int
+    public var droppedCount: Int
+
+    public init(depth: Int, peakDepth: Int, droppedCount: Int) {
+        self.depth = depth
+        self.peakDepth = peakDepth
+        self.droppedCount = droppedCount
     }
 }
 

@@ -1,6 +1,7 @@
 @_spi(Testing) import EveeCore
-import AVFoundation
+@preconcurrency import AVFoundation
 import Darwin
+import FluidAudio
 import Foundation
 import Network
 
@@ -113,6 +114,51 @@ private final class LockedValues<Value>: @unchecked Sendable {
         lock.lock()
         storage.append(value)
         lock.unlock()
+    }
+}
+
+private actor SyntheticLiveAudioRecognizer: LiveAudioRecognizing {
+    nonisolated let transcriptionUpdates: AsyncStream<SlidingWindowTranscriptionUpdate>
+    private nonisolated let updateContinuation: AsyncStream<SlidingWindowTranscriptionUpdate>.Continuation
+    private var audioWaiters: [CheckedContinuation<Void, Never>] = []
+    private var shouldBlockAudio = false
+    private(set) var receivedBufferCount = 0
+    private(set) var finishCount = 0
+    private(set) var cancelCount = 0
+    private let finalText: String
+
+    init(finalText: String = "Synthetic final transcript") {
+        self.finalText = finalText
+        let pair = AsyncStream<SlidingWindowTranscriptionUpdate>.makeStream(bufferingPolicy: .bufferingNewest(4))
+        transcriptionUpdates = pair.stream
+        updateContinuation = pair.continuation
+    }
+
+    func setAudioBlocked(_ blocked: Bool) {
+        shouldBlockAudio = blocked
+        guard !blocked else { return }
+        let waiters = audioWaiters
+        audioWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func streamAudio(_ buffer: AVAudioPCMBuffer) async {
+        receivedBufferCount += 1
+        if shouldBlockAudio {
+            await withCheckedContinuation { audioWaiters.append($0) }
+        }
+    }
+
+    func finish() async throws -> String {
+        finishCount += 1
+        updateContinuation.finish()
+        return finalText
+    }
+
+    func cancel() async {
+        cancelCount += 1
+        setAudioBlocked(false)
+        updateContinuation.finish()
     }
 }
 
@@ -712,6 +758,99 @@ private func checkBoundedMailbox() async throws {
     try require(copiedSamples[0] == 0.25 && copiedSamples[1] == -0.5, "PCM copy shared source storage")
 
     print("bounded-mailbox: passed (peak=\(mailbox.peakDepth), dropped=\(mailbox.droppedCount))")
+}
+
+private func checkAudioPipeline() async throws {
+    let recognizer = SyntheticLiveAudioRecognizer()
+    await recognizer.setAudioBlocked(true)
+    let transcriber = LiveMeetingTranscriber(testingMicrophone: recognizer)
+    try await transcriber.start(includeSystem: false)
+
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    ), let source = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 2) else {
+        throw CoreCheckError.assertionFailed("synthetic live PCM setup failed")
+    }
+    source.frameLength = 2
+    guard let copied = CopiedAudioBuffer(copying: source) else {
+        throw CoreCheckError.assertionFailed("synthetic live PCM copy failed")
+    }
+
+    transcriber.acceptMicrophone(copied)
+    let receiveDeadline = Date().addingTimeInterval(1)
+    while await recognizer.receivedBufferCount == 0, Date() < receiveDeadline {
+        await Task.yield()
+    }
+    for _ in 0..<100 { transcriber.acceptMicrophone(copied) }
+    let metrics = transcriber.microphoneMailboxMetrics
+    try require(metrics.depth <= 32, "slow recognizer allowed Evee's mailbox past capacity")
+    try require(metrics.peakDepth == 32, "slow recognizer did not exercise the configured capacity")
+    try require(metrics.droppedCount > 0, "slow recognizer did not report dropped buffers")
+
+    let forwarded = Task {
+        var updates: [LiveMeetingTranscriptUpdate] = []
+        for await update in transcriber.updates { updates.append(update) }
+        return updates
+    }
+    await recognizer.setAudioBlocked(false)
+    await transcriber.stop()
+    let updates = await forwarded.value
+    try require(updates.last?.text == "Synthetic final transcript", "graceful finish lost the final recognizer transcript")
+    try require(updates.last?.isConfirmed == true, "graceful finish did not confirm the final transcript")
+    try require(updates.last?.isFinal == true, "graceful finish did not mark the channel replacement update")
+    let gracefulFinishCount = await recognizer.finishCount
+    let gracefulCancelCount = await recognizer.cancelCount
+    try require(gracefulFinishCount == 1 && gracefulCancelCount == 0, "graceful stop did not use recognizer finish exclusively")
+
+    let cancelledRecognizer = SyntheticLiveAudioRecognizer()
+    let cancelledTranscriber = LiveMeetingTranscriber(testingMicrophone: cancelledRecognizer)
+    try await cancelledTranscriber.start(includeSystem: false)
+    await cancelledTranscriber.stop(discardPendingAudio: true)
+    let discardFinishCount = await cancelledRecognizer.finishCount
+    let discardCancelCount = await cancelledRecognizer.cancelCount
+    try require(discardFinishCount == 0 && discardCancelCount == 1, "discard stop did not use recognizer cancellation exclusively")
+
+    print("audio-pipeline: passed (peak=\(metrics.peakDepth), dropped=\(metrics.droppedCount))")
+}
+
+private func checkAudioRelay() async throws {
+    let relay = AudioBufferRelay()
+    let mailbox = BoundedAudioMailbox<CopiedAudioBuffer>(capacity: 1)
+    let handlerEntered = DispatchSemaphore(value: 0)
+    let releaseHandler = DispatchSemaphore(value: 0)
+    let detachReturned = DispatchSemaphore(value: 0)
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    ), let source = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1) else {
+        throw CoreCheckError.assertionFailed("synthetic relay PCM setup failed")
+    }
+    source.frameLength = 1
+
+    relay.set { copied in
+        handlerEntered.signal()
+        releaseHandler.wait()
+        mailbox.send(copied)
+    }
+    DispatchQueue.global().async { relay.publishCopy(of: source) }
+    try require(handlerEntered.wait(timeout: .now() + 1) == .success, "relay handler did not take its producer snapshot")
+    DispatchQueue.global().async {
+        relay.detachAndWait()
+        detachReturned.signal()
+    }
+    try require(detachReturned.wait(timeout: .now() + 0.05) == .timedOut, "relay detach returned before its snapshotted handler")
+
+    releaseHandler.signal()
+    try require(detachReturned.wait(timeout: .now() + 1) == .success, "relay detach did not return after handler completion")
+    mailbox.close(mode: .drain)
+    let retained = await mailbox.next()
+    try require(retained != nil, "relay drain lost the snapshotted final buffer")
+    print("audio-relay: passed")
 }
 
 private func checkWebhookTransactions() async throws {
@@ -2843,9 +2982,13 @@ if arguments == ["--filter", "context-policy"] {
     try checkHotMicRace()
 } else if arguments == ["--filter", "bounded-mailbox"] {
     try await checkBoundedMailbox()
+} else if arguments == ["--filter", "audio-pipeline"] {
+    try await checkAudioPipeline()
+} else if arguments == ["--filter", "audio-relay"] {
+    try await checkAudioRelay()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay>\n", stderr)
     exit(EXIT_FAILURE)
 }

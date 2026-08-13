@@ -33,7 +33,7 @@ public final class MicrophoneRecorder: ObservableObject {
 
     public init() {}
 
-    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+    public func setBufferHandler(_ handler: (@Sendable (CopiedAudioBuffer) -> Void)?) {
         bufferRelay.set(handler)
     }
 

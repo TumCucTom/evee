@@ -1,21 +1,47 @@
 @preconcurrency import AVFoundation
 import Foundation
 
-final class AudioBufferRelay: @unchecked Sendable {
-    typealias Handler = @Sendable (AVAudioPCMBuffer) -> Void
-    private let lock = NSLock()
+@_spi(Testing)
+public final class AudioBufferRelay: @unchecked Sendable {
+    public typealias Handler = @Sendable (CopiedAudioBuffer) -> Void
+    private let condition = NSCondition()
     private var handler: Handler?
+    private var inFlightHandlerCount = 0
 
-    func set(_ handler: Handler?) {
-        lock.lock(); defer { lock.unlock() }
+    public init() {}
+
+    public func set(_ handler: Handler?) {
+        if handler == nil {
+            detachAndWait()
+            return
+        }
+        condition.lock(); defer { condition.unlock() }
         self.handler = handler
     }
 
-    func publishCopy(of source: AVAudioPCMBuffer) {
+    /// Detaches the producer and waits for handlers that already took a snapshot.
+    public func detachAndWait() {
+        condition.lock()
+        handler = nil
+        while inFlightHandlerCount > 0 { condition.wait() }
+        condition.unlock()
+    }
+
+    public func publishCopy(of source: AVAudioPCMBuffer) {
         guard let copy = CopiedAudioBuffer(copying: source) else { return }
-        lock.lock()
-        let handler = self.handler
-        lock.unlock()
-        handler?(copy.buffer)
+        condition.lock()
+        guard let handler else {
+            condition.unlock()
+            return
+        }
+        inFlightHandlerCount += 1
+        condition.unlock()
+
+        handler(copy)
+
+        condition.lock()
+        inFlightHandlerCount -= 1
+        if inFlightHandlerCount == 0 { condition.broadcast() }
+        condition.unlock()
     }
 }
