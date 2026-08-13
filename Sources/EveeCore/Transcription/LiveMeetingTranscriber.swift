@@ -31,8 +31,11 @@ public actor LiveMeetingTranscriber {
     public nonisolated let updates: AsyncStream<LiveMeetingTranscriptUpdate>
     private nonisolated let continuation: AsyncStream<LiveMeetingTranscriptUpdate>.Continuation
     private let session = SlidingWindowAsrSession()
+    private nonisolated let microphoneMailbox = BoundedAudioMailbox<CopiedAudioBuffer>(capacity: 32)
+    private nonisolated let systemMailbox = BoundedAudioMailbox<CopiedAudioBuffer>(capacity: 32)
     private var microphone: SlidingWindowAsrManager?
     private var system: SlidingWindowAsrManager?
+    private var audioConsumerTasks: [Task<Void, Never>] = []
     private var updateTasks: [Task<Void, Never>] = []
 
     public init() {
@@ -44,19 +47,32 @@ public actor LiveMeetingTranscriber {
     public func start(includeSystem: Bool) async throws {
         microphone = try await session.createStream(source: .microphone, config: .streaming)
         if includeSystem { system = try await session.createStream(source: .system, config: .streaming) }
-        if let microphone { consume(microphone, channel: .microphone) }
-        if let system { consume(system, channel: .system) }
+        if let microphone {
+            consumeAudio(from: microphoneMailbox, with: microphone)
+            consumeUpdates(from: microphone, channel: .microphone)
+        }
+        if let system {
+            consumeAudio(from: systemMailbox, with: system)
+            consumeUpdates(from: system, channel: .system)
+        }
     }
 
-    public func acceptMicrophone(_ buffer: AVAudioPCMBuffer) async {
-        await microphone?.streamAudio(buffer)
+    public nonisolated func acceptMicrophone(_ buffer: AVAudioPCMBuffer) {
+        guard let copied = CopiedAudioBuffer(copying: buffer) else { return }
+        microphoneMailbox.send(copied)
     }
 
-    public func acceptSystem(_ buffer: AVAudioPCMBuffer) async {
-        await system?.streamAudio(buffer)
+    public nonisolated func acceptSystem(_ buffer: AVAudioPCMBuffer) {
+        guard let copied = CopiedAudioBuffer(copying: buffer) else { return }
+        systemMailbox.send(copied)
     }
 
-    public func stop() async {
+    public func stop(discardPendingAudio: Bool = false) async {
+        let closeMode: BoundedAudioMailbox<CopiedAudioBuffer>.CloseMode = discardPendingAudio ? .discard : .drain
+        microphoneMailbox.close(mode: closeMode)
+        systemMailbox.close(mode: closeMode)
+        for task in audioConsumerTasks { await task.value }
+        audioConsumerTasks.removeAll()
         if let microphone { _ = try? await microphone.finish() }
         if let system { _ = try? await system.finish() }
         updateTasks.forEach { $0.cancel() }
@@ -66,7 +82,18 @@ public actor LiveMeetingTranscriber {
         self.system = nil
     }
 
-    private func consume(_ manager: SlidingWindowAsrManager, channel: AudioTrackRole) {
+    private func consumeAudio(
+        from mailbox: BoundedAudioMailbox<CopiedAudioBuffer>,
+        with manager: SlidingWindowAsrManager
+    ) {
+        audioConsumerTasks.append(Task {
+            while let copied = await mailbox.next() {
+                await manager.streamAudio(copied.buffer)
+            }
+        })
+    }
+
+    private func consumeUpdates(from manager: SlidingWindowAsrManager, channel: AudioTrackRole) {
         let continuation = self.continuation
         updateTasks.append(Task {
             for await update in await manager.transcriptionUpdates {

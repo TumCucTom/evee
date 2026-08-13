@@ -956,7 +956,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             try? await systemAudioRecorder.stop()
             isSystemAudioActive = false
         }
-        if activeKind == .meeting { await stopLiveMeetingTranscription() }
+        if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -1103,7 +1103,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
-        if activeKind == .meeting { await stopLiveMeetingTranscription() }
+        if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         removeActiveRecoveryFiles()
         if activeKind == .meeting { await clearMeetingDraft() }
         await refreshRecoverableCaptures()
@@ -1117,7 +1117,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             activeAudioURL = stoppedURL
         }
         try? await systemAudioRecorder.stop()
-        if activeKind == .meeting { await stopLiveMeetingTranscription() }
+        if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         isSystemAudioActive = false
 
         let recoveryPath = activeAudioURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0.path : nil }
@@ -1330,10 +1330,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             try await live.start(includeSystem: settings.meetingCaptureEnabled)
             liveMeetingTranscriber = live
             recorder.setBufferHandler { [weak live] buffer in
-                Task { await live?.acceptMicrophone(buffer) }
+                live?.acceptMicrophone(buffer)
             }
             systemAudioRecorder.setBufferHandler { [weak live] buffer in
-                Task { await live?.acceptSystem(buffer) }
+                live?.acceptSystem(buffer)
             }
             liveMeetingStatus = "Live local transcript is active. Final text is rebuilt from the saved tracks after you stop."
             liveMeetingUpdateTask = Task { @MainActor [weak self] in
@@ -1352,7 +1352,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
         } catch {
             liveMeetingStatus = "Live transcript preview is unavailable: \(error.localizedDescription). Recording and final transcription will continue."
-            await live.stop()
+            await live.stop(discardPendingAudio: true)
         }
     }
 
@@ -1479,10 +1479,12 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         hotMicState = hotMicStateMachine.state
     }
 
-    private func stopLiveMeetingTranscription() async {
+    private func stopLiveMeetingTranscription(discardPendingAudio: Bool = false) async {
         recorder.setBufferHandler(nil)
         systemAudioRecorder.setBufferHandler(nil)
-        if let liveMeetingTranscriber { await liveMeetingTranscriber.stop() }
+        if let liveMeetingTranscriber {
+            await liveMeetingTranscriber.stop(discardPendingAudio: discardPendingAudio)
+        }
         liveMeetingUpdateTask?.cancel()
         liveMeetingUpdateTask = nil
         liveMeetingTranscriber = nil

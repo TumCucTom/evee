@@ -1,4 +1,5 @@
 @_spi(Testing) import EveeCore
+import AVFoundation
 import Darwin
 import Foundation
 import Network
@@ -666,6 +667,51 @@ private func checkHotMicRace() throws {
     try require(hotMic.isDisabled, "repeated hot mic disable was not idempotent")
 
     print("hot-mic-race: passed")
+}
+
+private func checkBoundedMailbox() async throws {
+    let mailbox = BoundedAudioMailbox<Int>(capacity: 3)
+    let consumer = Task {
+        var received: [Int] = []
+        while let value = await mailbox.next() {
+            received.append(value)
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return received
+    }
+
+    for value in 0..<100 { mailbox.send(value) }
+    try require(mailbox.depth <= 3, "mailbox exceeded its configured capacity")
+    try require(mailbox.peakDepth == 3, "mailbox did not report its bounded peak depth")
+    try require(mailbox.droppedCount > 0, "mailbox did not report overwritten audio")
+    mailbox.close(mode: .drain)
+
+    let received = await consumer.value
+    try require(received.suffix(3) == [97, 98, 99], "mailbox did not retain the newest buffered values in order")
+
+    guard let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    ), let source = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 2) else {
+        throw CoreCheckError.assertionFailed("synthetic PCM setup failed")
+    }
+    source.frameLength = 2
+    guard let sourceSamples = source.floatChannelData?[0] else {
+        throw CoreCheckError.assertionFailed("synthetic PCM samples were unavailable")
+    }
+    sourceSamples[0] = 0.25
+    sourceSamples[1] = -0.5
+    guard let copied = CopiedAudioBuffer(copying: source),
+          let copiedSamples = copied.buffer.floatChannelData?[0] else {
+        throw CoreCheckError.assertionFailed("PCM copy failed")
+    }
+    sourceSamples[0] = 1
+    sourceSamples[1] = 1
+    try require(copiedSamples[0] == 0.25 && copiedSamples[1] == -0.5, "PCM copy shared source storage")
+
+    print("bounded-mailbox: passed (peak=\(mailbox.peakDepth), dropped=\(mailbox.droppedCount))")
 }
 
 private func checkWebhookTransactions() async throws {
@@ -2795,9 +2841,11 @@ if arguments == ["--filter", "context-policy"] {
     try checkModelDownloadLifecycle()
 } else if arguments == ["--filter", "hot-mic-race"] {
     try checkHotMicRace()
+} else if arguments == ["--filter", "bounded-mailbox"] {
+    try await checkBoundedMailbox()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox>\n", stderr)
     exit(EXIT_FAILURE)
 }
