@@ -628,6 +628,20 @@ private func checkModelDownloadLifecycle() throws {
     try require(download.fail(failed, message: "Synthetic failure"), "model download failure was not recorded")
     try require(download.begin(model: .qwen3) != nil, "model download failure did not permit retry")
 
+    var modelSwitch = ModelDownloadStateMachine()
+    let readyA = try unwrapped(modelSwitch.begin(model: .parakeet), "model A did not start")
+    try require(modelSwitch.complete(readyA), "model A did not become ready")
+    let selectedB = try unwrapped(
+        modelSwitch.begin(model: .qwen3),
+        "ready model A blocked selected model B"
+    )
+    try require(
+        modelSwitch.state == .downloading(model: .qwen3, progress: nil),
+        "model switch did not publish selected model B"
+    )
+    try require(modelSwitch.begin(model: .qwen3) == nil, "model B switch was not single-flight")
+    try require(modelSwitch.complete(selectedB), "model B did not become ready")
+
     print("model-download: passed")
 }
 

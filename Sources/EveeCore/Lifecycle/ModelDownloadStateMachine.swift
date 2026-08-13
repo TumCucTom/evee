@@ -28,7 +28,14 @@ public struct ModelDownloadStateMachine: Sendable {
 
     public mutating func begin(model: SpeechModel) -> LifecycleOperation? {
         guard operation == nil else { return nil }
-        guard isIdle || isFailed else { return nil }
+        switch state {
+        case .idle, .failed:
+            break
+        case .ready(let readyModel) where readyModel != model:
+            break
+        case .downloading, .ready:
+            return nil
+        }
 
         let operation = LifecycleOperation()
         self.operation = operation
@@ -66,10 +73,5 @@ public struct ModelDownloadStateMachine: Sendable {
         self.operation = nil
         state = .failed(model: model, message: message)
         return true
-    }
-
-    private var isFailed: Bool {
-        if case .failed = state { return true }
-        return false
     }
 }

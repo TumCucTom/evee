@@ -42,6 +42,43 @@ final class ModelDownloadLifecycleTests: XCTestCase {
         XCTAssertEqual(store.modelDownloadState, .ready(model: .parakeet))
     }
 
+    func testSelectingUndownloadedModelAfterReadyModelStartsSelectedModelOnce() async {
+        let cachedA = DelayedModelDownloader(isDownloaded: true)
+        let selectedB = DelayedModelDownloader()
+        let store = AppStore(
+            modelDownloaderFactory: { model in
+                switch model {
+                case .parakeet: cachedA
+                case .qwen3: selectedB
+                }
+            },
+            modelDownloadDefaults: nil
+        )
+
+        store.settings.model = .parakeet
+        store.startModelDownload()
+        await waitUntil { store.modelDownloadState == .ready(model: .parakeet) }
+
+        store.settings.model = .qwen3
+        store.startModelDownload()
+        store.startModelDownload()
+        await selectedB.waitUntilStarted(count: 1)
+
+        let selectedBStartCount = await selectedB.startCount
+        let cachedADownloadCount = await cachedA.startCount
+        XCTAssertEqual(selectedBStartCount, 1)
+        XCTAssertEqual(cachedADownloadCount, 0)
+        let selectedBProgress = ModelProgress(fraction: 0.25, status: "Synthetic progress")
+        await waitUntil {
+            store.modelDownloadState == .downloading(model: .qwen3, progress: selectedBProgress)
+        }
+        XCTAssertEqual(store.modelDownloadState, .downloading(model: .qwen3, progress: selectedBProgress))
+
+        await selectedB.finish()
+        await waitUntil { store.modelDownloadState == .ready(model: .qwen3) }
+        XCTAssertEqual(store.modelDownloadState, .ready(model: .qwen3))
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool
@@ -55,10 +92,14 @@ final class ModelDownloadLifecycleTests: XCTestCase {
 }
 
 private actor DelayedModelDownloader: LocalModelDownloading {
-    nonisolated let isDownloaded = false
+    nonisolated let isDownloaded: Bool
     private(set) var startCount = 0
     private var downloadContinuation: CheckedContinuation<Void, Error>?
     private var startWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    init(isDownloaded: Bool = false) {
+        self.isDownloaded = isDownloaded
+    }
 
     func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {
         startCount += 1
