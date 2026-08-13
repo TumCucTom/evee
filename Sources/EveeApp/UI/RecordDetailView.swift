@@ -27,13 +27,17 @@ struct RecordDetailView: View {
                     } label: { Label("Copy", systemImage: "doc.on.doc") }
                     .buttonStyle(.bordered)
                     .help("Copy the finished text")
+                    .accessibilityLabel("Copy \(draft.kind.rawValue) text")
+                    .accessibilityHint("Copies the finished text to the clipboard.")
                     Button("Save") { Task { await store.update(draft) } }
                         .buttonStyle(AlphaButtonStyle())
                         .keyboardShortcut("s", modifiers: .command)
+                        .accessibilityLabel("Save changes to \(draft.kind.rawValue) \(draft.title)")
                     Button(role: .destructive) { confirmDelete = true } label: { Image(systemName: "trash") }
                         .buttonStyle(.borderless)
                         .help("Delete this record")
-                        .accessibilityLabel("Delete \(draft.kind.rawValue)")
+                        .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
+                        .accessibilityHint("Shows a confirmation before deleting this record and retained audio.")
                 }
 
                 metadata
@@ -100,6 +104,8 @@ struct RecordDetailView: View {
                                         .font(.caption.weight(.semibold))
                                         .foregroundStyle(AnimaTheme.violet)
                                         .help("Correct this anonymous speaker label, then Save")
+                                        .accessibilityLabel(AccessibilityCopy.speakerLabel(start: segment.start, currentLabel: segment.speaker))
+                                        .accessibilityHint("Enter a consistent name for this anonymous speaker, then save the record.")
                                         if let provenance = segmentProvenance(segment) {
                                             Text(provenance)
                                                 .font(.system(size: 9, weight: .medium))
@@ -125,6 +131,7 @@ struct RecordDetailView: View {
         .onDisappear { audioPlayer.stop() }
         .confirmationDialog("Delete this \(draft.kind.rawValue)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete permanently", role: .destructive) { Task { await store.delete(draft) } }
+                .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
         } message: { Text("The local record and retained audio will be removed. This cannot be undone in Evee.") }
     }
 
@@ -342,6 +349,7 @@ struct RecordDetailView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(audioPlayer.loadedURL == nil)
+                    .accessibilityLabel(audioPlayer.isPlaying ? "Pause retained \(selectedAudioTrackName) audio" : "Play retained \(selectedAudioTrackName) audio")
                     .accessibilityHint(audioPlayer.isPlaying ? "Pauses retained audio" : "Plays retained audio")
 
                     Text(timestamp(audioPlayer.currentTime))
@@ -369,6 +377,8 @@ struct RecordDetailView: View {
                     .buttonStyle(.bordered)
                     .disabled(selectedAudioTrack == nil)
                     .help("Export the selected retained audio track")
+                    .accessibilityLabel(AccessibilityCopy.exportRetainedTrack(named: selectedAudioTrackName))
+                    .accessibilityHint("Opens a save panel for the selected local audio track.")
                 }
 
                 if let message = audioPlayer.errorMessage ?? audioStatusMessage {
@@ -387,6 +397,10 @@ struct RecordDetailView: View {
         case .meeting: "person.2.wave.2"
         case .memo: "waveform"
         }
+    }
+
+    private var selectedAudioTrackName: String {
+        selectedAudioTrack.map { audioTrackTitle($0.role) } ?? "selected"
     }
 
     private func timestamp(_ interval: TimeInterval) -> String {

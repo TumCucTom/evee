@@ -321,6 +321,71 @@ private func unwrapped<Value>(_ value: Value?, _ message: String) throws -> Valu
     return value
 }
 
+private func checkActionContrast() throws {
+    var minimumEnabledContrast = Double.greatestFiniteMagnitude
+    for appearance in InterfaceAppearance.allCases {
+        for stop in AccessibleActionPalette.gradientStops(for: appearance) {
+            let ratio = AccessibleActionPalette.foreground.contrastRatio(with: stop)
+            try require(ratio >= 4.5, "\(appearance) action stop contrast was \(ratio)")
+            minimumEnabledContrast = min(minimumEnabledContrast, ratio)
+        }
+        let disabledRatio = AccessibleActionPalette.disabledBorder.contrastRatio(
+            with: AccessibleActionPalette.paper(for: appearance)
+        )
+        try require(disabledRatio >= 3, "\(appearance) disabled border contrast was \(disabledRatio)")
+    }
+    let formattedMinimum = String(format: "%.2f", minimumEnabledContrast)
+    print("action-contrast: passed (minimum enabled \(formattedMinimum):1)")
+}
+
+private func checkOnboardingPresentation() throws {
+    let denied = OnboardingPresentation(
+        microphone: .denied,
+        accessibility: .granted,
+        model: .idle
+    )
+    try require(denied.focusTarget == .microphoneRecovery, "denied microphone did not focus recovery")
+    try require(denied.microphoneActionTitle == "Open Microphone Settings", "denied microphone repeated permission request")
+
+    let downloading = OnboardingPresentation(
+        microphone: .granted,
+        accessibility: .granted,
+        model: .downloading(fraction: 0.42, status: "Downloading")
+    )
+    try require(downloading.modelAction == .cancel, "download did not expose cancel as its only action")
+    try require(downloading.modelAccessibilityValue == "42 percent, Downloading", "download status was not explicit")
+
+    let failed = OnboardingPresentation(
+        microphone: .granted,
+        accessibility: .granted,
+        model: .failed("The previous model download did not finish.")
+    )
+    try require(failed.modelAction == .retry, "interrupted download did not expose retry")
+    print("onboarding-presentation: passed")
+}
+
+private func checkAccessibilityCopy() throws {
+    let syntheticMeeting = WorkspaceRecord(
+        kind: .meeting,
+        title: "Weekly review",
+        text: "Full transcript",
+        sourceApplication: "Meet"
+    )
+    let label = AccessibilityCopy.recordRow(
+        record: syntheticMeeting,
+        snippet: "…matched decision text…"
+    )
+    try require(label.contains("matched decision text"), "record row omitted its visible search match")
+    try require(AccessibilityCopy.removeAppStyle(named: "Mail") == "Remove writing style for Mail", "app-style removal lacked context")
+    try require(AccessibilityCopy.clearSearch == "Clear workspace search", "search clear label lacked context")
+    try require(AccessibilityCopy.exportRetainedTrack(named: "Microphone") == "Export retained Microphone audio", "audio export label lacked track context")
+    try require(AccessibilityCopy.speakerLabel(start: 125, currentLabel: nil).contains("2 minutes 5 seconds"), "speaker label omitted timestamp")
+    try require(AccessibilityCopy.helperRevocation.contains("registered clients"), "helper revocation omitted consequence")
+    try require(RootLayoutMode.route(.settings, captureState: .idle) == .sidebarAndDetail, "settings retained a wasted detail column")
+    try require(RootLayoutMode.route(.library, captureState: .idle) == .threeColumn, "library lost browse/detail layout")
+    print("accessibility-copy: passed")
+}
+
 private func checkWebhookGeneration() async throws {
     let deliveryID = UUID(uuidString: "75B09B72-BC3F-4939-9F81-E6B7C814A552")!
     let coordinator = WebhookOutboxCoordinator()
@@ -3684,7 +3749,13 @@ private func coreCheckSilentWAV() -> Data {
 }
 
 let arguments = CommandLine.arguments.dropFirst()
-if arguments == ["--filter", "context-policy"] {
+if arguments == ["--filter", "action-contrast"] {
+    try checkActionContrast()
+} else if arguments == ["--filter", "onboarding-presentation"] {
+    try checkOnboardingPresentation()
+} else if arguments == ["--filter", "accessibility-copy"] {
+    try checkAccessibilityCopy()
+} else if arguments == ["--filter", "context-policy"] {
     checkContextPolicy()
 } else if arguments == ["--filter", "public-record"] {
     try checkPublicRecord()
@@ -3743,6 +3814,6 @@ if arguments == ["--filter", "context-policy"] {
 } else if arguments == ["--filter", "corrupt-library-recovery"] {
     try await checkCorruptLibraryRecovery()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
+    fputs("usage: evee-core-checks --filter <action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
     exit(EXIT_FAILURE)
 }

@@ -50,10 +50,13 @@ struct MeetingWorkspaceView: View {
                 Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
                     .buttonStyle(.bordered)
                     .help("Stop and permanently discard this meeting capture")
+                    .accessibilityLabel("Discard the current meeting capture")
+                    .accessibilityHint("Stops recording and permanently deletes the current local meeting audio.")
                 Button("Stop and transcribe") { Task { await store.finishCapture() } }
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
                     .keyboardShortcut(.return, modifiers: [])
+                    .accessibilityLabel("Stop and transcribe the current meeting")
             } else {
                 Button { Task { await store.beginMeeting() } } label: {
                     Label(isProcessingMeeting ? "Processing meeting" : "Record meeting", systemImage: isProcessingMeeting ? "ellipsis" : "record.circle")
@@ -61,6 +64,8 @@ struct MeetingWorkspaceView: View {
                 .buttonStyle(AlphaButtonStyle())
                 .disabled(store.captureState != .idle)
                 .help(store.captureState == .idle ? "Start a local meeting capture" : "Finish the current capture first")
+                .accessibilityLabel(isProcessingMeeting ? "Meeting transcription is in progress" : "Record a new meeting")
+                .accessibilityHint("Starts local microphone and optional system-audio capture without joining the meeting.")
             }
         }
         .padding(20)
@@ -88,6 +93,8 @@ struct MeetingWorkspaceView: View {
                         Button("Open Privacy Settings", action: openScreenRecordingSettings)
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .accessibilityLabel("Open Screen and System Audio Recording settings")
+                            .accessibilityHint("Opens System Settings so Evee can include other meeting participants in local capture.")
                     }
                 }
                 .accessibilityElement(children: .combine)
@@ -178,6 +185,8 @@ struct MeetingWorkspaceView: View {
             }
             Spacer()
             Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
+                .accessibilityLabel("Cancel meeting audio preparation")
+                .accessibilityHint("Stops preparation and removes this incomplete capture.")
         }
         .animaCard()
         .padding(20)
@@ -186,7 +195,7 @@ struct MeetingWorkspaceView: View {
     private var restoredDraftCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("Recovered meeting notes", systemImage: "doc.badge.clock")
+                Label(recoveredNotesLabel, systemImage: "doc.badge.clock")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(AnimaTheme.indigo)
                 Spacer()
@@ -194,12 +203,15 @@ struct MeetingWorkspaceView: View {
                     Task { await store.discardMeetingDraft() }
                 }
                 .controlSize(.small)
+                .accessibilityLabel("Discard recovered meeting notes")
+                .accessibilityHint("Permanently removes the restored title and notes.")
             }
             Text("These notes were restored from your last interrupted meeting and continue to save automatically.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextField("Meeting title", text: $store.meetingTitle)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Recovered meeting title")
             TextEditor(text: $store.meetingNotes)
                 .font(.system(size: 13))
                 .frame(minHeight: 80, maxHeight: 130)
@@ -207,6 +219,7 @@ struct MeetingWorkspaceView: View {
                 .padding(6)
                 .background(AnimaTheme.raisedSurface)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel(recoveredNotesLabel)
         }
         .animaCard()
         .padding(.horizontal, 20)
@@ -247,6 +260,11 @@ struct MeetingWorkspaceView: View {
     private func openScreenRecordingSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    private var recoveredNotesLabel: String {
+        guard let startedAt = store.meetingDraftStartedAt else { return "Recovered meeting notes" }
+        return AccessibilityCopy.recoveredNotes(startedAt: startedAt)
     }
 
     private func liveTimestamp(_ date: Date) -> String {

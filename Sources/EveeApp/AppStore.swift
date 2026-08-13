@@ -81,8 +81,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var isSystemAudioActive = false
     @Published private(set) var isPreparingMeetingDiarization = false
     @Published private(set) var meetingDiarizationReady = false
-    @Published private(set) var accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
-    @Published private(set) var microphonePermissionGranted = false
+    @Published private(set) var accessibilityPermissionState: PermissionState = TextDelivery.isAccessibilityTrusted ? .granted : .notDetermined
+    @Published private(set) var microphonePermissionState: PermissionState = .notDetermined
     @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
     @Published private(set) var liveMeetingStatus: String?
     @Published private(set) var availableUpdate: EveeRelease?
@@ -98,6 +98,32 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     var modelReady: Bool {
         if case .ready = modelDownloadState { return true }
         return false
+    }
+
+    var accessibilityPermissionGranted: Bool { accessibilityPermissionState == .granted }
+    var microphonePermissionGranted: Bool { microphonePermissionState == .granted }
+
+    var onboardingPresentation: OnboardingPresentation {
+        let model: OnboardingModelState = switch modelDownloadState {
+        case .idle:
+            modelDownloadNeedsRetry
+                ? .failed("The previous model download did not finish.")
+                : .idle
+        case .downloading(_, let progress):
+            .downloading(
+                fraction: progress?.fraction ?? 0,
+                status: progress?.status ?? "Starting"
+            )
+        case .failed(_, let message):
+            .failed(message)
+        case .ready:
+            .ready
+        }
+        return OnboardingPresentation(
+            microphone: microphonePermissionState,
+            accessibility: accessibilityPermissionState,
+            model: model
+        )
     }
 
     func isSpeechModelSupported(_ model: SpeechModel) -> Bool {
@@ -145,6 +171,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var modelDownloadStateMachine = ModelDownloadStateMachine()
     private var modelDownloadOperation: LifecycleOperation?
     private var modelDownloadTask: Task<Void, Never>?
+    private var accessibilityPermissionRequested = false
     private var modelsRequiringRepair: Set<SpeechModel> = []
     private var activeAudioURL: URL?
     private var activeSystemAudioURL: URL?
@@ -297,7 +324,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         self.systemAudioStopper = systemAudioStopper
         self.textDeliverer = textDeliverer
         self.recoveryTranscriberFactory = recoveryTranscriberFactory
-        self.microphonePermissionGranted = microphonePermissionProvider()
+        self.microphonePermissionState = microphonePermissionProvider()
+            ? .granted
+            : MicrophoneRecorder.authorizationState
         let webhookOutboxTransactions = WebhookOutboxTransactions()
         self.webhookOutboxTransactions = webhookOutboxTransactions
         self.webhookOutboxCoordinator = WebhookOutboxCoordinator(transactions: webhookOutboxTransactions)
@@ -813,17 +842,30 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func refreshPermissionState() {
-        accessibilityPermissionGranted = TextDelivery.isAccessibilityTrusted
-        microphonePermissionGranted = microphonePermissionProvider()
+        accessibilityPermissionState = TextDelivery.isAccessibilityTrusted
+            ? .granted
+            : (accessibilityPermissionRequested ? .denied : .notDetermined)
+        microphonePermissionState = microphonePermissionProvider()
+            ? .granted
+            : MicrophoneRecorder.authorizationState
     }
 
     func requestAccessibilityPermission() {
+        accessibilityPermissionRequested = true
         _ = TextDelivery.requestAccessibility()
         refreshPermissionState()
     }
 
     func requestMicrophonePermission() async {
-        microphonePermissionGranted = await recorder.requestPermission()
+        let granted = await recorder.requestPermission()
+        microphonePermissionState = granted ? .granted : MicrophoneRecorder.authorizationState
+    }
+
+    func openMicrophoneSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        ) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func beginDictation() async {
@@ -1490,6 +1532,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     var hasMeetingDraft: Bool {
         !meetingTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
         !meetingNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var meetingDraftStartedAt: Date? {
+        guard let meetingDraftCaptureID else { return nil }
+        return recoverableCaptures.first { $0.id == meetingDraftCaptureID }?.startedAt
     }
 
     func recover(

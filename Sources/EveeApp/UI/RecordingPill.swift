@@ -43,6 +43,8 @@ struct RecordingPill: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .help("Stop recording and permanently discard this capture")
+                        .accessibilityLabel("Discard the current capture")
+                        .accessibilityHint("Stops recording and permanently deletes this capture.")
                 }
                 if let onStop, case .recording = state {
                     Button("Stop", action: onStop)
@@ -51,6 +53,7 @@ struct RecordingPill: View {
                         .tint(.red)
                         .keyboardShortcut(.return, modifiers: [])
                         .help("Stop recording and transcribe")
+                        .accessibilityLabel("Stop and transcribe the current capture")
                 }
             }
         }

@@ -24,15 +24,19 @@ struct MenuBarView: View {
                     Text("Preparing \(captureName)…").font(.caption)
                 }
                 Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
+                    .accessibilityLabel("Cancel preparation for \(captureName)")
             case .recording:
                 Text("Recording \(captureName)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
                     Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                        .accessibilityLabel("Discard \(captureName)")
+                        .accessibilityHint("Stops recording and permanently deletes this capture.")
                     Button("Stop and transcribe") { Task { await store.finishCapture() } }
                         .buttonStyle(.borderedProminent)
                         .tint(.red)
+                        .accessibilityLabel("Stop and transcribe \(captureName)")
                 }
             case .transcribing, .delivering:
                 HStack(spacing: 9) {
@@ -46,6 +50,7 @@ struct MenuBarView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(3)
                 Button("Open Evee", action: showMainWindow)
+                    .accessibilityLabel("Open Evee to review the capture error")
             case .checkpointed(let message):
                 Label(message, systemImage: "checkmark.shield.fill")
                     .font(.caption)
@@ -55,15 +60,21 @@ struct MenuBarView: View {
                     Button("Open Recovery") {
                         store.openCheckpointedRecovery()
                     }
+                    .accessibilityLabel("Open Evee capture recovery")
                     Button("Retry Quit") { NSApp.terminate(nil) }
+                        .accessibilityLabel("Retry quitting Evee")
                 }
             case .idle:
                 Button("Start dictation") { Task { await store.beginDictation() } }
                     .buttonStyle(.borderedProminent)
                     .tint(AnimaTheme.indigo)
+                    .accessibilityLabel("Start a new dictation")
                 Button("Transform selected text") { Task { await store.beginSelectionTransform() } }
+                    .accessibilityLabel("Start a selected-text transform instruction")
                 Button("Record meeting") { Task { await store.beginMeeting() } }
+                    .accessibilityLabel("Start a new meeting recording")
                 Button("Record memo") { Task { await store.beginMemo() } }
+                    .accessibilityLabel("Start a new memo recording")
             }
 
             Divider()
@@ -72,6 +83,7 @@ struct MenuBarView: View {
                 .foregroundStyle(.secondary)
             Button("Open Evee", action: showMainWindow)
                 .keyboardShortcut(",", modifiers: .command)
+                .accessibilityLabel("Open the Evee window")
         }
         .padding(14)
         .frame(width: 290)

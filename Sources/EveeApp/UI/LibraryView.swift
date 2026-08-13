@@ -38,15 +38,20 @@ struct LibraryView: View {
                             Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
                                 .buttonStyle(.bordered)
                                 .help("Stop and permanently discard this memo")
+                                .accessibilityLabel("Discard the current memo recording")
+                                .accessibilityHint("Stops recording and permanently deletes this memo capture.")
                             Button("Stop and save") { Task { await store.finishCapture() } }
                                 .buttonStyle(.borderedProminent)
                                 .tint(.red)
                                 .keyboardShortcut(.return, modifiers: [])
+                                .accessibilityLabel("Stop and save the current memo recording")
                         } else {
                             Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
                                 .buttonStyle(AlphaButtonStyle())
                                 .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
                                 .help(store.captureState == .idle ? "Record a private voice memo" : "Finish the current capture first")
+                                .accessibilityLabel("Record a new private memo")
+                                .accessibilityHint("Starts a local microphone recording.")
                         }
                     }
                 }
@@ -101,6 +106,8 @@ struct LibraryView: View {
                                     Task { await store.discardRecovery(capture) }
                                 }
                                 .controlSize(.small)
+                                .accessibilityLabel(AccessibilityCopy.discardRecovery(kind: capture.kind, startedAt: capture.startedAt))
+                                .accessibilityHint("Permanently deletes the interrupted capture and its local audio.")
 
                                 Spacer()
 
@@ -110,6 +117,8 @@ struct LibraryView: View {
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
                                 .disabled(!canRecoverAll(capture))
+                                .accessibilityLabel("Recover all valid tracks from interrupted \(capture.kind.rawValue)")
+                                .accessibilityHint("Transcribes every playable local audio track and saves one workspace record.")
 
                                 if capture.tracks.contains(where: { $0.role == .microphone }) {
                                     Button("Microphone") {
@@ -117,6 +126,7 @@ struct LibraryView: View {
                                     }
                                     .controlSize(.small)
                                     .disabled(!isValid(.microphone, in: capture))
+                                    .accessibilityLabel("Recover interrupted \(capture.kind.rawValue) from microphone audio")
                                 }
 
                                 if capture.tracks.contains(where: { $0.role == .system }) {
@@ -125,6 +135,7 @@ struct LibraryView: View {
                                     }
                                     .controlSize(.small)
                                     .disabled(capture.kind != .meeting || !isValid(.system, in: capture))
+                                    .accessibilityLabel("Recover interrupted meeting from system audio")
                                 }
                             }
                             .disabled(
@@ -145,7 +156,13 @@ struct LibraryView: View {
                 TextField("Search everything you have said…", text: $store.search)
                     .textFieldStyle(.plain)
                 if !store.search.isEmpty {
-                    Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    Button { store.search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").accessibilityHidden(true)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(AccessibilityCopy.clearSearch)
+                    .accessibilityHint("Removes the current query and shows all workspace records.")
                 }
             }
             .padding(.horizontal, 12).frame(height: 38)
@@ -249,7 +266,7 @@ private struct RecordRow: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(AnimaTheme.border.opacity(0.8)))
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(record.kind.rawValue.capitalized), \(record.title), \(record.createdAt.formatted(date: .abbreviated, time: .shortened))")
+        .accessibilityLabel(AccessibilityCopy.recordRow(record: record, snippet: snippet))
     }
 
     private var icon: String { switch record.kind { case .dictation: "text.cursor"; case .meeting: "person.2.wave.2"; case .memo: "waveform" } }

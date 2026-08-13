@@ -131,16 +131,33 @@ struct WorkspaceIntelligencePrivacyView: View {
             }
             .disabled(!preferences.isEnabled)
 
-            HStack {
-                Button("Save activity privacy settings") { Task { await save() } }
-                Button("Delete activity data", role: .destructive) { showingPurgeConfirmation = true }
-                if let status { Text(status).font(.caption).foregroundStyle(.secondary) }
+            ViewThatFits(in: .horizontal) {
+                HStack { activityActions }
+                VStack(alignment: .leading, spacing: 8) { activityActions }
             }
         }
         .task { await load() }
         .confirmationDialog("Delete all stored activity and journal data?", isPresented: $showingPurgeConfirmation) {
             Button("Delete activity data", role: .destructive) { Task { await purge() } }
+                .accessibilityLabel(AccessibilityCopy.deleteActivityData)
+                .accessibilityHint("Permanently deletes all locally stored activity observations and generated journal entries.")
             Button("Cancel", role: .cancel) {}
+                .accessibilityLabel("Cancel activity data deletion")
+        }
+    }
+
+    @ViewBuilder
+    private var activityActions: some View {
+        Button("Save activity privacy settings") { Task { await save() } }
+            .accessibilityLabel("Save local activity privacy settings")
+        Button("Delete activity data", role: .destructive) { showingPurgeConfirmation = true }
+            .accessibilityLabel(AccessibilityCopy.deleteActivityData)
+            .accessibilityHint("Shows a confirmation before permanently deleting local activity data.")
+        if let status {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Activity privacy status: \(status)")
         }
     }
 

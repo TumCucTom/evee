@@ -12,14 +12,24 @@ struct RootView: View {
             if !store.modelReady {
                 OnboardingView()
             } else {
-                NavigationSplitView {
-                    sidebar
-                } content: {
-                    routeContent
-                } detail: {
-                    detail
+                switch layoutMode {
+                case .threeColumn:
+                    NavigationSplitView {
+                        sidebar
+                    } content: {
+                        routeContent
+                    } detail: {
+                        detail
+                    }
+                    .navigationSplitViewStyle(.balanced)
+                case .sidebarAndDetail:
+                    NavigationSplitView {
+                        sidebar
+                    } detail: {
+                        routeContent
+                    }
+                    .navigationSplitViewStyle(.balanced)
                 }
-                .navigationSplitViewStyle(.balanced)
             }
 
         }
@@ -36,13 +46,19 @@ struct RootView: View {
                     Spacer(minLength: 12)
                     Button("Show in Finder") { store.revealPreservedLibraryFiles() }
                         .controlSize(.small)
+                        .accessibilityLabel("Show preserved library data in Finder")
+                        .accessibilityHint("Opens the private folder containing files Evee preserved for manual review.")
                     Button("Keep preserved data") { store.dismissLibraryRecoveryWarning() }
                         .controlSize(.small)
+                        .accessibilityLabel("Dismiss preserved library data warning")
+                        .accessibilityHint("Keeps the preserved data and hides this warning.")
                     if store.recordsQuarantineActive {
                         Button("Reset library metadata", role: .destructive) {
                             showingMetadataResetConfirmation = true
                         }
                         .controlSize(.small)
+                        .accessibilityLabel("Reset library metadata protection")
+                        .accessibilityHint("Shows a confirmation before allowing future cleanup of unreferenced audio.")
                     }
                 }
                 .padding(10)
@@ -59,7 +75,9 @@ struct RootView: View {
             Button("Reset metadata protection", role: .destructive) {
                 Task { await store.resetLibraryMetadataProtection() }
             }
+            .accessibilityLabel("Confirm reset of library metadata protection")
             Button("Cancel", role: .cancel) {}
+                .accessibilityLabel("Cancel library metadata protection reset")
         } message: {
             Text("The preserved corrupt copy will remain, and no audio will be deleted by this action. Future maintenance may then remove audio that current library metadata does not reference.")
         }
@@ -74,13 +92,17 @@ struct RootView: View {
         )) {
             if store.pendingDelivery != nil {
                 Button("Retry Paste") { Task { await store.retryPendingTextDelivery() } }
+                    .accessibilityLabel("Retry pasting the pending text")
                 Button("Copy Text") { store.copyPendingTextDelivery() }
+                    .accessibilityLabel("Copy the pending text to the clipboard")
             }
             Button("Open Settings") {
                 store.route = .settings
                 clearFailedCaptureIfNeeded()
             }
+            .accessibilityLabel("Open Evee Settings")
             Button("Dismiss", role: .cancel) { clearFailedCaptureIfNeeded() }
+                .accessibilityLabel("Dismiss Evee status message")
         } message: { Text(store.statusMessage ?? "") }
     }
 
@@ -135,6 +157,20 @@ struct RootView: View {
         }
         else {
             ContentUnavailableView("Choose a recording", systemImage: "waveform.badge.magnifyingglass", description: Text("Dictations, meetings and memos stay searchable on this Mac."))
+        }
+    }
+
+    private var layoutMode: RootLayoutMode {
+        RootLayoutMode.route(routeKind, captureState: store.captureState)
+    }
+
+    private var routeKind: WorkspaceRouteKind {
+        switch store.route {
+        case .library: .library
+        case .meetings: .meetings
+        case .memos: .memos
+        case .dictionary: .dictionary
+        case .settings: .settings
         }
     }
 

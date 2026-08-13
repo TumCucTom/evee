@@ -39,7 +39,16 @@ public final class MicrophoneRecorder: ObservableObject {
     }
 
     public static var isPermissionGranted: Bool {
-        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        authorizationState == .granted
+    }
+
+    public static var authorizationState: PermissionState {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined: .notDetermined
+        case .authorized: .granted
+        case .denied, .restricted: .denied
+        @unknown default: .denied
+        }
     }
 
     public func requestPermission() async -> Bool {

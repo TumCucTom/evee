@@ -17,16 +17,23 @@ public enum AnimaTheme {
     public static let border = adaptive(light: NSColor(red: 0.902, green: 0.902, blue: 0.941, alpha: 1), dark: NSColor(red: 0.25, green: 0.23, blue: 0.32, alpha: 1))
 
     public static let alphaGradient = LinearGradient(
-        colors: [magenta, violet, electric],
+        colors: AccessibleActionPalette.gradientStops(for: .light).map(swiftUIColor),
         startPoint: .topLeading,
         endPoint: .bottomTrailing
     )
+
+    public static let actionForeground = swiftUIColor(AccessibleActionPalette.foreground)
+    public static let disabledActionBorder = swiftUIColor(AccessibleActionPalette.disabledBorder)
 
     private static func adaptive(light: NSColor, dark: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
             let match = appearance.bestMatch(from: [.darkAqua, .aqua])
             return match == .darkAqua ? dark : light
         })
+    }
+
+    private static func swiftUIColor(_ color: RGBColor) -> Color {
+        Color(red: color.red, green: color.green, blue: color.blue)
     }
 }
 
@@ -61,12 +68,22 @@ public struct AlphaButtonStyle: ButtonStyle {
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.white)
+            .foregroundStyle(AnimaTheme.actionForeground)
             .padding(.horizontal, 16)
             .frame(minHeight: 36)
             .background(AnimaTheme.alphaGradient)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .opacity(!isEnabled ? 0.42 : (configuration.isPressed ? 0.82 : 1))
+            .overlay {
+                if !isEnabled {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(
+                            AnimaTheme.disabledActionBorder,
+                            style: StrokeStyle(lineWidth: 2, dash: [5, 3])
+                        )
+                }
+            }
+            .saturation(isEnabled ? 1 : 0.28)
+            .opacity(configuration.isPressed ? 0.82 : 1)
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
             .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: configuration.isPressed)
     }

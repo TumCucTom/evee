@@ -33,22 +33,16 @@ struct SettingsView: View {
                 if let reason = store.speechModelUnavailableReason(.qwen3) {
                     Text(reason).font(.caption).foregroundStyle(.secondary)
                 }
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(store.settings.model.detail).font(.caption).foregroundStyle(.secondary)
-                        if let progress = store.modelProgress {
-                            ProgressView(value: progress.fraction) { Text(progress.status) }.frame(maxWidth: 280)
-                        }
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        modelDownloadStatus
+                        Spacer()
+                        modelDownloadButton
                     }
-                    Spacer()
-                    Button(selectedModelReady ? "Downloaded" : "Download") {
-                        Task { await store.downloadSelectedModel() }
+                    VStack(alignment: .leading, spacing: 8) {
+                        modelDownloadStatus
+                        modelDownloadButton
                     }
-                    .disabled(
-                        selectedModelReady ||
-                        store.modelProgress != nil ||
-                        !store.isSpeechModelSupported(store.settings.model)
-                    )
                 }
                 Picker("Language", selection: $store.settings.languageCode) {
                     ForEach(SupportedLanguage.all) { language in
@@ -100,15 +94,14 @@ struct SettingsView: View {
                                 store.settings.smartLinks.removeAll { $0.id == link.id }
                             } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless)
-                            .accessibilityLabel("Remove smart link for \(link.phrase)")
+                            .accessibilityLabel(AccessibilityCopy.removeSmartLink(phrase: link.phrase))
+                            .accessibilityHint("Permanently removes this local smart link.")
                         }
                     }
                 }
-                HStack {
-                    TextField("Spoken phrase", text: $newLinkPhrase)
-                    TextField("https://destination.example", text: $newLinkDestination)
-                    Button("Add", action: addSmartLink)
-                        .disabled(!validNewLink)
+                ViewThatFits(in: .horizontal) {
+                    HStack { smartLinkFields }
+                    VStack(alignment: .leading, spacing: 8) { smartLinkFields }
                 }
                 Text("Smart links replace an exact spoken phrase with its web address locally. Only HTTP and HTTPS destinations are accepted.")
                     .font(.caption)
@@ -132,6 +125,8 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.borderless)
                             .help("Remove this app style")
+                            .accessibilityLabel(AccessibilityCopy.removeAppStyle(named: style.displayName.isEmpty ? style.bundleIdentifier : style.displayName))
+                            .accessibilityHint("Permanently removes this per-app writing style.")
                         }
                         HStack {
                             Picker("Tone", selection: $style.tone) {
@@ -143,15 +138,9 @@ struct SettingsView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                HStack {
-                    TextField("App name", text: $newAppName)
-                    TextField("Bundle identifier (for example com.apple.mail)", text: $newBundleIdentifier)
-                    Picker("Tone", selection: $newAppTone) {
-                        ForEach(WritingTone.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                    }
-                    .labelsHidden()
-                    Button("Add", action: addStyle)
-                        .disabled(trimmedBundleIdentifier.isEmpty || newAppName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                ViewThatFits(in: .horizontal) {
+                    HStack { newAppStyleFields }
+                    VStack(alignment: .leading, spacing: 8) { newAppStyleFields }
                 }
             }
 
@@ -177,6 +166,8 @@ struct SettingsView: View {
                             store.isPreparingMeetingDiarization ||
                             store.captureState != .idle
                         )
+                        .accessibilityLabel("Prepare anonymous speaker separation model")
+                        .accessibilityHint("Downloads and prepares the additional local meeting model.")
                     }
                 }
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
@@ -205,7 +196,9 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 HStack {
                     Button("Export JSON") { Task { await store.exportWorkspace(format: .json) } }
+                        .accessibilityLabel("Export workspace records as JSON")
                     Button("Export Markdown") { Task { await store.exportWorkspace(format: .markdown) } }
+                        .accessibilityLabel("Export workspace records as Markdown")
                     Spacer()
                     Text("Exports omit retry payload bodies and never include Keychain secrets.")
                         .font(.caption)
@@ -224,10 +217,16 @@ struct SettingsView: View {
                             .disabled(true)
                         Button("Copy") { copy(store.localAPICredentials?.token ?? "") }
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel("Copy local API token")
+                            .accessibilityHint("Copies the Keychain-backed token for sixty seconds.")
                         Button("Rotate", action: store.rotateLocalAPIToken)
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel("Rotate local API token")
+                            .accessibilityHint("Replaces the current token and invalidates clients using it.")
                         Button("Revoke", role: .destructive) { Task { await store.revokeLocalAPIAccess() } }
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel(AccessibilityCopy.revokeLocalAPIAccess)
+                            .accessibilityHint("Disables authenticated local API access until settings are saved again.")
                     }
                     Text("Save to publish a token. The API is read-only, accepts connections from this Mac only, and stores its token in Keychain.")
                         .font(.caption)
@@ -242,7 +241,10 @@ struct SettingsView: View {
                             .foregroundStyle(.orange)
                         Spacer()
                         Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
+                            .accessibilityLabel("Retry all undelivered webhook items now")
                         Button("Cancel outbox", role: .destructive) { Task { await store.cancelWebhookOutbox() } }
+                            .accessibilityLabel(AccessibilityCopy.cancelWebhookOutbox)
+                            .accessibilityHint("Marks every pending webhook delivery as cancelled.")
                     }
                 }
                 Text("Webhook secrets are stored in Keychain. HTTPS is required except for localhost development.")
@@ -275,10 +277,12 @@ struct SettingsView: View {
                                     Task { await adoptMCP(inspection.client) }
                                 }
                                 .accessibilityLabel("Adopt existing Evee registration for \(inspection.client.name)")
+                                .accessibilityHint("Marks the existing helper entry as owned so Evee can revoke it later.")
                                 Button("Remove", role: .destructive) {
                                     Task { await removeLegacyMCP(inspection.client) }
                                 }
                                 .accessibilityLabel("Remove existing Evee registration from \(inspection.client.name)")
+                                .accessibilityHint("Removes only the recognized Evee entry and preserves unrelated client settings.")
                             }
                         }
                     }
@@ -296,15 +300,20 @@ struct SettingsView: View {
                         Button("Revoke access", role: .destructive) {
                             Task { await revokeMCP() }
                         }
+                        .accessibilityLabel(AccessibilityCopy.helperRevocation)
+                        .accessibilityHint("Disables helper authorization and removes owned client registrations.")
                     } else {
                         Button("Enable selected clients") {
                             Task { await registerMCP() }
                         }
                         .disabled(selectedMCPClientIDs.isEmpty)
+                        .accessibilityLabel(AccessibilityCopy.helperRegistration(clientCount: selectedMCPClientIDs.count))
+                        .accessibilityHint("Adds an owned Evee helper registration to each selected local client.")
                         Button("Adopt selected legacy entries") {
                             Task { await adoptSelectedMCP() }
                         }
                         .disabled(selectedLegacyMCPClients.isEmpty)
+                        .accessibilityLabel("Adopt \(selectedLegacyMCPClients.count) selected legacy helper \(selectedLegacyMCPClients.count == 1 ? "entry" : "entries")")
                     }
                 }
                 if let integrationMessage {
@@ -333,10 +342,13 @@ struct SettingsView: View {
                         Task { await store.checkForUpdates() }
                     }
                     .disabled(store.isCheckingForUpdates)
+                    .accessibilityLabel(store.isCheckingForUpdates ? "Checking for Evee updates" : "Check for Evee updates")
                     if let update = store.availableUpdate {
                         Link("Open Evee \(update.version) release", destination: update.pageURL)
                     }
                     Button("Export diagnostics") { Task { await store.exportDiagnostics() } }
+                        .accessibilityLabel("Export private Evee diagnostics")
+                        .accessibilityHint("Creates a local diagnostic export without workspace content or secrets.")
                 }
             }
 
@@ -345,6 +357,7 @@ struct SettingsView: View {
                 Button("Save settings") { Task { await store.saveSettings() } }
                     .buttonStyle(AlphaButtonStyle())
                     .keyboardShortcut("s", modifiers: .command)
+                    .accessibilityLabel("Save Evee settings")
             }
         }
         .formStyle(.grouped)
@@ -357,6 +370,75 @@ struct SettingsView: View {
         }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
+    }
+
+    @ViewBuilder
+    private var modelDownloadStatus: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(store.settings.model.detail).font(.caption).foregroundStyle(.secondary)
+            if let progress = store.modelProgress {
+                ProgressView(value: progress.fraction) { Text(progress.status) }
+                    .frame(maxWidth: 280)
+                    .accessibilityLabel("Local model download progress")
+                    .accessibilityValue("\(Int((progress.fraction * 100).rounded())) percent, \(progress.status)")
+            }
+        }
+    }
+
+    private var modelDownloadButton: some View {
+        Button(modelDownloadButtonTitle) {
+            if isModelDownloading {
+                store.cancelModelDownload()
+            } else {
+                store.startModelDownload()
+            }
+        }
+        .disabled(selectedModelReady || !store.isSpeechModelSupported(store.settings.model))
+        .accessibilityLabel(modelDownloadAccessibilityLabel)
+        .accessibilityValue(store.onboardingPresentation.modelAccessibilityValue ?? "")
+        .accessibilityHint(store.onboardingPresentation.modelAccessibilityHint)
+    }
+
+    private var modelDownloadButtonTitle: String {
+        if selectedModelReady { return "Downloaded" }
+        if isModelDownloading { return "Cancel" }
+        return store.modelDownloadNeedsRetry ? "Retry" : "Download"
+    }
+
+    private var modelDownloadAccessibilityLabel: String {
+        if selectedModelReady { return "Selected local model is downloaded" }
+        if isModelDownloading { return "Cancel local model download" }
+        return store.modelDownloadNeedsRetry ? "Retry local model download" : "Download local model"
+    }
+
+    private var isModelDownloading: Bool {
+        if case .downloading = store.modelDownloadState { return true }
+        return false
+    }
+
+    @ViewBuilder
+    private var smartLinkFields: some View {
+        TextField("Spoken phrase", text: $newLinkPhrase)
+            .accessibilityLabel("Smart link spoken phrase")
+        TextField("https://destination.example", text: $newLinkDestination)
+            .accessibilityLabel("Smart link web address")
+        Button("Add", action: addSmartLink)
+            .disabled(!validNewLink)
+            .accessibilityLabel("Add local smart link")
+    }
+
+    @ViewBuilder
+    private var newAppStyleFields: some View {
+        TextField("App name", text: $newAppName)
+        TextField("Bundle identifier (for example com.apple.mail)", text: $newBundleIdentifier)
+        Picker("Tone", selection: $newAppTone) {
+            ForEach(WritingTone.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+        }
+        .labelsHidden()
+        .accessibilityLabel("New app writing tone")
+        Button("Add", action: addStyle)
+            .disabled(trimmedBundleIdentifier.isEmpty || newAppName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .accessibilityLabel("Add per-app writing style")
     }
 
     private var trimmedBundleIdentifier: String {
