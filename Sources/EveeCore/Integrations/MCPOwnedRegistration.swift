@@ -56,6 +56,7 @@ public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
     case unsafeConfiguration(URL)
     case conflict(URL)
     case legacyEntryNotRecognized(URL)
+    case legacyRegistrationSelectionRequired([URL])
     case recoveryRequired([String])
     case rollbackFailed(primary: String, failures: [String])
 
@@ -71,6 +72,8 @@ public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
             return "The Evee-owned client entry has a cleanup conflict. It was left unchanged and needs manual cleanup."
         case .legacyEntryNotRecognized:
             return "The existing Evee client entry is manual or ambiguous. Review it in the client configuration before enabling local helper access."
+        case .legacyRegistrationSelectionRequired(let urls):
+            return "Local helper access remains disabled until every existing Evee registration is explicitly adopted or removed: \(urls.map(\.path).joined(separator: "; "))"
         case .recoveryRequired(let failures):
             return "An unfinished local helper transaction needs manual cleanup: \(failures.joined(separator: "; "))"
         case .rollbackFailed(let primary, let failures):
@@ -244,7 +247,10 @@ public enum MCPOwnedRegistration {
         allowedRootURLs: [URL],
         storageRootURL: URL,
         settings: EveeSettings,
-        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        fileManager: FileManager = .default,
+        homeURL: URL? = nil,
+        applicationSupportURL: URL? = nil
     ) async throws -> [MCPRegistrationResult] {
         guard !clients.isEmpty else { return [] }
         let executable = expectedExecutableURL.standardizedFileURL
@@ -270,6 +276,17 @@ public enum MCPOwnedRegistration {
         let manifestURL = manifestURL(storageRootURL: storageRootURL)
         guard !FileManager.default.fileExists(atPath: manifestURL.path) else {
             throw MCPOwnedRegistrationError.manifestAlreadyExists(manifestURL)
+        }
+        let blocking = try unselectedExistingRegistrations(
+            selectedClients: clients,
+            expectedExecutableURL: executable,
+            allowedRootURLs: allowedRootURLs,
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL
+        )
+        guard blocking.isEmpty else {
+            throw MCPOwnedRegistrationError.legacyRegistrationSelectionRequired(blocking)
         }
 
         let snapshots = try clients.map { client in
@@ -454,13 +471,56 @@ public enum MCPOwnedRegistration {
         return snapshot
     }
 
+    private static func unselectedExistingRegistrations(
+        selectedClients: [MCPClientConfiguration],
+        expectedExecutableURL: URL,
+        allowedRootURLs: [URL],
+        fileManager: FileManager,
+        homeURL: URL?,
+        applicationSupportURL: URL?
+    ) throws -> [URL] {
+        let selectedURLs = Set(selectedClients.map { $0.configurationURL.standardizedFileURL.path })
+        return try MCPRegistration.detectedClients(
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL
+        ).compactMap { client in
+            guard !selectedURLs.contains(client.configurationURL.standardizedFileURL.path) else { return nil }
+            let clientPath = client.configurationURL.standardizedFileURL.path
+            guard allowedRootURLs.contains(where: { root in
+                let rootPath = root.standardizedFileURL.path
+                return clientPath == rootPath || clientPath.hasPrefix(rootPath + "/")
+            }) else {
+                return nil
+            }
+            let plan = try AnchoredTarget.plan(
+                selectedURL: client.configurationURL,
+                allowedRootURLs: allowedRootURLs,
+                executableURL: expectedExecutableURL
+            )
+            switch try disposition(
+                snapshot: plan.snapshot,
+                manifest: nil,
+                expectedExecutableURL: expectedExecutableURL
+            ) {
+            case .recognizedLegacy, .ambiguous:
+                return client.configurationURL
+            case .unregistered, .ownedCurrent:
+                return nil
+            }
+        }.sorted { $0.path < $1.path }
+    }
+
     public static func enable(
         clients: [MCPClientConfiguration],
         executableURL: URL,
         allowedRootURLs: [URL],
         storageRootURL: URL,
         settings: EveeSettings,
-        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        fileManager: FileManager = .default,
+        homeURL: URL? = nil,
+        applicationSupportURL: URL? = nil
     ) async throws -> [MCPRegistrationResult] {
         try await enableImpl(
             clients: clients,
@@ -469,6 +529,9 @@ public enum MCPOwnedRegistration {
             storageRootURL: storageRootURL,
             settings: settings,
             saveSettings: saveSettings,
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL,
             testing: nil
         )
     }
@@ -481,6 +544,9 @@ public enum MCPOwnedRegistration {
         storageRootURL: URL,
         settings: EveeSettings,
         saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        fileManager: FileManager = .default,
+        homeURL: URL? = nil,
+        applicationSupportURL: URL? = nil,
         testing: MCPRegistrationTesting
     ) async throws -> [MCPRegistrationResult] {
         try await enableImpl(
@@ -490,6 +556,9 @@ public enum MCPOwnedRegistration {
             storageRootURL: storageRootURL,
             settings: settings,
             saveSettings: saveSettings,
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL,
             testing: testing
         )
     }
@@ -550,6 +619,9 @@ public enum MCPOwnedRegistration {
         storageRootURL: URL,
         settings: EveeSettings,
         saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        fileManager: FileManager,
+        homeURL: URL?,
+        applicationSupportURL: URL?,
         testing: MCPRegistrationTesting?
     ) async throws -> [MCPRegistrationResult] {
         guard !clients.isEmpty else { return [] }
@@ -578,6 +650,17 @@ public enum MCPOwnedRegistration {
         let manifestURL = manifestURL(storageRootURL: storageRootURL)
         guard !FileManager.default.fileExists(atPath: manifestURL.path) else {
             throw MCPOwnedRegistrationError.manifestAlreadyExists(manifestURL)
+        }
+        let blocking = try unselectedExistingRegistrations(
+            selectedClients: clients,
+            expectedExecutableURL: executable,
+            allowedRootURLs: allowedRootURLs,
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL
+        )
+        guard blocking.isEmpty else {
+            throw MCPOwnedRegistrationError.legacyRegistrationSelectionRequired(blocking)
         }
 
         var handles: [AnchoredTarget] = []

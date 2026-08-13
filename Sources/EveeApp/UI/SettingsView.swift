@@ -250,7 +250,7 @@ struct SettingsView: View {
                 } else {
                     ForEach(mcpInspections) { inspection in
                         HStack(alignment: .top) {
-                            if inspection.disposition == .unregistered {
+                            if inspection.disposition == .unregistered || inspection.disposition == .recognizedLegacy {
                                 Toggle(isOn: mcpSelectionBinding(for: inspection.client)) {
                                     mcpClientLabel(inspection)
                                 }
@@ -272,6 +272,11 @@ struct SettingsView: View {
                         }
                     }
                 }
+                if !store.settings.mcpEnabled, !unresolvedMCPRegistrations.isEmpty {
+                    Text("Local helper access remains disabled until every existing Evee entry below is explicitly selected and adopted or removed. Manual or ambiguous entries must be reviewed outside Evee.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 HStack {
                     if store.settings.mcpEnabled {
                         Label("Local helper access enabled", systemImage: "checkmark.circle.fill")
@@ -285,6 +290,10 @@ struct SettingsView: View {
                             Task { await registerMCP() }
                         }
                         .disabled(selectedMCPClientIDs.isEmpty)
+                        Button("Adopt selected legacy entries") {
+                            Task { await adoptSelectedMCP() }
+                        }
+                        .disabled(selectedLegacyMCPClients.isEmpty)
                     }
                 }
                 if let integrationMessage {
@@ -441,6 +450,16 @@ struct SettingsView: View {
         )
     }
 
+    private var selectedLegacyMCPClients: [MCPClientConfiguration] {
+        mcpInspections
+            .filter { $0.disposition == .recognizedLegacy && selectedMCPClientIDs.contains($0.client.id) }
+            .map(\.client)
+    }
+
+    private var unresolvedMCPRegistrations: [MCPClientRegistrationInspection] {
+        mcpInspections.filter { $0.disposition == .recognizedLegacy || $0.disposition == .ambiguous }
+    }
+
     private func registerMCP() async {
         let mcpURL = MCPRegistration.bundledExecutableURL()
         guard FileManager.default.isExecutableFile(atPath: mcpURL.path) else {
@@ -463,6 +482,17 @@ struct SettingsView: View {
         do {
             _ = try await store.adoptLegacyLocalHelperAccess(for: [client])
             integrationMessage = "Adopted the existing Evee entry for \(client.name). Revoking access will remove that entry rather than restore it."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Adoption failed without authorizing the helper: \(error.localizedDescription)"
+        }
+    }
+
+    private func adoptSelectedMCP() async {
+        guard !selectedLegacyMCPClients.isEmpty else { return }
+        do {
+            let results = try await store.adoptLegacyLocalHelperAccess(for: selectedLegacyMCPClients)
+            integrationMessage = "Adopted \(results.count) existing Evee \(results.count == 1 ? "entry" : "entries"). Restart the selected clients to connect."
             await refreshMCPClients()
         } catch {
             integrationMessage = "Adoption failed without authorizing the helper: \(error.localizedDescription)"

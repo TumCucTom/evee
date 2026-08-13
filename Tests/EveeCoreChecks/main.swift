@@ -2518,23 +2518,73 @@ private func checkMCPLegacyRegistrations() async throws {
 
     let cursor = MCPClientConfiguration(name: "Cursor", configurationURL: cursorURL)
     let codex = MCPClientConfiguration(name: "Codex", configurationURL: codexURL)
+    let claude = MCPClientConfiguration(name: "Claude Desktop", configurationURL: claudeURL)
+    var blockedEnableSaves: [Bool] = []
+    do {
+        _ = try await MCPOwnedRegistration.enable(
+            clients: [claude],
+            executableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: storage,
+            settings: EveeSettings(),
+            saveSettings: { settings in blockedEnableSaves.append(settings.mcpEnabled) },
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        throw CoreCheckError.assertionFailed("enable ignored an unselected legacy registration")
+    } catch MCPOwnedRegistrationError.legacyRegistrationSelectionRequired {
+        // Expected: helper authorization cannot bypass unresolved registrations.
+    }
+    try require(blockedEnableSaves.isEmpty, "blocked enable persisted authorization")
+    let claudeAfterBlockedEnable = try Data(contentsOf: claudeURL)
+    try require(claudeAfterBlockedEnable == unrelatedOriginal, "blocked enable changed the selected client")
+
+    var partialAdoptionSaves: [Bool] = []
+    do {
+        _ = try await MCPOwnedRegistration.adoptRecognizedLegacy(
+            clients: [cursor],
+            expectedExecutableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: storage,
+            settings: EveeSettings(),
+            saveSettings: { settings in partialAdoptionSaves.append(settings.mcpEnabled) },
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        throw CoreCheckError.assertionFailed("partial legacy adoption enabled the helper")
+    } catch MCPOwnedRegistrationError.legacyRegistrationSelectionRequired {
+        // Expected: every recognized registration must be selected explicitly.
+    }
+    try require(partialAdoptionSaves.isEmpty, "partial legacy adoption persisted authorization")
+    let cursorAfterPartialAdoption = try Data(contentsOf: cursorURL)
+    let codexAfterPartialAdoption = String(decoding: try Data(contentsOf: codexURL), as: UTF8.self)
+    let ambiguousAfterPartialAdoption = try Data(contentsOf: windsurfURL)
+    try require(cursorAfterPartialAdoption == cursorOriginal, "partial legacy adoption changed the selected client")
+    try require(codexAfterPartialAdoption == codexOriginal, "partial legacy adoption changed the untouched client")
+    try require(ambiguousAfterPartialAdoption == ambiguousOriginal, "partial legacy adoption changed an ambiguous client")
+
+    // The ambiguous entry is deliberately left untouched; remove this synthetic
+    // client file so the two selected recognized registrations can be adopted.
+    try FileManager.default.removeItem(at: windsurfURL)
+
     let adopted = try await MCPOwnedRegistration.adoptRecognizedLegacy(
-        clients: [cursor],
+        clients: [cursor, codex],
         expectedExecutableURL: executable,
         allowedRootURLs: [home],
         storageRootURL: storage,
         settings: EveeSettings(),
         saveSettings: { settings in
             try require(settings.mcpEnabled, "legacy adoption did not enable authorization transactionally")
-        }
+        },
+        homeURL: home,
+        applicationSupportURL: support
     )
-    try require(adopted.count == 1 && adopted[0].configurationURL == cursorURL, "legacy adoption changed an unselected client")
+    try require(adopted.map(\.configurationURL) == [cursorURL, codexURL], "batch legacy adoption did not adopt every selected client")
     let adoptedInspections = try inspections()
     let codexAfterAdopt = try Data(contentsOf: codexURL)
-    let ambiguousAfterAdopt = try Data(contentsOf: windsurfURL)
     try require(adoptedInspections["Cursor"] == .ownedCurrent, "adopted JSON unit was not classified as owned/current")
-    try require(codexAfterAdopt == Data(codexOriginal.utf8), "JSON adoption changed the unselected TOML client")
-    try require(ambiguousAfterAdopt == ambiguousOriginal, "legacy scan/adoption mutated an ambiguous client")
+    try require(adoptedInspections["Codex"] == .ownedCurrent, "adopted TOML unit was not classified as owned/current")
+    try require(codexAfterAdopt == Data(codexOriginal.utf8), "batch adoption changed the selected TOML client")
 
     var enabled = EveeSettings()
     enabled.mcpEnabled = true
@@ -2550,24 +2600,43 @@ private func checkMCPLegacyRegistrations() async throws {
     try require(revokedServers["evee"] == nil, "revoke restored the pre-hardening JSON Evee unit")
     try require(revokedServers["other"] != nil && revokedJSON["theme"] as? String == "dark", "adopted JSON revoke changed unrelated configuration")
 
+    try cursorOriginal.write(to: cursorURL)
+    try Data(codexOriginal.utf8).write(to: codexURL)
     let removed = try await MCPOwnedRegistration.removeRecognizedLegacy(
-        clients: [codex],
+        clients: [cursor],
         expectedExecutableURL: executable,
         allowedRootURLs: [home],
         storageRootURL: storage,
         settings: EveeSettings(),
         saveSettings: { settings in try require(!settings.mcpEnabled, "legacy removal did not confirm disabled authorization before mutation") }
     )
-    try require(removed.cleanupFailures.isEmpty && removed.removals.map(\.configurationURL) == [codexURL], "selected TOML legacy unit was not removed")
-    let removedCodex = String(decoding: try Data(contentsOf: codexURL), as: UTF8.self)
-    try require(!removedCodex.contains("mcp_servers.evee"), "TOML legacy removal left the Evee unit")
-    try require(removedCodex.contains("model = \"synthetic\"") && removedCodex.contains("mcp_servers.other"), "TOML legacy removal changed unrelated configuration")
-    let ambiguousAfterRemoval = try Data(contentsOf: windsurfURL)
-    try require(ambiguousAfterRemoval == ambiguousOriginal, "legacy removal mutated an ambiguous client")
+    try require(removed.cleanupFailures.isEmpty && removed.removals.map(\.configurationURL) == [cursorURL], "selected JSON legacy unit was not removed")
+    let removedCursor = try JSONSerialization.jsonObject(with: Data(contentsOf: cursorURL)) as! [String: Any]
+    let removedCursorServers = removedCursor["mcpServers"] as! [String: Any]
+    try require(removedCursorServers["evee"] == nil, "JSON legacy removal left the Evee unit")
+    try require(removedCursorServers["other"] != nil && removedCursor["theme"] as? String == "dark", "JSON legacy removal changed unrelated configuration")
 
+    let adoptedAfterRemoval = try await MCPOwnedRegistration.adoptRecognizedLegacy(
+        clients: [codex],
+        expectedExecutableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: storage,
+        settings: EveeSettings(),
+        saveSettings: { settings in try require(settings.mcpEnabled, "adopting the remaining recognized client did not enable authorization") },
+        homeURL: home,
+        applicationSupportURL: support
+    )
+    try require(adoptedAfterRemoval.map(\.configurationURL) == [codexURL], "remaining recognized client was not adopted")
+    let afterRemovalAdoptionCodex = String(decoding: try Data(contentsOf: codexURL), as: UTF8.self)
+    try require(afterRemovalAdoptionCodex == codexOriginal, "remaining TOML adoption changed configuration contents")
+    _ = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: storage,
+        settings: enabled,
+        saveSettings: { settings in try require(!settings.mcpEnabled, "post-adoption revoke did not disable authorization") }
+    )
     let saveFailureOriginal = Data("{\"mcpServers\":{\"evee\":{\"command\":\"\(executable.path)\",\"args\":[]},\"other\":{\"command\":\"other\"}}}".utf8)
     try saveFailureOriginal.write(to: claudeURL)
-    let claude = MCPClientConfiguration(name: "Claude Desktop", configurationURL: claudeURL)
     do {
         _ = try await MCPOwnedRegistration.adoptRecognizedLegacy(
             clients: [claude],
@@ -2577,7 +2646,9 @@ private func checkMCPLegacyRegistrations() async throws {
             settings: EveeSettings(),
             saveSettings: { settings in
                 if settings.mcpEnabled { throw SyntheticMCPPersistenceError.rejected }
-            }
+            },
+            homeURL: home,
+            applicationSupportURL: support
         )
         throw CoreCheckError.assertionFailed("legacy adoption ignored authorization save failure")
     } catch SyntheticMCPPersistenceError.rejected {
