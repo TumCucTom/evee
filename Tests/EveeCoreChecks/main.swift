@@ -23,6 +23,21 @@ private enum SyntheticMCPPersistenceError: Error {
     case restoreRejected
 }
 
+@MainActor
+private final class SyntheticTerminationCheckpoint: ApplicationTerminationCheckpoint {
+    private let operation: @MainActor () async throws -> Void
+    private(set) var callCount = 0
+
+    init(operation: @escaping @MainActor () async throws -> Void) {
+        self.operation = operation
+    }
+
+    func checkpointForApplicationTermination() async throws {
+        callCount += 1
+        try await operation()
+    }
+}
+
 private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
     private let lock = NSLock()
     private let enteredRead = DispatchSemaphore(value: 0)
@@ -176,6 +191,11 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     guard condition() else { throw CoreCheckError.assertionFailed(message) }
 }
 
+private func unwrapped<Value>(_ value: Value?, _ message: String) throws -> Value {
+    guard let value else { throw CoreCheckError.assertionFailed(message) }
+    return value
+}
+
 private func checkWebhookGeneration() async throws {
     let deliveryID = UUID(uuidString: "75B09B72-BC3F-4939-9F81-E6B7C814A552")!
     let coordinator = WebhookOutboxCoordinator()
@@ -196,10 +216,10 @@ private func checkWebhookGeneration() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: root) }
     let store = LibraryStore(rootURL: root)
-    let body = Data("{\"meeting\":\"synthetic\"}".utf8)
     let suspendedDeliveryID = UUID(uuidString: "19CF6CE4-3841-4CF7-9888-679CC63B3364")!
     let destination = URL(string: "https://example.invalid/webhook")!
     var storedRecord = WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Local test")
+    let body = try MeetingWebhook.payload(for: storedRecord)
     storedRecord.webhookDeliveries = [WebhookDelivery(
         id: suspendedDeliveryID,
         destination: destination.absoluteString,
@@ -321,16 +341,251 @@ private func checkWebhookSignature() throws {
     print("webhook-signature: passed")
 }
 
+private func checkWebhookPayload() throws {
+    let recoveryID = UUID(uuidString: "EBBDA6A3-47DF-42A2-BD44-8A6DE8C12B8D")!
+    let recordID = UUID(uuidString: "2C89F637-C572-4395-83FE-C9434685FD36")!
+    let createdAt = Date(timeIntervalSince1970: 1_786_616_400)
+    let updatedAt = Date(timeIntervalSince1970: 1_786_616_460)
+    let segmentID = UUID(uuidString: "08F9AE87-7CF3-491D-8A52-7472A69C3377")!
+    let record = WorkspaceRecord(
+        id: recordID,
+        kind: .meeting,
+        createdAt: createdAt,
+        updatedAt: updatedAt,
+        title: "Synthetic review",
+        text: "Allowlisted transcript",
+        rawText: "PRIVATE-RAW-SENTINEL",
+        sourceApplication: "Synthetic Meetings",
+        audioRelativePath: "PRIVATE-AUDIO-PATH.caf",
+        audioTracks: [WorkspaceAudioTrack(
+            role: .system,
+            relativePath: "PRIVATE-SYSTEM-TRACK.caf"
+        )],
+        duration: 60,
+        segments: [TranscriptSegment(
+            id: segmentID,
+            start: 1,
+            end: 3,
+            speaker: "Speaker 1",
+            text: "Evidence-backed segment"
+        )],
+        notes: "Synthetic notes",
+        tags: ["review"],
+        webhookDeliveries: [WebhookDelivery(
+            destination: "https://example.invalid/private-webhook-state"
+        )],
+        recoverySourceID: recoveryID,
+        operation: .selectionTransform,
+        context: WorkspaceContext(
+            windowTitle: "PRIVATE-WINDOW-CONTEXT",
+            selectedText: "PRIVATE-SELECTION-CONTEXT"
+        )
+    )
+
+    let body = try MeetingWebhook.payload(for: record)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let decoded = try decoder.decode(MeetingWebhookPayload.self, from: body)
+    try require(decoded.schema == MeetingWebhookPayload.schemaIdentifier, "meeting webhook payload omitted its schema")
+    try require(decoded.version == MeetingWebhookPayload.currentVersion, "meeting webhook payload omitted its version")
+    try require(decoded.meetingID == recordID, "meeting webhook payload changed the record identifier")
+    try require(decoded.transcript == "Allowlisted transcript", "meeting webhook payload omitted the transcript")
+    try require(decoded.segments.map(\.id) == [segmentID], "meeting webhook payload omitted meeting segments")
+    try require(MeetingWebhook.isCurrentPayload(body), "new meeting webhook bytes were not recognized as current")
+
+    let object = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+    let expectedKeys: Set<String> = [
+        "schema", "version", "meetingID", "createdAt", "updatedAt", "title",
+        "transcript", "sourceApplication", "duration", "segments", "notes", "tags",
+    ]
+    try require(Set(object.keys) == expectedKeys, "meeting webhook payload fields were not an exact allowlist: \(object.keys.sorted())")
+    let text = String(decoding: body, as: UTF8.self)
+    for sentinel in [
+        "PRIVATE-RAW-SENTINEL", "PRIVATE-AUDIO-PATH.caf", "PRIVATE-SYSTEM-TRACK.caf",
+        recoveryID.uuidString, "selectionTransform", "PRIVATE-WINDOW-CONTEXT",
+        "PRIVATE-SELECTION-CONTEXT", "private-webhook-state",
+    ] {
+        try require(!text.contains(sentinel), "meeting webhook payload leaked \(sentinel)")
+    }
+    let legacyBody = try JSONEncoder().encode(record)
+    try require(!MeetingWebhook.isCurrentPayload(legacyBody), "legacy full-record payload was accepted as current")
+    try require(!MeetingWebhook.isCurrentPayload(Data("{\"schema\":\"evee.meeting.completed\",\"version\":999}".utf8)), "unknown webhook payload version was accepted")
+
+    print("webhook-payload: passed")
+}
+
+private func checkWebhookLegacyRows() async throws {
+    let destination = "https://example.invalid/webhook"
+    let now = Date(timeIntervalSince1970: 1_786_616_800)
+    let nilID = UUID(uuidString: "427AD9DC-B219-44C7-8A0A-C3FF49798231")!
+    let privateID = UUID(uuidString: "FC0A8397-6B2C-4744-AF6D-D6A1FA0D37A9")!
+    let currentID = UUID(uuidString: "F0D174D0-816C-4C4F-96F9-C1FAB6D5F19E")!
+    var record = WorkspaceRecord(
+        id: UUID(uuidString: "6A6F69A9-FEE5-44FD-802D-D54BA73C3DB0")!,
+        kind: .meeting,
+        createdAt: Date(timeIntervalSince1970: 1_786_616_000),
+        updatedAt: Date(timeIntervalSince1970: 1_786_616_100),
+        title: "Synthetic migration",
+        text: "Allowlisted transcript",
+        rawText: "PRIVATE-LEGACY-RAW",
+        audioRelativePath: "PRIVATE-LEGACY-AUDIO.caf"
+    )
+    let fullRecordBody = try JSONEncoder().encode(record)
+    let currentBody = try MeetingWebhook.payload(for: record)
+    record.webhookDeliveries = [
+        WebhookDelivery(
+            id: nilID,
+            destination: destination,
+            state: .pending,
+            payloadBody: nil,
+            retryable: true
+        ),
+        WebhookDelivery(
+            id: privateID,
+            destination: destination,
+            state: .failed,
+            payloadBody: fullRecordBody,
+            retryable: true,
+            nextAttemptAt: now.addingTimeInterval(-1)
+        ),
+        WebhookDelivery(
+            id: currentID,
+            destination: destination,
+            state: .failed,
+            payloadBody: currentBody,
+            retryable: true,
+            nextAttemptAt: now.addingTimeInterval(-1)
+        ),
+    ]
+
+    let transactions = WebhookOutboxTransactions()
+    let automatic = transactions.automaticRetryDeliveries(
+        records: [record],
+        destination: destination,
+        at: now
+    )
+    try require(automatic == [WebhookDeliveryReference(recordID: record.id, deliveryID: currentID)], "automatic retry included a nil or legacy payload")
+
+    let retired = transactions.retireUnsupportedPayloads(records: [record], at: now)
+    let migrated = try unwrapped(retired.first, "legacy webhook migration did not produce a record")
+    let migratedNil = try unwrapped(migrated.webhookDeliveries.first(where: { $0.id == nilID }), "nil legacy row disappeared")
+    let migratedPrivate = try unwrapped(migrated.webhookDeliveries.first(where: { $0.id == privateID }), "private legacy row disappeared")
+    let migratedCurrent = try unwrapped(migrated.webhookDeliveries.first(where: { $0.id == currentID }), "current row disappeared")
+    for delivery in [migratedNil, migratedPrivate] {
+        try require(delivery.state == .cancelled, "legacy webhook row was not terminally retired")
+        try require(!delivery.retryable && delivery.nextAttemptAt == nil, "legacy webhook row remained retryable")
+        try require(delivery.payloadBody == nil, "legacy webhook row retained payload bytes")
+        try require(delivery.requiresExplicitReplacement, "legacy webhook row did not retain an explicit replacement action")
+    }
+    try require(migratedCurrent.state == .failed && migratedCurrent.payloadBody == currentBody, "migration changed a current payload")
+
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("evee-webhook-migration-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    try await store.upsert(migrated)
+    let relaunched = try await store.loadRecords()
+    try require(transactions.retireUnsupportedPayloads(records: relaunched, at: now.addingTimeInterval(30)).isEmpty, "relaunch repeatedly migrated terminal legacy rows")
+    try require(transactions.automaticRetryDeliveries(records: relaunched, destination: destination, at: now).map(\.deliveryID) == [currentID], "relaunch made a legacy row automatically actionable")
+
+    let freshID = UUID(uuidString: "CB3818DB-0648-4198-976A-67259E28E570")!
+    var retrySource = record
+    retrySource.webhookDeliveries = [record.webhookDeliveries[0]]
+    let retry = transactions.prepareManualRetry(
+        records: [retrySource],
+        destination: destination,
+        at: now,
+        makeDeliveryID: { freshID }
+    )
+    let retryRecord = try unwrapped(retry.records.first, "legacy explicit retry did not produce an atomic record update")
+    try require(retryRecord.webhookDeliveries.count == 2, "legacy explicit retry did not keep the terminal audit row")
+    let retiredOld = try unwrapped(retryRecord.webhookDeliveries.first(where: { $0.id == nilID }), "legacy explicit retry rewrote the old identifier")
+    let fresh = try unwrapped(retryRecord.webhookDeliveries.first(where: { $0.id == freshID }), "legacy explicit retry did not create a fresh identifier")
+    try require(retiredOld.state == .cancelled && retiredOld.payloadBody == nil && !retiredOld.retryable && !retiredOld.requiresExplicitReplacement, "legacy explicit retry did not terminally retire the old row")
+    try require(fresh.state == .pending && fresh.retryable, "legacy explicit retry did not create an actionable row")
+    let expectedFreshBody = try MeetingWebhook.payload(for: retrySource)
+    try require(fresh.payloadBody == expectedFreshBody, "legacy explicit retry did not queue exact allowlisted bytes")
+    try require(retry.deliveries == [WebhookDeliveryReference(recordID: retrySource.id, deliveryID: freshID)], "legacy explicit retry dispatched the old identifier")
+
+    let persistence = await transactions.persistAll(retry.records) { proposed in
+        try await store.upsert(proposed)
+    }
+    try require(persistence.failures.isEmpty, "legacy retry atomic snapshot failed to persist")
+    let persisted = try await store.record(id: retrySource.id)
+    try require(persisted?.webhookDeliveries.map(\.id) == [nilID, freshID], "legacy retry transitions were not persisted together")
+
+    print("webhook-legacy: passed")
+}
+
+@MainActor
+private func checkTerminationCheckpoint() async throws {
+    let gate = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    let successfulCheckpoint = SyntheticTerminationCheckpoint {
+        var iterator = gate.stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
+    let replies = LockedValues<Bool>()
+    let failures = LockedValues<String>()
+    let coordinator = ApplicationTerminationCoordinator()
+
+    let first = coordinator.requestTermination(
+        checkpoint: successfulCheckpoint,
+        reply: { value in replies.append(value) },
+        reportFailure: { error in failures.append(error.localizedDescription) }
+    )
+    let repeated = coordinator.requestTermination(
+        checkpoint: successfulCheckpoint,
+        reply: { value in replies.append(value) },
+        reportFailure: { error in failures.append(error.localizedDescription) }
+    )
+    try require(first == .terminateLater && repeated == .terminateLater, "quit did not wait for the durable checkpoint")
+    await Task.yield()
+    try require(successfulCheckpoint.callCount == 1, "repeated quit started more than one checkpoint")
+    gate.continuation.yield(())
+    gate.continuation.finish()
+    let replyDeadline = Date().addingTimeInterval(1)
+    while replies.values.isEmpty, Date() < replyDeadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    try require(replies.values == [true], "successful persistence checkpoint did not reply exactly once")
+    try require(successfulCheckpoint.callCount == 1, "successful checkpoint ran more than once")
+    try require(failures.values.isEmpty, "successful checkpoint reported a failure")
+
+    let persistenceFailure = SyntheticTerminationCheckpoint {
+        throw SyntheticWebhookPersistenceError.rejected
+    }
+    let failedReplies = LockedValues<Bool>()
+    let reportedFailures = LockedValues<String>()
+    let failedCoordinator = ApplicationTerminationCoordinator()
+    let failedDecision = failedCoordinator.requestTermination(
+        checkpoint: persistenceFailure,
+        reply: { value in failedReplies.append(value) },
+        reportFailure: { error in reportedFailures.append(error.localizedDescription) }
+    )
+    try require(failedDecision == .terminateLater, "failing persistence checkpoint did not hold termination")
+    let failedReplyDeadline = Date().addingTimeInterval(1)
+    while failedReplies.values.isEmpty, Date() < failedReplyDeadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try await Task.sleep(for: .milliseconds(20))
+    try require(failedReplies.values == [false], "persistence failure did not cancel termination exactly once")
+    try require(persistenceFailure.callCount == 1, "failing persistence checkpoint ran more than once")
+    try require(reportedFailures.values.count == 1, "persistence failure was not surfaced exactly once")
+
+    print("termination-checkpoint: passed")
+}
+
 private func checkWebhookTransactions() async throws {
     let queueRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: queueRoot) }
     let queueStore = LibraryStore(rootURL: queueRoot)
     let queueTransactions = WebhookOutboxTransactions()
     var queuedRecord = WorkspaceRecord(kind: .meeting, title: "Queue race", text: "Synthetic")
+    let queuedPayload = try MeetingWebhook.payload(for: queuedRecord)
     let queuedDelivery = WebhookDelivery(
         id: UUID(uuidString: "57CBE526-0514-48B0-9C18-42EE74653CA5")!,
         destination: "https://example.invalid/webhook",
-        payloadBody: Data("{\"queued\":true}".utf8)
+        payloadBody: queuedPayload
     )
     queuedRecord.webhookDeliveries = [queuedDelivery]
     let queueToken = queueTransactions.beginPreparation()
@@ -392,12 +647,13 @@ private func checkWebhookTransactions() async throws {
     let retryDeliveryID = UUID(uuidString: "546290F6-C799-4967-AC9C-B6CAF86726D7")!
     let destination = "https://example.invalid/webhook"
     var failedRecord = WorkspaceRecord(kind: .meeting, title: "Retry race", text: "Synthetic")
+    let retryPayload = try MeetingWebhook.payload(for: failedRecord)
     failedRecord.webhookDeliveries = [WebhookDelivery(
         id: retryDeliveryID,
         destination: destination,
         state: .failed,
         attemptCount: 1,
-        payloadBody: Data("{\"retry\":true}".utf8),
+        payloadBody: retryPayload,
         retryable: true,
         nextAttemptAt: .now
     )]
@@ -884,6 +1140,51 @@ private func checkAPIPublicErrors() async throws {
     try require(responseText.contains("\"error\":\"Internal server error\""), "500 response did not use fixed public text")
     try require(!responseText.contains(root.path), "500 response exposed a storage path")
 
+    let validationRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-api-parameters-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: validationRoot) }
+    let validationStore = LibraryStore(rootURL: validationRoot)
+    try await validationStore.upsert(WorkspaceRecord(
+        kind: .meeting,
+        title: "Synthetic parameter record",
+        text: "parameter sentinel"
+    ))
+    let validationServer = LocalAPIServer(
+        store: validationStore,
+        secretStore: MemorySecretStore(value: "parameter-token")
+    )
+    defer { validationServer.stop() }
+    let validationCredentials = try await validationServer.startWithCredentials(port: try availablePort())
+
+    func parameterResponse(for target: String) async throws -> String {
+        let connection = try await connect(
+            to: validationCredentials,
+            label: "com.tumcuctom.evee.core-checks.parameters.\(UUID().uuidString)"
+        )
+        defer { connection.cancel() }
+        let request = "GET \(target) HTTP/1.1\r\nAuthorization: Bearer \(validationCredentials.token)\r\n\r\n"
+        try await send(Data(request.utf8), on: connection)
+        let data = try await withTimeout(seconds: 2, onTimeout: { connection.cancel() }) {
+            await receiveAll(on: connection)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    for target in [
+        "/v1/records?q=parameter&kind=unknown",
+        "/v1/records?q=parameter&limit=many",
+        "/v1/records?q=parameter&limit=0",
+        "/v1/records?q=parameter&limit=201",
+    ] {
+        let malformed = try await parameterResponse(for: target)
+        try require(malformed.contains("400 Bad Request"), "malformed supplied API filter did not return 400: \(target)")
+        try require(!malformed.contains("parameter sentinel"), "malformed supplied API filter broadened into workspace records")
+    }
+    let defaulted = try await parameterResponse(for: "/v1/records?q=parameter")
+    try require(defaulted.contains("200 OK") && defaulted.contains("parameter sentinel"), "absent API filters did not retain valid defaults")
+    let valid = try await parameterResponse(for: "/v1/records?q=parameter&kind=meeting&limit=1")
+    try require(valid.contains("200 OK") && valid.contains("parameter sentinel"), "valid supplied API filters were rejected")
+
     print("api-public-errors: passed")
 }
 
@@ -1030,7 +1331,7 @@ private func checkMCPRevocation() async throws {
     let manualConfiguration = home.appendingPathComponent(".manual/mcp.json")
     try FileManager.default.createDirectory(at: selectedConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: manualConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let selectedOriginal = Data("{\"theme\":\"dark\",\"mcpServers\":{\"evee\":{\"command\":\"prior\",\"args\":[\"keep\"]},\"other\":{\"command\":\"other\"}}}".utf8)
+    let selectedOriginal = Data("{\"theme\":\"dark\",\"mcpServers\":{\"other\":{\"command\":\"other\"}}}".utf8)
     let manualOriginal = Data("{\"mcpServers\":{\"evee\":{\"command\":\"manual\"}}}".utf8)
     try selectedOriginal.write(to: selectedConfiguration)
     try manualOriginal.write(to: manualConfiguration)
@@ -1045,7 +1346,7 @@ private func checkMCPRevocation() async throws {
             try require(settings.mcpEnabled, "enable persisted disabled authorization")
         }
     )
-    try require(ownedResults.count == 1 && ownedResults[0].replacedExistingRegistration, "selected pre-existing registration was not recorded")
+    try require(ownedResults.count == 1 && !ownedResults[0].replacedExistingRegistration, "selected absent registration was not recorded")
     accessSettings.mcpEnabled = true
     let ownedRevocation = try await MCPOwnedRegistration.revoke(
         allowedRootURLs: [home],
@@ -1058,7 +1359,7 @@ private func checkMCPRevocation() async throws {
     try require(ownedRevocation.cleanupFailures.isEmpty, "selected registration cleanup failed")
     let selectedRestored = try Data(contentsOf: selectedConfiguration)
     let manualRestored = try Data(contentsOf: manualConfiguration)
-    try require(selectedRestored == selectedOriginal, "selected pre-existing registration was not restored exactly")
+    try require(selectedRestored == selectedOriginal, "selected configuration was not restored exactly")
     try require(manualRestored == manualOriginal, "unselected markerless registration was changed")
     try require(!FileManager.default.fileExists(atPath: MCPOwnedRegistration.manifestURL(storageRootURL: registrationRoot).path), "owned manifest remained after successful revoke")
 
@@ -1228,7 +1529,7 @@ private func checkMCPRevocation() async throws {
 
     let concurrentEditConfiguration = home.appendingPathComponent(".concurrent/mcp.json")
     try FileManager.default.createDirectory(at: concurrentEditConfiguration.deletingLastPathComponent(), withIntermediateDirectories: true)
-    let concurrentBefore = Data("{\"display\":\"compact\",\"mcpServers\":{\"evee\":{\"command\":\"prior\",\"args\":[\"restore\"]},\"other\":{\"command\":\"before\"}}}".utf8)
+    let concurrentBefore = Data("{\"display\":\"compact\",\"mcpServers\":{\"other\":{\"command\":\"before\"}}}".utf8)
     try concurrentBefore.write(to: concurrentEditConfiguration)
     _ = try await MCPOwnedRegistration.enable(
         clients: [MCPClientConfiguration(name: "Concurrent edits", configurationURL: concurrentEditConfiguration)],
@@ -1254,10 +1555,9 @@ private func checkMCPRevocation() async throws {
     try require(concurrentRevoke.cleanupFailures.isEmpty, "unrelated concurrent edits caused a cleanup conflict")
     let concurrentRestored = try JSONSerialization.jsonObject(with: Data(contentsOf: concurrentEditConfiguration)) as! [String: Any]
     let concurrentRestoredServers = concurrentRestored["mcpServers"] as! [String: Any]
-    let concurrentRestoredEvee = concurrentRestoredServers["evee"] as! [String: Any]
     try require(concurrentRestored["display"] as? String == "expanded", "revoke discarded an unrelated root edit")
     try require((concurrentRestoredServers["other"] as? [String: Any])?["command"] as? String == "after" && concurrentRestoredServers["new"] != nil, "revoke discarded unrelated server edits")
-    try require(concurrentRestoredEvee["command"] as? String == "prior", "revoke did not restore the selected pre-existing Evee entry")
+    try require(concurrentRestoredServers["evee"] == nil, "revoke left the owned Evee entry")
 
     let concurrentTOMLBefore = "model = \"before\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"
     try Data(concurrentTOMLBefore.utf8).write(to: codexConfiguration)
@@ -2166,6 +2466,132 @@ private func checkMCPRevocation() async throws {
     print("mcp-revocation: passed")
 }
 
+private func checkMCPLegacyRegistrations() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-mcp-legacy-\(UUID().uuidString)", isDirectory: true)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+    let storage = support.appendingPathComponent("Evee", isDirectory: true)
+    let executable = root.appendingPathComponent("Evee.app/Contents/Helpers/evee-mcp")
+    let cursorURL = home.appendingPathComponent(".cursor/mcp.json")
+    let codexURL = home.appendingPathComponent(".codex/config.toml")
+    let windsurfURL = home.appendingPathComponent(".codeium/windsurf/mcp_config.json")
+    let claudeURL = support.appendingPathComponent("Claude/claude_desktop_config.json")
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    for directory in [
+        executable.deletingLastPathComponent(), cursorURL.deletingLastPathComponent(),
+        codexURL.deletingLastPathComponent(), windsurfURL.deletingLastPathComponent(),
+        claudeURL.deletingLastPathComponent(), storage,
+    ] {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    try Data("#!/bin/sh\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+    let cursorOriginal = Data("{\"theme\":\"dark\",\"mcpServers\":{\"evee\":{\"command\":\"\(executable.path)\",\"args\":[]},\"other\":{\"command\":\"other\"}}}".utf8)
+    let codexOriginal = "model = \"synthetic\"\n\n[mcp_servers.evee]\ncommand = \"\(executable.path)\"\nargs = []\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+    let ambiguousOriginal = Data("{\"mcpServers\":{\"evee\":{\"command\":\"\(executable.path)\",\"args\":[\"--manual\"]},\"other\":{\"command\":\"other\"}}}".utf8)
+    let unrelatedOriginal = Data("{\"mcpServers\":{\"other\":{\"command\":\"other\"}},\"theme\":\"paper\"}".utf8)
+    try cursorOriginal.write(to: cursorURL)
+    try Data(codexOriginal.utf8).write(to: codexURL)
+    try ambiguousOriginal.write(to: windsurfURL)
+    try unrelatedOriginal.write(to: claudeURL)
+
+    func inspections() throws -> [String: MCPRegistrationDisposition] {
+        let values = try MCPOwnedRegistration.inspectSupportedClients(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support,
+            storageRootURL: storage,
+            expectedExecutableURL: executable,
+            allowedRootURLs: [home]
+        )
+        return Dictionary(uniqueKeysWithValues: values.map { ($0.client.name, $0.disposition) })
+    }
+
+    let initial = try inspections()
+    try require(initial["Cursor"] == .recognizedLegacy, "exact JSON Evee unit was not recognized as legacy")
+    try require(initial["Codex"] == .recognizedLegacy, "exact TOML Evee unit was not recognized as legacy")
+    try require(initial["Windsurf"] == .ambiguous, "manual JSON Evee unit was not classified as ambiguous")
+    try require(initial["Claude Desktop"] == .unregistered, "unrelated JSON configuration was not classified as unregistered")
+
+    let cursor = MCPClientConfiguration(name: "Cursor", configurationURL: cursorURL)
+    let codex = MCPClientConfiguration(name: "Codex", configurationURL: codexURL)
+    let adopted = try await MCPOwnedRegistration.adoptRecognizedLegacy(
+        clients: [cursor],
+        expectedExecutableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: storage,
+        settings: EveeSettings(),
+        saveSettings: { settings in
+            try require(settings.mcpEnabled, "legacy adoption did not enable authorization transactionally")
+        }
+    )
+    try require(adopted.count == 1 && adopted[0].configurationURL == cursorURL, "legacy adoption changed an unselected client")
+    let adoptedInspections = try inspections()
+    let codexAfterAdopt = try Data(contentsOf: codexURL)
+    let ambiguousAfterAdopt = try Data(contentsOf: windsurfURL)
+    try require(adoptedInspections["Cursor"] == .ownedCurrent, "adopted JSON unit was not classified as owned/current")
+    try require(codexAfterAdopt == Data(codexOriginal.utf8), "JSON adoption changed the unselected TOML client")
+    try require(ambiguousAfterAdopt == ambiguousOriginal, "legacy scan/adoption mutated an ambiguous client")
+
+    var enabled = EveeSettings()
+    enabled.mcpEnabled = true
+    let revoked = try await MCPOwnedRegistration.revoke(
+        allowedRootURLs: [home],
+        storageRootURL: storage,
+        settings: enabled,
+        saveSettings: { settings in try require(!settings.mcpEnabled, "adopted revoke did not disable authorization first") }
+    )
+    try require(revoked.cleanupFailures.isEmpty, "adopted JSON revoke failed")
+    let revokedJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: cursorURL)) as! [String: Any]
+    let revokedServers = revokedJSON["mcpServers"] as! [String: Any]
+    try require(revokedServers["evee"] == nil, "revoke restored the pre-hardening JSON Evee unit")
+    try require(revokedServers["other"] != nil && revokedJSON["theme"] as? String == "dark", "adopted JSON revoke changed unrelated configuration")
+
+    let removed = try await MCPOwnedRegistration.removeRecognizedLegacy(
+        clients: [codex],
+        expectedExecutableURL: executable,
+        allowedRootURLs: [home],
+        storageRootURL: storage,
+        settings: EveeSettings(),
+        saveSettings: { settings in try require(!settings.mcpEnabled, "legacy removal did not confirm disabled authorization before mutation") }
+    )
+    try require(removed.cleanupFailures.isEmpty && removed.removals.map(\.configurationURL) == [codexURL], "selected TOML legacy unit was not removed")
+    let removedCodex = String(decoding: try Data(contentsOf: codexURL), as: UTF8.self)
+    try require(!removedCodex.contains("mcp_servers.evee"), "TOML legacy removal left the Evee unit")
+    try require(removedCodex.contains("model = \"synthetic\"") && removedCodex.contains("mcp_servers.other"), "TOML legacy removal changed unrelated configuration")
+    let ambiguousAfterRemoval = try Data(contentsOf: windsurfURL)
+    try require(ambiguousAfterRemoval == ambiguousOriginal, "legacy removal mutated an ambiguous client")
+
+    let saveFailureOriginal = Data("{\"mcpServers\":{\"evee\":{\"command\":\"\(executable.path)\",\"args\":[]},\"other\":{\"command\":\"other\"}}}".utf8)
+    try saveFailureOriginal.write(to: claudeURL)
+    let claude = MCPClientConfiguration(name: "Claude Desktop", configurationURL: claudeURL)
+    do {
+        _ = try await MCPOwnedRegistration.adoptRecognizedLegacy(
+            clients: [claude],
+            expectedExecutableURL: executable,
+            allowedRootURLs: [home],
+            storageRootURL: storage,
+            settings: EveeSettings(),
+            saveSettings: { settings in
+                if settings.mcpEnabled { throw SyntheticMCPPersistenceError.rejected }
+            }
+        )
+        throw CoreCheckError.assertionFailed("legacy adoption ignored authorization save failure")
+    } catch SyntheticMCPPersistenceError.rejected {
+        // Expected: fail-closed reversal removes the adopted unit rather than
+        // restoring a pre-hardening Evee entry.
+    }
+    let failedAdoptionJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: claudeURL)) as! [String: Any]
+    let failedAdoptionServers = failedAdoptionJSON["mcpServers"] as! [String: Any]
+    try require(failedAdoptionServers["evee"] == nil, "adoption save failure restored a pre-hardening Evee unit")
+    try require(failedAdoptionServers["other"] != nil, "adoption save failure changed unrelated JSON configuration")
+
+    print("mcp-legacy: passed")
+}
+
 let arguments = CommandLine.arguments.dropFirst()
 if arguments == ["--filter", "context-policy"] {
     checkContextPolicy()
@@ -2187,13 +2613,21 @@ if arguments == ["--filter", "context-policy"] {
     try await checkMCPPublicOutput()
 } else if arguments == ["--filter", "mcp-revocation"] {
     try await checkMCPRevocation()
+} else if arguments == ["--filter", "mcp-legacy"] {
+    try await checkMCPLegacyRegistrations()
 } else if arguments == ["--filter", "webhook-generation"] {
     try await checkWebhookGeneration()
 } else if arguments == ["--filter", "webhook-signature"] {
     try checkWebhookSignature()
+} else if arguments == ["--filter", "webhook-payload"] {
+    try checkWebhookPayload()
+} else if arguments == ["--filter", "webhook-legacy"] {
+    try await checkWebhookLegacyRows()
+} else if arguments == ["--filter", "termination-checkpoint"] {
+    try await checkTerminationCheckpoint()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|webhook-generation|webhook-signature|webhook-transactions>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint>\n", stderr)
     exit(EXIT_FAILURE)
 }

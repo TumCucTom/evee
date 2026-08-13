@@ -7,6 +7,7 @@ import SwiftUI
 @main
 struct EveeApp: App {
     @StateObject private var store = AppStore()
+    @NSApplicationDelegateAdaptor(EveeApplicationDelegate.self) private var applicationDelegate
 
     init() {
         guard CommandLine.arguments.contains("--installation-self-test") else { return }
@@ -28,6 +29,7 @@ struct EveeApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 920, minHeight: 620)
                 .background(CaptureOverlayInstaller().environmentObject(store))
+                .onAppear { applicationDelegate.checkpoint = store }
                 .task {
                     WorkspaceIntelligenceRuntime.shared.start()
                     await store.bootstrap()
@@ -52,6 +54,40 @@ struct EveeApp: App {
         case .transcribing, .delivering: "ellipsis.circle"
         default: "waveform.circle"
         }
+    }
+}
+
+@MainActor
+private final class EveeApplicationDelegate: NSObject, NSApplicationDelegate {
+    weak var checkpoint: (any ApplicationTerminationCheckpoint)?
+    private let termination = ApplicationTerminationCoordinator()
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let checkpoint else {
+            presentFailure("Evee is still preparing its shutdown checkpoint. Wait a moment, then quit again.")
+            return .terminateCancel
+        }
+        _ = termination.requestTermination(
+            checkpoint: checkpoint,
+            reply: { shouldTerminate in
+                sender.reply(toApplicationShouldTerminate: shouldTerminate)
+            },
+            reportFailure: { [weak self, weak checkpoint] error in
+                (checkpoint as? AppStore)?.reportApplicationTerminationCheckpointFailure(error)
+                self?.presentFailure("Evee could not save its webhook cancellation state. Check available disk space and file permissions, then quit again.\n\n\(error.localizedDescription)")
+            }
+        )
+        return .terminateLater
+    }
+
+    private func presentFailure(_ message: String) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Evee stayed open to protect your data"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }
 

@@ -11,7 +11,7 @@ struct SettingsView: View {
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
     @State private var integrationMessage: String?
-    @State private var detectedMCPClients: [MCPClientConfiguration] = []
+    @State private var mcpInspections: [MCPClientRegistrationInspection] = []
     @State private var selectedMCPClientIDs: Set<String> = []
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newLinkPhrase = ""
@@ -243,21 +243,33 @@ struct SettingsView: View {
                 Text("Local helper access lets the selected apps search your Evee workspace. It is off by default and can be revoked at any time without changing unrelated client settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if detectedMCPClients.isEmpty {
+                if mcpInspections.isEmpty {
                     Text("No supported local clients were detected. Evee will not create a fallback configuration.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(detectedMCPClients) { client in
-                        Toggle(isOn: mcpSelectionBinding(for: client)) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(client.name)
-                                Text(client.configurationURL.path)
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
+                    ForEach(mcpInspections) { inspection in
+                        HStack(alignment: .top) {
+                            if inspection.disposition == .unregistered {
+                                Toggle(isOn: mcpSelectionBinding(for: inspection.client)) {
+                                    mcpClientLabel(inspection)
+                                }
+                                .disabled(store.settings.mcpEnabled)
+                            } else {
+                                mcpClientLabel(inspection)
+                            }
+                            Spacer()
+                            if !store.settings.mcpEnabled, inspection.disposition == .recognizedLegacy {
+                                Button("Adopt") {
+                                    Task { await adoptMCP(inspection.client) }
+                                }
+                                .accessibilityLabel("Adopt existing Evee registration for \(inspection.client.name)")
+                                Button("Remove", role: .destructive) {
+                                    Task { await removeLegacyMCP(inspection.client) }
+                                }
+                                .accessibilityLabel("Remove existing Evee registration from \(inspection.client.name)")
                             }
                         }
-                        .disabled(store.settings.mcpEnabled)
                     }
                 }
                 HStack {
@@ -321,7 +333,7 @@ struct SettingsView: View {
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()
-            refreshMCPClients()
+            await refreshMCPClients()
         }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
@@ -373,9 +385,47 @@ struct SettingsView: View {
         selectedModelReady = (try? TranscriberFactory.make(store.settings.model).isDownloaded) == true
     }
 
-    private func refreshMCPClients() {
-        detectedMCPClients = MCPRegistration.detectedClients()
-        selectedMCPClientIDs = Set(detectedMCPClients.map(\.id))
+    private func refreshMCPClients() async {
+        do {
+            mcpInspections = try await store.inspectLocalHelperClients()
+            selectedMCPClientIDs = Set(
+                mcpInspections
+                    .filter { $0.disposition == .unregistered }
+                    .map(\.client.id)
+            )
+        } catch {
+            mcpInspections = []
+            selectedMCPClientIDs = []
+            integrationMessage = "Client registration scan failed without changing any configuration: \(error.localizedDescription)"
+        }
+    }
+
+    @ViewBuilder
+    private func mcpClientLabel(_ inspection: MCPClientRegistrationInspection) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(inspection.client.name)
+            Text(inspection.client.configurationURL.path)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            switch inspection.disposition {
+            case .unregistered:
+                Text("No Evee entry")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .ownedCurrent:
+                Text("Owned Evee registration")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            case .recognizedLegacy:
+                Text("Existing Evee entry — adopt it or remove it")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .ambiguous:
+                Text("Manual or ambiguous Evee entry — review this file manually")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
     }
 
     private func mcpSelectionBinding(for client: MCPClientConfiguration) -> Binding<Bool> {
@@ -397,13 +447,37 @@ struct SettingsView: View {
             integrationMessage = "The MCP helper is not bundled in this installation."
             return
         }
-        let selected = detectedMCPClients.filter { selectedMCPClientIDs.contains($0.id) }
+        let selected = mcpInspections
+            .filter { $0.disposition == .unregistered && selectedMCPClientIDs.contains($0.client.id) }
+            .map(\.client)
         guard !selected.isEmpty else { return }
         do {
             let results = try await store.enableLocalHelperAccess(for: selected)
             integrationMessage = "Enabled \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
         } catch {
             integrationMessage = "Registration failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func adoptMCP(_ client: MCPClientConfiguration) async {
+        do {
+            _ = try await store.adoptLegacyLocalHelperAccess(for: [client])
+            integrationMessage = "Adopted the existing Evee entry for \(client.name). Revoking access will remove that entry rather than restore it."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Adoption failed without authorizing the helper: \(error.localizedDescription)"
+        }
+    }
+
+    private func removeLegacyMCP(_ client: MCPClientConfiguration) async {
+        do {
+            let outcome = try await store.removeLegacyLocalHelperRegistrations(for: [client])
+            integrationMessage = outcome.cleanupFailures.isEmpty
+                ? "Removed the recognized Evee entry from \(client.name) and preserved its other settings."
+                : "Local helper access remains disabled, but the client entry needs manual cleanup."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Removal failed without changing an ambiguous entry: \(error.localizedDescription)"
         }
     }
 
@@ -418,12 +492,12 @@ struct SettingsView: View {
             } else if outcome.cleanupFailures.isEmpty, outcome.cleanupWarnings.isEmpty {
                 integrationMessage = removed == 0
                     ? "Local helper access is disabled. No owned client registrations were present."
-                    : "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"). Restart them to disconnect."
+                    : "Local helper access is disabled. Removed \(removed) owned \(removed == 1 ? "client entry" : "client entries"). Restart those clients to disconnect."
             } else {
                 let cleanupCount = outcome.cleanupWarnings.count + outcome.cleanupFailures.count
-                integrationMessage = "Local helper access is disabled. Restored \(removed) \(removed == 1 ? "client" : "clients"); \(cleanupCount) \(cleanupCount == 1 ? "item needs" : "items need") manual cleanup."
+                integrationMessage = "Local helper access is disabled. Removed \(removed) owned \(removed == 1 ? "client entry" : "client entries"); \(cleanupCount) \(cleanupCount == 1 ? "item needs" : "items need") manual cleanup."
             }
-            refreshMCPClients()
+            await refreshMCPClients()
         } catch {
             integrationMessage = store.settings.mcpEnabled
                 ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"

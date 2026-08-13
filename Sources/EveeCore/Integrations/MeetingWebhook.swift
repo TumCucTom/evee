@@ -45,13 +45,56 @@ public enum WebhookPayloadError: LocalizedError, Sendable {
     case empty
     case tooLarge
     case invalidJSON
+    case invalidMeeting
+    case unsupportedSchema
 
     public var errorDescription: String? {
         switch self {
         case .empty: "The webhook payload is empty."
         case .tooLarge: "The webhook payload is too large to queue safely."
         case .invalidJSON: "The webhook payload is not valid JSON."
+        case .invalidMeeting: "Only meeting records can be delivered to the meeting webhook."
+        case .unsupportedSchema: "The queued webhook payload uses an unsupported schema and must be retried explicitly."
         }
+    }
+}
+
+/// The complete and intentionally narrow wire contract for meeting webhooks.
+/// Persistence-only fields must never be added implicitly by encoding a
+/// `WorkspaceRecord` at this boundary.
+public struct MeetingWebhookPayload: Codable, Equatable, Sendable {
+    public static let schemaIdentifier = "evee.meeting.completed"
+    public static let currentVersion = 1
+
+    public let schema: String
+    public let version: Int
+    public let meetingID: UUID
+    public let createdAt: Date
+    public let updatedAt: Date
+    public let title: String
+    public let transcript: String
+    public let sourceApplication: String?
+    public let duration: TimeInterval?
+    public let segments: [TranscriptSegment]
+    public let meetingIntelligence: MeetingIntelligence?
+    public let notes: String
+    public let tags: [String]
+
+    public init(record: WorkspaceRecord) throws {
+        guard record.kind == .meeting else { throw WebhookPayloadError.invalidMeeting }
+        schema = Self.schemaIdentifier
+        version = Self.currentVersion
+        meetingID = record.id
+        createdAt = record.createdAt
+        updatedAt = record.updatedAt
+        title = record.title
+        transcript = record.text
+        sourceApplication = record.sourceApplication
+        duration = record.duration
+        segments = record.segments
+        meetingIntelligence = record.meetingIntelligence
+        notes = record.notes
+        tags = record.tags
     }
 }
 
@@ -101,6 +144,7 @@ public struct MeetingWebhook: Sendable {
             body = try Self.payload(for: record)
         }
         try Self.validatePayload(body)
+        guard Self.isCurrentPayload(body) else { throw WebhookPayloadError.unsupportedSchema }
         let attempts = max(1, min(maxAttempts, 5))
         var delivery = WebhookDelivery(
             id: deliveryID,
@@ -236,12 +280,18 @@ public struct MeetingWebhook: Sendable {
     }
 
     public static func payload(for record: WorkspaceRecord) throws -> Data {
-        var stable = record
-        stable.webhookDeliveries = []
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(stable)
+        return try encoder.encode(MeetingWebhookPayload(record: record))
+    }
+
+    public static func isCurrentPayload(_ body: Data) -> Bool {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let payload = try? decoder.decode(MeetingWebhookPayload.self, from: body) else { return false }
+        return payload.schema == MeetingWebhookPayload.schemaIdentifier
+            && payload.version == MeetingWebhookPayload.currentVersion
     }
 
     public static func validatePayload(_ body: Data) throws {

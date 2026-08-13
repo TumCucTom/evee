@@ -12,7 +12,7 @@ extension KeyboardShortcuts.Name {
 }
 
 @MainActor
-final class AppStore: ObservableObject {
+final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     enum Route: Hashable { case library, meetings, memos, dictionary, settings }
     struct PendingTextDelivery {
         var text: String
@@ -58,7 +58,9 @@ final class AppStore: ObservableObject {
 
     var webhookOutboxCount: Int {
         records.reduce(into: 0) { count, record in
-            count += record.webhookDeliveries.filter { $0.state != .delivered && $0.state != .cancelled }.count
+            count += record.webhookDeliveries.filter {
+                ($0.state != .delivered && $0.state != .cancelled) || $0.requiresExplicitReplacement
+            }.count
         }
     }
 
@@ -95,7 +97,6 @@ final class AppStore: ObservableObject {
     private let webhookOutboxTransactions: WebhookOutboxTransactions
     private let webhookOutboxCoordinator: WebhookOutboxCoordinator
     private var configuredWebhookDestination: String?
-    private var terminationObserver: NSObjectProtocol?
     private var pendingWebhookTerminationRecords: [WorkspaceRecord] = []
     private var liveMeetingTranscriber: LiveMeetingTranscriber?
     private var liveMeetingUpdateTask: Task<Void, Never>?
@@ -208,15 +209,6 @@ final class AppStore: ObservableObject {
                 }
             }
         }
-        terminationObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.invalidateWebhookOutboxForTermination()
-            }
-        }
     }
 
     var filteredRecords: [WorkspaceRecord] {
@@ -302,6 +294,7 @@ final class AppStore: ObservableObject {
                 _ = try await library.purgeRecords(olderThan: cutoff)
             }
             records = try await library.loadRecords().sorted { $0.createdAt > $1.createdAt }
+            await retireUnsupportedWebhookPayloads()
             try await library.reconcileAudioStorage()
             if let draft = try await library.loadMeetingDraft() {
                 suppressDraftAutosave = true
@@ -397,6 +390,44 @@ final class AppStore: ObservableObject {
         guard !results.isEmpty else { return [] }
         settings.mcpEnabled = true
         return results
+    }
+
+    func inspectLocalHelperClients() async throws -> [MCPClientRegistrationInspection] {
+        let rootURL = await library.rootURL
+        return try MCPOwnedRegistration.inspectSupportedClients(
+            storageRootURL: rootURL,
+            expectedExecutableURL: MCPRegistration.bundledExecutableURL(),
+            allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser]
+        )
+    }
+
+    func adoptLegacyLocalHelperAccess(for clients: [MCPClientConfiguration]) async throws -> [MCPRegistrationResult] {
+        let rootURL = await library.rootURL
+        let results = try await MCPOwnedRegistration.adoptRecognizedLegacy(
+            clients: clients,
+            expectedExecutableURL: MCPRegistration.bundledExecutableURL(),
+            allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+            storageRootURL: rootURL,
+            settings: settings,
+            saveSettings: { [library] settings in try await library.save(settings) }
+        )
+        guard !results.isEmpty else { return [] }
+        settings.mcpEnabled = true
+        return results
+    }
+
+    func removeLegacyLocalHelperRegistrations(for clients: [MCPClientConfiguration]) async throws -> MCPRevocationOutcome {
+        let rootURL = await library.rootURL
+        let outcome = try await MCPOwnedRegistration.removeRecognizedLegacy(
+            clients: clients,
+            expectedExecutableURL: MCPRegistration.bundledExecutableURL(),
+            allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+            storageRootURL: rootURL,
+            settings: settings,
+            saveSettings: { [library] settings in try await library.save(settings) }
+        )
+        if outcome.authorizationDisabled { settings.mcpEnabled = false }
+        return outcome
     }
 
     func revokeLocalHelperAccess() async throws -> MCPRevocationOutcome {
@@ -1476,6 +1507,7 @@ final class AppStore: ObservableObject {
             guard existing.retryable,
                   existing.state == .pending || existing.state == .failed,
                   let payloadBody = existing.payloadBody,
+                  MeetingWebhook.isCurrentPayload(payloadBody),
                   let configured = normalizedWebhookDestination(settings.webhookURL),
                   existing.destination == configured,
                   let destination = URL(string: existing.destination) else { return }
@@ -1560,20 +1592,18 @@ final class AppStore: ObservableObject {
     }
 
     private func retryPendingWebhookDeliveries() async {
-        guard normalizedWebhookDestination(settings.webhookURL) != nil else { return }
+        guard let destination = normalizedWebhookDestination(settings.webhookURL) else { return }
         let operation = webhookOutboxTransactions.beginPreparation()
         defer { webhookOutboxTransactions.abandon(operation) }
-        let now = Date.now
-        let queued = records.flatMap { record in
-            record.webhookDeliveries.filter {
-                $0.retryable && ($0.state == .pending || ($0.state == .failed && ($0.nextAttemptAt ?? .distantPast) <= now))
-            }.map { (record.id, $0.id) }
-        }
-        for (recordID, deliveryID) in queued {
+        let queued = webhookOutboxTransactions.automaticRetryDeliveries(
+            records: records,
+            destination: destination
+        )
+        for delivery in queued {
             guard !Task.isCancelled else { return }
             await deliverWebhook(
-                recordID: recordID,
-                deliveryID: deliveryID,
+                recordID: delivery.recordID,
+                deliveryID: delivery.deliveryID,
                 requiringGeneration: operation.generation
             )
         }
@@ -1584,7 +1614,10 @@ final class AppStore: ObservableObject {
         webhookRetryTask?.cancel()
         let nextDate = records
             .flatMap(\.webhookDeliveries)
-            .filter { $0.state == .failed && $0.retryable }
+            .filter {
+                $0.state == .failed && $0.retryable &&
+                    $0.payloadBody.map(MeetingWebhook.isCurrentPayload) == true
+            }
             .compactMap(\.nextAttemptAt)
             .min()
         guard let nextDate else { webhookRetryTask = nil; return }
@@ -1725,9 +1758,18 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Task 5's terminate-later checkpoint calls this after synchronous
-    /// invalidation. The notification observer deliberately does not launch or
-    /// claim completion of this durable phase.
+    private func retireUnsupportedWebhookPayloads() async {
+        let retired = webhookOutboxTransactions.retireUnsupportedPayloads(records: records)
+        guard !retired.isEmpty else { return }
+        replaceWebhookRecords(retired)
+        let persistence = await persistWebhookRecords(retired)
+        if !persistence.failures.isEmpty {
+            statusMessage = "Legacy webhook payloads were blocked, but their retired state could not be saved: \(WebhookOutboxPersistenceBatchError(failures: persistence.failures).localizedDescription)"
+        }
+    }
+
+    /// The AppKit terminate-later checkpoint calls this after synchronous
+    /// invalidation and does not reply until these writes complete.
     func persistWebhookOutboxTerminationCancellation() async throws {
         let pending = pendingWebhookTerminationRecords
         let persistence = await persistWebhookRecords(pending)
@@ -1736,6 +1778,15 @@ final class AppStore: ObservableObject {
         guard persistence.failures.isEmpty else {
             throw WebhookOutboxPersistenceBatchError(failures: persistence.failures)
         }
+    }
+
+    func checkpointForApplicationTermination() async throws {
+        invalidateWebhookOutboxForTermination()
+        try await persistWebhookOutboxTerminationCancellation()
+    }
+
+    func reportApplicationTerminationCheckpointFailure(_ error: Error) {
+        statusMessage = "Quit was cancelled because Evee could not durably cancel its webhook outbox. Check available disk space and file permissions, then quit again. \(error.localizedDescription)"
     }
 
     private func invalidateWebhookOutboxForTermination() {

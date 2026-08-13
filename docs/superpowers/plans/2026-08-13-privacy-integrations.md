@@ -38,7 +38,7 @@
 - Produces: `ContextCollectionPolicy`, `TextDelivery.frontmostApplication(policy:)`, and `evee-core-checks --filter context-policy`.
 - Consumers: AppStore dictation/selection startup and later privacy reviews.
 
-- [ ] **Step 1: Add the failing core check and XCTest cases**
+- [x] **Step 1: Add the failing core check and XCTest cases**
 
 ```swift
 let ordinary = ContextCollectionPolicy.ordinaryDictation(
@@ -56,13 +56,13 @@ precondition(transform.collectsSelectedText)
 
 Add an executable target depending only on `EveeCore`. The check runner accepts `--filter context-policy` and exits non-zero on a failed precondition. Mirror these assertions in `ContextTransformTests`.
 
-- [ ] **Step 2: Run the red check**
+- [x] **Step 2: Run the red check**
 
 Run: `swift run evee-core-checks --filter context-policy`
 
 Expected: FAIL at compile time because `ContextCollectionPolicy` does not exist.
 
-- [ ] **Step 3: Implement the policy and gated AX reads**
+- [x] **Step 3: Implement the policy and gated AX reads**
 
 ```swift
 public struct ContextCollectionPolicy: Equatable, Sendable {
@@ -77,7 +77,7 @@ public struct ContextCollectionPolicy: Equatable, Sendable {
 
 Change `frontmostApplication` so it performs each `AXUIElementCopyAttributeValue` call only when the matching policy field is true. Ordinary dictation collects process/bundle/focused-element identity and role only. Selection transformation explicitly collects selected text. AppStore constructs policy from the operation and settings.
 
-- [ ] **Step 4: Run green checks and inspect call sites**
+- [x] **Step 4: Run green checks and inspect call sites**
 
 Run: `swift run evee-core-checks --filter context-policy`
 
@@ -87,7 +87,7 @@ Run: `rg -n 'frontmostApplication\(' Sources Tests`
 
 Expected: every call supplies a named `policy:` argument.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Package.swift Tests/EveeCoreChecks/main.swift Tests/EveeCoreTests/ContextTransformTests.swift Sources/EveeCore/Delivery/ContextCollectionPolicy.swift Sources/EveeCore/Delivery/TextDelivery.swift Sources/EveeApp/AppStore.swift
@@ -107,7 +107,7 @@ git commit -m "Enforce context collection policy"
 - Consumes: `LibraryStore(rootURL:)` and `WorkspaceRecord`.
 - Produces: `PublicWorkspaceRecord.init(_:)`, revocable connection generations, bounded connections, and header deadlines.
 
-- [ ] **Step 1: Add failing public-response and socket checks**
+- [x] **Step 1: Add failing public-response and socket checks**
 
 ```swift
 let privateRecord = WorkspaceRecord(
@@ -126,7 +126,7 @@ precondition(!json.contains("Private raw"))
 
 Add an async socket scenario that connects, sends half an authenticated header, calls `server.stop()`, sends the remainder, and requires EOF without `Visible` in the response.
 
-- [ ] **Step 2: Run the red checks**
+- [x] **Step 2: Run the red checks**
 
 Run: `swift run evee-core-checks --filter public-record`
 
@@ -136,7 +136,7 @@ Run: `swift run evee-core-checks --filter api-revoke`
 
 Expected: FAIL because the accepted connection remains live.
 
-- [ ] **Step 3: Implement explicit DTOs and connection ownership**
+- [x] **Step 3: Implement explicit DTOs and connection ownership**
 
 ```swift
 public struct PublicWorkspaceRecord: Codable, Sendable {
@@ -158,7 +158,7 @@ public struct PublicWorkspaceRecord: Codable, Sendable {
 
 Track `[ObjectIdentifier: NWConnection]`, an `accessGeneration`, a maximum of 32 connections, and a five-second header deadline under `stateLock`. `stop`, rotation, and revocation increment the generation and cancel the detached registry. Every callback checks generation before reading the store or sending. Clear the in-memory token on stop. Retry legacy token-file deletion after every successful Keychain read.
 
-- [ ] **Step 4: Run focused checks**
+- [x] **Step 4: Run focused checks**
 
 Run: `swift run evee-core-checks --filter public-record`
 
@@ -172,7 +172,7 @@ Run: `swift run evee-core-checks --filter api-limits`
 
 Expected: PASS for timeout and connection-cap scenarios.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Sources/EveeCore/Integrations/PublicWorkspaceRecord.swift Sources/EveeCore/Integrations/LocalAPIServer.swift Sources/EveeMCP/main.swift Tests/EveeCoreChecks/main.swift Tests/EveeCoreTests/LocalAPIServerTests.swift
@@ -194,7 +194,7 @@ git commit -m "Revoke loopback API access completely"
 - Produces: actor `WebhookOutboxCoordinator`, `WebhookDispatchToken`, canonical signature input, and terminal cancellation.
 - Consumers: AppStore initial delivery, scheduled retry, manual retry, settings save, and termination.
 
-- [ ] **Step 1: Add failing generation and signature checks**
+- [x] **Step 1: Add failing generation and signature checks**
 
 ```swift
 let coordinator = WebhookOutboxCoordinator()
@@ -221,7 +221,7 @@ precondition(first != changedID)
 
 Add XCTest coverage with a suspended `URLProtocol` task: cancel the outbox, release the response, and assert stored state remains cancelled.
 
-- [ ] **Step 2: Run red checks**
+- [x] **Step 2: Run red checks**
 
 Run: `swift run evee-core-checks --filter webhook-generation`
 
@@ -231,7 +231,7 @@ Run: `swift run evee-core-checks --filter webhook-signature`
 
 Expected: FAIL because the current signature authenticates only the body.
 
-- [ ] **Step 3: Implement coordinator and canonical signatures**
+- [x] **Step 3: Implement coordinator and canonical signatures**
 
 ```swift
 public struct WebhookDispatchToken: Hashable, Sendable {
@@ -252,7 +252,7 @@ public actor WebhookOutboxCoordinator {
 
 AppStore routes every send through the coordinator. It commits a receipt or failure only after `mayCommit`. Cancelled rows set `retryable = false`, clear `nextAttemptAt`, and are excluded from `webhookOutboxCount`. Manual retry requires a non-empty valid destination and `.pending`/`.failed` plus `retryable`.
 
-- [ ] **Step 4: Run focused checks**
+- [x] **Step 4: Run focused checks**
 
 Run: `swift run evee-core-checks --filter webhook-generation && swift run evee-core-checks --filter webhook-signature`
 
@@ -262,7 +262,7 @@ Run: `swift build --target EveeCore`
 
 Expected: build completes; unrelated pre-existing warnings are recorded, not hidden.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Sources/EveeCore/Integrations/WebhookOutboxCoordinator.swift Sources/EveeCore/Integrations/MeetingWebhook.swift Sources/EveeApp/AppStore.swift Sources/EveeCore/Models.swift Tests/EveeCoreChecks/main.swift Tests/EveeCoreTests/WebhookOutboxTests.swift Tests/EveeCoreTests/EveeCoreTests.swift
@@ -284,7 +284,7 @@ git commit -m "Own webhook cancellation state"
 - Produces: `EveeSettings.mcpEnabled`, `MCPRegistration.removeConfiguration(at:)`, detected Codex configuration, and helper fail-closed checks.
 - Consumers: Settings integration UI and packaged verifier.
 
-- [ ] **Step 1: Add failing settings and registration checks**
+- [x] **Step 1: Add failing settings and registration checks**
 
 ```swift
 let legacy = try JSONDecoder().decode(EveeSettings.self, from: Data("{}".utf8))
@@ -300,13 +300,13 @@ precondition(servers["other"] != nil)
 
 Add tests that no-client detection returns an empty list and never writes a fallback file.
 
-- [ ] **Step 2: Run red checks**
+- [x] **Step 2: Run red checks**
 
 Run: `swift run evee-core-checks --filter mcp-revocation`
 
 Expected: FAIL because the setting and removal API are absent.
 
-- [ ] **Step 3: Implement transactional registration and fail-closed helper**
+- [x] **Step 3: Implement transactional registration and fail-closed helper**
 
 ```swift
 public struct MCPRemovalResult: Equatable, Sendable {
@@ -319,7 +319,7 @@ Detect supported configurations, including the local Codex configuration path, w
 
 Validate `kind`, `since`, `limit`, and identifiers explicitly. Reuse `PublicWorkspaceRecord` for record responses.
 
-- [ ] **Step 4: Run focused checks and packaged helper smoke**
+- [x] **Step 4: Run focused checks and packaged helper smoke**
 
 Run: `swift run evee-core-checks --filter mcp-revocation`
 
@@ -333,7 +333,7 @@ Run: `CFFIXED_USER_HOME="$(mktemp -d /tmp/evee-mcp-plan.XXXXXX)" scripts/smoke_m
 
 Expected: smoke script seeds enabled synthetic settings and all 11 tools return valid JSON.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Sources/EveeCore/Models.swift Sources/EveeCore/Integrations/MCPRegistration.swift Sources/EveeMCP/main.swift Sources/EveeApp/AppStore.swift Sources/EveeApp/UI/SettingsView.swift Tests/EveeCoreChecks/main.swift Tests/EveeCoreTests/EveeCoreTests.swift scripts/smoke_mcp.sh
@@ -358,12 +358,13 @@ Run: `swift run evee-core-checks`
 Expected: every named core check passes.
 
 Result (2026-08-13): the no-argument invocation exits with usage because the
-runner requires `--filter`; every listed filter was then run on the exact
-workstream head and passed: `context-policy`, `public-record`, `api-revoke`,
-`api-rotate`, `api-limits`, `api-start-races`, `api-revoke-persistence`,
-`api-public-errors`, `mcp-public-output`, `mcp-revocation`,
-`webhook-generation`, `webhook-signature`, and `webhook-transactions`. See the
-Task 5 report for command output.
+runner requires `--filter`; every registered filter was run on the final-review
+tree and passed: `context-policy`, `public-record`, `api-revoke`, `api-rotate`,
+`api-limits`, `api-start-races`, `api-revoke-persistence`, `api-public-errors`,
+`mcp-public-output`, `mcp-revocation`, `mcp-legacy`, `webhook-generation`,
+`webhook-signature`, `webhook-payload`, `webhook-legacy`,
+`webhook-transactions`, and `termination-checkpoint`. See the Task 5 and final
+fix reports for command output.
 
 - [x] **Step 2: Run compiler and protocol validation**
 
@@ -375,8 +376,10 @@ Run: `bash scripts/smoke_mcp.sh`
 
 Expected: protocol smoke passes using isolated synthetic data.
 
-Result (2026-08-13): `EveeCore` and `EveeMCP` built successfully, and the
-script's isolated synthetic-data smoke passed all 11 advertised tools.
+Result (2026-08-13): `EveeCore`, `EveeMCP`, and `EveeApp` built successfully,
+and the script's isolated synthetic-data smoke passed all 11 advertised tools.
+The EveeApp Command Line Tools build used the documented temporary dependency
+preview guard; full XCTest execution remains a full-Xcode gate.
 
 - [x] **Step 3: Update wording and mark only evidenced plan steps**
 
@@ -384,7 +387,7 @@ Document that optional content is collected only when enabled, API disable close
 
 - [ ] **Step 4: Scan the complete workstream diff**
 
-Run: `git diff --check df8f21439fbf58d480a24000ccdc5c743257682e...HEAD`
+Run: `git diff --check b2c51662854f3d2e4d97cb8569e41923a9f74146...HEAD`
 
 Run the owner-held restricted-reference policy against the complete tree and proposed commit metadata. The policy itself remains outside the repository.
 

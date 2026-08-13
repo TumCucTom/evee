@@ -81,9 +81,10 @@ final class WebhookOutboxTests: XCTestCase {
         let store = LibraryStore(rootURL: root)
         let transactions = WebhookOutboxTransactions()
         var record = WorkspaceRecord(kind: .meeting, title: "Queue race", text: "Synthetic")
+        let payload = try MeetingWebhook.payload(for: record)
         let delivery = WebhookDelivery(
             destination: "https://example.invalid/webhook",
-            payloadBody: Data("{\"queued\":true}".utf8)
+            payloadBody: payload
         )
         record.webhookDeliveries = [delivery]
         let token = transactions.beginPreparation()
@@ -115,11 +116,12 @@ final class WebhookOutboxTests: XCTestCase {
         let transactions = WebhookOutboxTransactions()
         let destination = "https://example.invalid/webhook"
         var record = WorkspaceRecord(kind: .meeting, title: "Retry race", text: "Synthetic")
+        let payload = try MeetingWebhook.payload(for: record)
         record.webhookDeliveries = [WebhookDelivery(
             destination: destination,
             state: .failed,
             attemptCount: 1,
-            payloadBody: Data("{\"retry\":true}".utf8),
+            payloadBody: payload,
             retryable: true,
             nextAttemptAt: .now
         )]
@@ -153,9 +155,10 @@ final class WebhookOutboxTests: XCTestCase {
         let store = LibraryStore(rootURL: root)
         let transactions = WebhookOutboxTransactions()
         var record = WorkspaceRecord(kind: .meeting, title: "Queue install race", text: "Synthetic")
+        let payload = try MeetingWebhook.payload(for: record)
         record.webhookDeliveries = [WebhookDelivery(
             destination: "https://example.invalid/webhook",
-            payloadBody: Data("{\"queued\":true}".utf8)
+            payloadBody: payload
         )]
         let preparation = transactions.beginPreparation()
         let transaction = await transactions.persistPreparation(
@@ -196,11 +199,12 @@ final class WebhookOutboxTests: XCTestCase {
         let transactions = WebhookOutboxTransactions()
         let destination = "https://example.invalid/webhook"
         var record = WorkspaceRecord(kind: .meeting, title: "Retry install race", text: "Synthetic")
+        let payload = try MeetingWebhook.payload(for: record)
         record.webhookDeliveries = [WebhookDelivery(
             destination: destination,
             state: .failed,
             attemptCount: 1,
-            payloadBody: Data("{\"retry\":true}".utf8),
+            payloadBody: payload,
             retryable: true,
             nextAttemptAt: .now
         )]
@@ -285,7 +289,6 @@ final class WebhookOutboxTests: XCTestCase {
     }
 
     func testLateSuspendedResponseCannotOverwriteTerminalCancellation() async throws {
-        let body = Data("{\"meeting\":\"synthetic\"}".utf8)
         let deliveryID = UUID(uuidString: "19CF6CE4-3841-4CF7-9888-679CC63B3364")!
         let destination = URL(string: "https://example.invalid/webhook")!
         let coordinator = WebhookOutboxCoordinator()
@@ -293,6 +296,7 @@ final class WebhookOutboxTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = LibraryStore(rootURL: root)
         var storedRecord = WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Local test")
+        let body = try MeetingWebhook.payload(for: storedRecord)
         storedRecord.webhookDeliveries = [WebhookDelivery(
             id: deliveryID,
             destination: destination.absoluteString,

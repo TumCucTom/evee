@@ -229,11 +229,13 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
             var changed = false
             for index in record.webhookDeliveries.indices where
                 record.webhookDeliveries[index].state == .pending ||
-                record.webhookDeliveries[index].state == .failed {
+                record.webhookDeliveries[index].state == .failed ||
+                record.webhookDeliveries[index].requiresExplicitReplacement {
                 record.webhookDeliveries[index].state = .cancelled
                 record.webhookDeliveries[index].retryable = false
                 record.webhookDeliveries[index].nextAttemptAt = nil
                 record.webhookDeliveries[index].payloadBody = nil
+                record.webhookDeliveries[index].requiresExplicitReplacement = false
                 record.webhookDeliveries[index].lastError = "Webhook delivery was cancelled."
                 changed = true
             }
@@ -246,31 +248,114 @@ public final class WebhookOutboxTransactions: @unchecked Sendable {
     public func prepareManualRetry(
         records: [WorkspaceRecord],
         destination: String,
-        at date: Date = .now
+        at date: Date = .now,
+        makeDeliveryID: () -> UUID = UUID.init
     ) -> WebhookManualRetryPreparation {
         var preparedRecords: [WorkspaceRecord] = []
         var deliveries: [WebhookDeliveryReference] = []
         for source in records {
             var record = source
             var changed = false
+            var replacements: [WebhookDelivery] = []
             for index in record.webhookDeliveries.indices where
-                record.webhookDeliveries[index].retryable &&
-                (record.webhookDeliveries[index].state == .pending || record.webhookDeliveries[index].state == .failed) &&
                 record.webhookDeliveries[index].destination == destination {
-                record.webhookDeliveries[index].state = .pending
+                let existing = record.webhookDeliveries[index]
+                let ordinaryRetry = existing.retryable &&
+                    (existing.state == .pending || existing.state == .failed)
+                let replacementRetry = existing.requiresExplicitReplacement
+                guard ordinaryRetry || replacementRetry else { continue }
+
+                if let body = existing.payloadBody, MeetingWebhook.isCurrentPayload(body), !replacementRetry {
+                    record.webhookDeliveries[index].state = .pending
+                    record.webhookDeliveries[index].nextAttemptAt = nil
+                    deliveries.append(WebhookDeliveryReference(
+                        recordID: record.id,
+                        deliveryID: existing.id
+                    ))
+                    changed = true
+                    continue
+                }
+
+                record.webhookDeliveries[index].state = .cancelled
+                record.webhookDeliveries[index].retryable = false
                 record.webhookDeliveries[index].nextAttemptAt = nil
+                record.webhookDeliveries[index].payloadBody = nil
+                record.webhookDeliveries[index].requiresExplicitReplacement = false
+                record.webhookDeliveries[index].lastError = "Legacy webhook payload was retired and replaced explicitly."
+                guard let body = try? MeetingWebhook.payload(for: record) else {
+                    changed = true
+                    continue
+                }
+                let replacement = WebhookDelivery(
+                    id: makeDeliveryID(),
+                    destination: destination,
+                    payloadBody: body
+                )
+                replacements.append(replacement)
                 deliveries.append(WebhookDeliveryReference(
                     recordID: record.id,
-                    deliveryID: record.webhookDeliveries[index].id
+                    deliveryID: replacement.id
                 ))
                 changed = true
             }
             if changed {
+                record.webhookDeliveries.append(contentsOf: replacements)
                 record.updatedAt = date
                 preparedRecords.append(record)
             }
         }
         return WebhookManualRetryPreparation(records: preparedRecords, deliveries: deliveries)
+    }
+
+    /// Returns only rows whose immutable bytes use the current allowlisted
+    /// payload contract. Legacy and missing bytes require an explicit
+    /// replacement and are never spun by the automatic scheduler.
+    public func automaticRetryDeliveries(
+        records: [WorkspaceRecord],
+        destination: String,
+        at date: Date = .now
+    ) -> [WebhookDeliveryReference] {
+        records.flatMap { record in
+            record.webhookDeliveries.compactMap { delivery in
+                guard delivery.destination == destination,
+                      delivery.retryable,
+                      delivery.state == .pending ||
+                        (delivery.state == .failed && (delivery.nextAttemptAt ?? .distantPast) <= date),
+                      let body = delivery.payloadBody,
+                      MeetingWebhook.isCurrentPayload(body) else { return nil }
+                return WebhookDeliveryReference(recordID: record.id, deliveryID: delivery.id)
+            }
+        }
+    }
+
+    /// Migrates actionable rows that predate the versioned DTO (including rows
+    /// with no immutable bytes) into a terminal audit row. The replacement is
+    /// deliberately deferred to an explicit user retry, which creates a new
+    /// delivery identifier and fresh allowlisted bytes.
+    public func retireUnsupportedPayloads(
+        records: [WorkspaceRecord],
+        at date: Date = .now
+    ) -> [WorkspaceRecord] {
+        records.compactMap { source in
+            var record = source
+            var changed = false
+            for index in record.webhookDeliveries.indices where
+                record.webhookDeliveries[index].state == .pending ||
+                record.webhookDeliveries[index].state == .failed {
+                let body = record.webhookDeliveries[index].payloadBody
+                guard body.map(MeetingWebhook.isCurrentPayload) != true else { continue }
+                record.webhookDeliveries[index].state = .cancelled
+                record.webhookDeliveries[index].retryable = false
+                record.webhookDeliveries[index].nextAttemptAt = nil
+                record.webhookDeliveries[index].payloadBody = nil
+                record.webhookDeliveries[index].requiresExplicitReplacement = true
+                record.webhookDeliveries[index].lastError = "This legacy webhook payload was retired. Choose Retry now to create a privacy-safe replacement."
+                changed = true
+            }
+            guard changed else { return nil }
+            record.updatedAt = date
+            return record
+        }
     }
 
     public func persistAll(

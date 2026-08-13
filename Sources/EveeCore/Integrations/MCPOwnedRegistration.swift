@@ -32,11 +32,30 @@ public struct MCPRevocationOutcome: Equatable, Sendable {
 
 public typealias MCPRecoveryOutcome = MCPRevocationOutcome
 
+public enum MCPRegistrationDisposition: String, Equatable, Sendable {
+    case unregistered
+    case ownedCurrent
+    case recognizedLegacy
+    case ambiguous
+}
+
+public struct MCPClientRegistrationInspection: Identifiable, Equatable, Sendable {
+    public var id: String { client.id }
+    public let client: MCPClientConfiguration
+    public let disposition: MCPRegistrationDisposition
+
+    public init(client: MCPClientConfiguration, disposition: MCPRegistrationDisposition) {
+        self.client = client
+        self.disposition = disposition
+    }
+}
+
 public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
     case manifestAlreadyExists(URL)
     case invalidManifest(URL)
     case unsafeConfiguration(URL)
     case conflict(URL)
+    case legacyEntryNotRecognized(URL)
     case recoveryRequired([String])
     case rollbackFailed(primary: String, failures: [String])
 
@@ -50,6 +69,8 @@ public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
             return "A selected client configuration no longer resolves to its validated local target."
         case .conflict:
             return "The Evee-owned client entry has a cleanup conflict. It was left unchanged and needs manual cleanup."
+        case .legacyEntryNotRecognized:
+            return "The existing Evee client entry is manual or ambiguous. Review it in the client configuration before enabling local helper access."
         case .recoveryRequired(let failures):
             return "An unfinished local helper transaction needs manual cleanup: \(failures.joined(separator: "; "))"
         case .rollbackFailed(let primary, let failures):
@@ -176,6 +197,261 @@ public enum MCPOwnedRegistration {
 
     public static func journalURL(storageRootURL: URL) -> URL {
         storageRootURL.appendingPathComponent(journalName)
+    }
+
+    public static func inspectSupportedClients(
+        fileManager: FileManager = .default,
+        homeURL: URL? = nil,
+        applicationSupportURL: URL? = nil,
+        storageRootURL: URL,
+        expectedExecutableURL: URL,
+        allowedRootURLs: [URL]
+    ) throws -> [MCPClientRegistrationInspection] {
+        let lease = try MCPAuthorization.sharedLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        let manifestURL = manifestURL(storageRootURL: storageRootURL)
+        let manifest: OwnedRegistrationManifest? = try loadDurableIfPresent(
+            OwnedRegistrationManifest.self,
+            from: manifestURL
+        )
+        if let manifest {
+            try validate(manifest: manifest, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
+        }
+        return try MCPRegistration.detectedClients(
+            fileManager: fileManager,
+            homeURL: homeURL,
+            applicationSupportURL: applicationSupportURL
+        ).map { client in
+            let plan = try AnchoredTarget.plan(
+                selectedURL: client.configurationURL,
+                allowedRootURLs: allowedRootURLs,
+                executableURL: expectedExecutableURL.standardizedFileURL
+            )
+            return MCPClientRegistrationInspection(
+                client: client,
+                disposition: try disposition(
+                    snapshot: plan.snapshot,
+                    manifest: manifest,
+                    expectedExecutableURL: expectedExecutableURL.standardizedFileURL
+                )
+            )
+        }
+    }
+
+    public static func adoptRecognizedLegacy(
+        clients: [MCPClientConfiguration],
+        expectedExecutableURL: URL,
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
+    ) async throws -> [MCPRegistrationResult] {
+        guard !clients.isEmpty else { return [] }
+        let executable = expectedExecutableURL.standardizedFileURL
+        guard FileManager.default.fileExists(atPath: executable.path) else {
+            throw MCPRegistrationError.executableMissing(executable)
+        }
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw MCPRegistrationError.executableNotRunnable(executable)
+        }
+
+        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        let recovery = try await recoverLocked(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: nil
+        )
+        guard recovery.cleanupFailures.isEmpty else {
+            throw MCPOwnedRegistrationError.recoveryRequired(recovery.cleanupFailures.map(\.message))
+        }
+        let manifestURL = manifestURL(storageRootURL: storageRootURL)
+        guard !FileManager.default.fileExists(atPath: manifestURL.path) else {
+            throw MCPOwnedRegistrationError.manifestAlreadyExists(manifestURL)
+        }
+
+        let snapshots = try clients.map { client in
+            let plan = try AnchoredTarget.plan(
+                selectedURL: client.configurationURL,
+                allowedRootURLs: allowedRootURLs,
+                executableURL: executable
+            )
+            guard try disposition(
+                snapshot: plan.snapshot,
+                manifest: nil,
+                expectedExecutableURL: executable
+            ) == .recognizedLegacy else {
+                throw MCPOwnedRegistrationError.legacyEntryNotRecognized(client.configurationURL)
+            }
+            return try adoptedSnapshot(from: plan.snapshot)
+        }
+        guard Set(snapshots.map { $0.rootPath + "/" + $0.targetRelativePath }).count == snapshots.count else {
+            throw MCPOwnedRegistrationError.invalidManifest(manifestURL)
+        }
+
+        var journal = RegistrationTransactionJournal(
+            version: 2,
+            operation: .enable,
+            phase: .clientsMutated,
+            snapshots: snapshots,
+            createdDirectories: [],
+            requiresManifestLoad: false
+        )
+        try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+        do {
+            try writeDurable(
+                OwnedRegistrationManifest(version: 2, snapshots: snapshots, createdDirectories: []),
+                to: manifestURL
+            )
+            journal.phase = .manifestDurable
+            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+            var enabled = settings
+            enabled.mcpEnabled = true
+            try await saveSettings(enabled)
+            journal.phase = .committed
+            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+            try removeDurable(journalURL(storageRootURL: storageRootURL))
+            return clients.map {
+                MCPRegistrationResult(
+                    configurationURL: $0.configurationURL,
+                    executableURL: executable,
+                    replacedExistingRegistration: true
+                )
+            }
+        } catch {
+            let primary = error
+            var disabled = settings
+            disabled.mcpEnabled = false
+            var failures: [String] = []
+            do { try await saveSettings(disabled) } catch {
+                failures.append("Fail-closed authorization restore: \(error.localizedDescription)")
+            }
+            let outcome = try reverseLocked(
+                journal: journal,
+                allowedRootURLs: allowedRootURLs,
+                storageRootURL: storageRootURL,
+                testing: nil
+            )
+            failures.append(contentsOf: outcome.cleanupFailures.map { "\($0.configurationURL.path): \($0.message)" })
+            guard !failures.isEmpty else { throw primary }
+            throw MCPOwnedRegistrationError.rollbackFailed(
+                primary: primary.localizedDescription,
+                failures: failures
+            )
+        }
+    }
+
+    public static func removeRecognizedLegacy(
+        clients: [MCPClientConfiguration],
+        expectedExecutableURL: URL,
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
+    ) async throws -> MCPRevocationOutcome {
+        guard !clients.isEmpty else {
+            return MCPRevocationOutcome(
+                authorizationDisabled: !settings.mcpEnabled,
+                removals: [],
+                cleanupWarnings: [],
+                cleanupFailures: []
+            )
+        }
+        let executable = expectedExecutableURL.standardizedFileURL
+        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        let recovery = try await recoverLocked(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: nil
+        )
+        guard recovery.cleanupFailures.isEmpty else { return recovery }
+        let manifest = manifestURL(storageRootURL: storageRootURL)
+        guard !FileManager.default.fileExists(atPath: manifest.path) else {
+            throw MCPOwnedRegistrationError.manifestAlreadyExists(manifest)
+        }
+        let snapshots = try clients.map { client in
+            let plan = try AnchoredTarget.plan(
+                selectedURL: client.configurationURL,
+                allowedRootURLs: allowedRootURLs,
+                executableURL: executable
+            )
+            guard try disposition(
+                snapshot: plan.snapshot,
+                manifest: nil,
+                expectedExecutableURL: executable
+            ) == .recognizedLegacy else {
+                throw MCPOwnedRegistrationError.legacyEntryNotRecognized(client.configurationURL)
+            }
+            return try adoptedSnapshot(from: plan.snapshot)
+        }
+        let journal = RegistrationTransactionJournal(
+            version: 2,
+            operation: .revoke,
+            phase: .prepared,
+            snapshots: snapshots,
+            createdDirectories: [],
+            requiresManifestLoad: false
+        )
+        let transactionURL = journalURL(storageRootURL: storageRootURL)
+        try writeDurable(journal, to: transactionURL)
+        var disabled = settings
+        disabled.mcpEnabled = false
+        do {
+            try await saveSettings(disabled)
+        } catch {
+            let primary = error
+            try? removeDurable(transactionURL)
+            throw primary
+        }
+        return try reverseLocked(
+            journal: journal,
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            testing: nil
+        )
+    }
+
+    private static func disposition(
+        snapshot: ManagedTargetSnapshot,
+        manifest: OwnedRegistrationManifest?,
+        expectedExecutableURL: URL
+    ) throws -> MCPRegistrationDisposition {
+        if let owned = manifest?.snapshots.first(where: {
+            $0.rootPath == snapshot.rootPath && $0.targetRelativePath == snapshot.targetRelativePath
+        }), snapshot.beforeOwned == owned.afterOwned {
+            return .ownedCurrent
+        }
+        guard let currentOwned = snapshot.beforeOwned else { return .unregistered }
+        return try ConfigurationImage.isRecognizedLegacyOwned(
+            format: snapshot.format,
+            owned: currentOwned,
+            executableURL: expectedExecutableURL
+        ) ? .recognizedLegacy : .ambiguous
+    }
+
+    private static func adoptedSnapshot(from source: ManagedTargetSnapshot) throws -> ManagedTargetSnapshot {
+        guard let currentData = source.beforeData, let currentOwned = source.beforeOwned else {
+            throw MCPOwnedRegistrationError.legacyEntryNotRecognized(source.selectedURL)
+        }
+        var snapshot = source
+        snapshot.beforeData = try ConfigurationImage.reversingOwned(
+            format: source.format,
+            currentData: currentData,
+            beforeOwned: nil,
+            sourceURL: source.selectedURL
+        )
+        snapshot.beforeOwned = nil
+        snapshot.afterData = currentData
+        snapshot.afterOwned = currentOwned
+        snapshot.mutationApplied = true
+        snapshot.mutationState = .complete
+        snapshot.registeredIdentity = source.originalIdentity
+        return snapshot
     }
 
     public static func enable(
@@ -312,6 +588,9 @@ public enum MCPOwnedRegistration {
                 allowedRootURLs: allowedRootURLs,
                 executableURL: executable
             )
+            guard plan.snapshot.beforeOwned == nil else {
+                throw MCPOwnedRegistrationError.legacyEntryNotRecognized(client.configurationURL)
+            }
             handles.append(plan.handle)
             snapshots.append(plan.snapshot)
         }
@@ -1507,6 +1786,27 @@ private struct ConfigurationImage {
         switch format {
         case .json: Data("{\n  \"mcpServers\" : {\n\n  }\n}".utf8)
         case .toml: Data()
+        }
+    }
+
+    static func isRecognizedLegacyOwned(
+        format: ConfigurationFormat,
+        owned: Data,
+        executableURL: URL
+    ) throws -> Bool {
+        switch format {
+        case .json:
+            let expected: [String: Any] = ["command": executableURL.path, "args": []]
+            return owned == (try canonicalJSON(expected))
+        case .toml:
+            let source = normalizedTOMLOwned(String(decoding: owned, as: UTF8.self))
+            let legacy = normalizedTOMLOwned(
+                "[mcp_servers.evee]\ncommand = \"\(tomlEscaped(executableURL.path))\"\nargs = []\n"
+            )
+            let current = normalizedTOMLOwned(
+                "# Managed by Evee local helper access.\n[mcp_servers.evee]\ncommand = \"\(tomlEscaped(executableURL.path))\"\nargs = []\n"
+            )
+            return source == legacy || source == current
         }
     }
 

@@ -369,9 +369,34 @@ public final class LocalAPIServer: @unchecked Sendable {
                 send(status: 200, encodable: PublicWorkspaceRecord(record), on: connection, generation: generation)
             } else if target.hasPrefix("/v1/records") {
                 let components = URLComponents(string: "http://localhost\(target)")
-                let query = components?.queryItems?.first(where: { $0.name == "q" })?.value ?? ""
-                let kind = components?.queryItems?.first(where: { $0.name == "kind" })?.value.flatMap(WorkspaceRecordKind.init(rawValue:))
-                let limit = components?.queryItems?.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
+                let queryItems = components?.queryItems ?? []
+                let query = queryItems.first(where: { $0.name == "q" })?.value ?? ""
+                let kindItems = queryItems.filter { $0.name == "kind" }
+                let limitItems = queryItems.filter { $0.name == "limit" }
+                guard kindItems.count <= 1, limitItems.count <= 1 else {
+                    send(status: 400, json: ["error": "kind and limit may be supplied only once"], on: connection, generation: generation)
+                    return
+                }
+                let kind: WorkspaceRecordKind?
+                if let supplied = kindItems.first {
+                    guard let raw = supplied.value, let parsed = WorkspaceRecordKind(rawValue: raw) else {
+                        send(status: 400, json: ["error": "kind must be dictation, meeting, or memo"], on: connection, generation: generation)
+                        return
+                    }
+                    kind = parsed
+                } else {
+                    kind = nil
+                }
+                let limit: Int
+                if let supplied = limitItems.first {
+                    guard let raw = supplied.value, let parsed = Int(raw), (1...200).contains(parsed) else {
+                        send(status: 400, json: ["error": "limit must be an integer from 1 through 200"], on: connection, generation: generation)
+                        return
+                    }
+                    limit = parsed
+                } else {
+                    limit = 50
+                }
                 guard isActive(connection, generation: generation) else { return }
                 let records = try await store.search(query, kind: kind, limit: limit)
                 guard isActive(connection, generation: generation) else { return }

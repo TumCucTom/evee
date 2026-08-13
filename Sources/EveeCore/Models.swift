@@ -155,6 +155,7 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
     public var payloadBody: Data?
     public var retryable: Bool
     public var nextAttemptAt: Date?
+    public var requiresExplicitReplacement: Bool
 
     public init(
         id: UUID = UUID(),
@@ -167,7 +168,8 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         lastError: String? = nil,
         payloadBody: Data? = nil,
         retryable: Bool = true,
-        nextAttemptAt: Date? = nil
+        nextAttemptAt: Date? = nil,
+        requiresExplicitReplacement: Bool = false
     ) {
         self.id = id
         self.destination = destination
@@ -180,11 +182,12 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         self.payloadBody = payloadBody
         self.retryable = retryable
         self.nextAttemptAt = nextAttemptAt
+        self.requiresExplicitReplacement = requiresExplicitReplacement
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, destination, state, attemptCount, lastAttemptAt, deliveredAt, responseStatusCode, lastError
-        case payloadBody, retryable, nextAttemptAt
+        case payloadBody, retryable, nextAttemptAt, requiresExplicitReplacement
     }
 
     public init(from decoder: Decoder) throws {
@@ -200,6 +203,7 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         payloadBody = try values.decodeIfPresent(Data.self, forKey: .payloadBody)
         retryable = try values.decodeIfPresent(Bool.self, forKey: .retryable) ?? true
         nextAttemptAt = try values.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
+        requiresExplicitReplacement = try values.decodeIfPresent(Bool.self, forKey: .requiresExplicitReplacement) ?? false
     }
 }
 
