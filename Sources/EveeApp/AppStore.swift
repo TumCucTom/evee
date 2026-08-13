@@ -37,6 +37,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     typealias SystemAudioStarter = @MainActor @Sendable (URL) async throws -> Void
     typealias SystemAudioStopper = @MainActor @Sendable () async throws -> Void
     typealias TextDeliverer = @MainActor @Sendable (String, FrontmostApplication?, TextDeliveryMode, String?) async throws -> Void
+    typealias RecoveryTranscriberFactory = @MainActor @Sendable (SpeechModel) throws -> any LocalTranscriber
 
     enum Route: Hashable { case library, meetings, memos, dictionary, settings }
     struct PendingTextDelivery {
@@ -122,6 +123,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let systemAudioStarter: SystemAudioStarter?
     private let systemAudioStopper: SystemAudioStopper?
     private let textDeliverer: TextDeliverer
+    private let recoveryTranscriberFactory: RecoveryTranscriberFactory
     private var transcriber: (any LocalTranscriber)?
     private var modelDownloadStateMachine = ModelDownloadStateMachine()
     private var modelDownloadOperation: LifecycleOperation?
@@ -159,8 +161,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var hotMicTranscriptTask: Task<Void, Never>?
     private var suppressDraftAutosave = false
     private var terminationCheckpointRecoveryID: UUID?
-    private var isApplicationTerminationCheckpointing = false
-    private var terminationGeneration: UInt64 = 0
+    private var terminationWorkGate = TerminationWorkGate()
     private var microphoneStartTask: Task<Void, Error>?
     private var systemAudioStartTask: Task<Void, Error>?
     private var deliveryTask: Task<Void, Error>?
@@ -192,18 +193,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     private var captureLifecycle: CaptureLifecycle = .idle
 
-    var terminationWorkGeneration: UInt64 { terminationGeneration }
+    var terminationWorkGeneration: UInt64 { terminationWorkGate.generation }
+    var isTerminationCheckpointActive: Bool { terminationWorkGate.isCheckpointActive }
+    private var isApplicationTerminationCheckpointing: Bool { terminationWorkGate.isCheckpointActive }
 
     @discardableResult
     func prepareForTerminationCheckpoint() -> UInt64 {
-        if !isApplicationTerminationCheckpointing {
-            isApplicationTerminationCheckpointing = true
-            terminationGeneration &+= 1
-        }
+        let generation = terminationWorkGate.prepareCheckpoint()
         deliveryTask?.cancel()
         hotMicStateMachine.disable()
         publishHotMicState()
-        return terminationGeneration
+        return generation
     }
 
     var captureShutdownPlan: CaptureShutdownPlan {
@@ -261,7 +261,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 mode: mode,
                 expectedSelectedText: expectedSelectedText
             )
-        }
+        },
+        recoveryTranscriberFactory: @escaping RecoveryTranscriberFactory = { try TranscriberFactory.make($0) }
     ) {
         self.modelDownloaderFactory = modelDownloaderFactory
         self.wakeListenerFactory = wakeListenerFactory
@@ -274,6 +275,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         self.systemAudioStarter = systemAudioStarter
         self.systemAudioStopper = systemAudioStopper
         self.textDeliverer = textDeliverer
+        self.recoveryTranscriberFactory = recoveryTranscriberFactory
         self.microphonePermissionGranted = microphonePermissionProvider()
         let webhookOutboxTransactions = WebhookOutboxTransactions()
         self.webhookOutboxTransactions = webhookOutboxTransactions
@@ -843,8 +845,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func beginCapture(prefix: String) async {
-        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
-        terminationGeneration &+= 1
+        guard captureLifecycle == .idle, terminationWorkGate.beginWork() else { return }
         let sessionID = UUID()
         captureLifecycle = .starting(sessionID)
         captureKind = activeKind
@@ -1011,7 +1012,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
             guard captureLifecycle == .finishing(sessionID) else { return }
             captureState = .transcribing
-            let engine = try transcriber ?? TranscriberFactory.make(settings.model)
+            let engine = try transcriber ?? recoveryTranscriberFactory(settings.model)
             transcriber = engine
             let microphoneTranscript = try await engine.transcribeDetailed(fileURL: audioURL, languageCode: settings.languageCode)
             guard captureLifecycle == .finishing(sessionID) else { return }
@@ -1159,8 +1160,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         )
         if activeKind == .meeting { record.segments = segments }
 
-        guard !isApplicationTerminationCheckpointing else { return }
-        terminationGeneration &+= 1
+        guard terminationWorkGate.beginWork() else { return }
         recordCommitSequence &+= 1
         let commitID = recordCommitSequence
         let recoveryID = activeRecoveryID
@@ -1260,8 +1260,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         mode: TextDeliveryMode,
         expectedSelectedText: String?
     ) async throws {
-        guard !isApplicationTerminationCheckpointing else { throw CancellationError() }
-        terminationGeneration &+= 1
+        guard terminationWorkGate.beginWork() else { throw CancellationError() }
         let textDeliverer = self.textDeliverer
         let task = Task { @MainActor in
             try await textDeliverer(text, target, mode, expectedSelectedText)
@@ -1395,13 +1394,20 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func recover(_ capture: CaptureRecoveryManifest) async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else {
+            statusMessage = "Recovery is protected while Evee finishes the quit checkpoint. Wait for it to finish, then retry."
+            return
+        }
         if capture.kind == .meeting, let draftID = meetingDraftCaptureID, draftID != capture.id {
             statusMessage = "These notes belong to a different interrupted meeting. Recover or discard that meeting first."
             return
         }
         guard let microphoneTrack = capture.tracks.first(where: { $0.role == .microphone }) else {
             statusMessage = "This recovery does not contain a microphone recording. You can discard it if the source audio is no longer available."
+            return
+        }
+        guard terminationWorkGate.beginWork() else {
+            statusMessage = "Recovery is protected while Evee finishes the quit checkpoint. Wait for it to finish, then retry."
             return
         }
 
@@ -1475,7 +1481,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func discardRecovery(_ capture: CaptureRecoveryManifest) async {
-        guard captureLifecycle == .idle else { return }
+        guard captureLifecycle == .idle, !isApplicationTerminationCheckpointing else { return }
         do {
             try await library.discardRecoveryCapture(id: capture.id)
             if meetingDraftCaptureID == capture.id { await clearMeetingDraft() }
@@ -1486,6 +1492,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func discardMeetingDraft() async {
+        guard !isApplicationTerminationCheckpointing else { return }
         await clearMeetingDraft()
     }
 
@@ -2187,7 +2194,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func checkpointForTermination() async throws {
-        isApplicationTerminationCheckpointing = true
+        _ = terminationWorkGate.prepareCheckpoint()
         let plan = captureShutdownPlan
         invalidateForApplicationTermination(plan: plan)
 
@@ -2212,8 +2219,21 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     let record = try await operation.task.value
                     acceptDurableRecord(record, commitID: operation.id)
                     durableCommitWon = true
+                    if try await library.clearMeetingDraft(
+                        forCommitted: record,
+                        recoveryID: operation.recoveryID
+                    ), let recoveryID = operation.recoveryID {
+                        if meetingDraftCaptureID == recoveryID {
+                            suppressDraftAutosave = true
+                            meetingDraftCaptureID = nil
+                            meetingTitle = ""
+                            meetingNotes = ""
+                            suppressDraftAutosave = false
+                        }
+                    }
                     recordCommitOperation = nil
                 } catch {
+                    if durableCommitWon { throw error }
                     if recordCommitOperation?.id == operation.id {
                         recordCommitOperation = nil
                     }
@@ -2298,7 +2318,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func reportApplicationTerminationCheckpointFailure(_ error: Error) {
-        statusMessage = "Quit was cancelled while Evee protected the active capture. The app stayed open and retained completed audio and notes. Check available disk space and permissions, then quit again. \(error.localizedDescription)"
+        let message = "Evee protected the capture for recovery. Check available disk space and permissions, then retry Quit. \(error.localizedDescription)"
+        captureState = captureState.protectedForTerminationFailure(message)
+        statusMessage = message
     }
 
     private func invalidateForApplicationTermination(plan: CaptureShutdownPlan) {

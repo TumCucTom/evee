@@ -157,6 +157,22 @@ public actor LibraryStore {
         try writePrivate(encoder.encode(draft), to: meetingDraftURL)
     }
 
+    @discardableResult
+    public func clearMeetingDraft(matching captureID: UUID) throws -> Bool {
+        guard let draft = try loadMeetingDraft(), draft.captureID == captureID else { return false }
+        try saveMeetingDraft(nil)
+        return true
+    }
+
+    @discardableResult
+    public func clearMeetingDraft(
+        forCommitted record: WorkspaceRecord,
+        recoveryID: UUID?
+    ) throws -> Bool {
+        guard record.kind == .meeting, let recoveryID else { return false }
+        return try clearMeetingDraft(matching: recoveryID)
+    }
+
     public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
         let records = try loadRecords()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)

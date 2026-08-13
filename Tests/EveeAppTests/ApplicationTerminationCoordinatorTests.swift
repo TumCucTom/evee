@@ -4,6 +4,51 @@ import XCTest
 
 @MainActor
 final class ApplicationTerminationCoordinatorTests: XCTestCase {
+    func testDeadlineFailureReplacesLivePresentationWithProtectedRecovery() {
+        let store = AppStore(modelDownloadDefaults: nil)
+        store.captureState = .recording(startedAt: .now, level: 0.5)
+
+        store.reportApplicationTerminationCheckpointFailure(ApplicationTerminationDeadlineError())
+
+        guard case .checkpointed(let message) = store.captureState else {
+            return XCTFail("Deadline left live capture controls visible")
+        }
+        XCTAssertTrue(message.contains("protected") || message.contains("recovery"))
+    }
+
+    func testRecoveryIsRejectedDuringCheckpointAndNewRecoveryAdvancesGeneration() async {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-recovery-gate-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let capture = try! await library.beginRecoveryCapture(kind: .memo)
+        let source = root.appendingPathComponent("synthetic.caf")
+        try! Data("synthetic".utf8).write(to: source)
+        let manifest = try! await library.addRecoveryTrack(
+            captureID: capture.id,
+            kind: .memo,
+            role: .microphone,
+            sourceURL: source
+        )
+        let gatedStore = AppStore(modelDownloadDefaults: nil, library: library)
+        let checkpointGeneration = gatedStore.prepareForTerminationCheckpoint()
+
+        await gatedStore.recover(manifest)
+
+        XCTAssertEqual(gatedStore.terminationWorkGeneration, checkpointGeneration)
+        XCTAssertTrue(gatedStore.isTerminationCheckpointActive)
+        XCTAssertNotEqual(gatedStore.captureState, .transcribing)
+
+        let recoveryStore = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            recoveryTranscriberFactory: { _ in throw SyntheticApplicationTerminationError.persistenceFailed }
+        )
+        let initialGeneration = recoveryStore.terminationWorkGeneration
+        await recoveryStore.recover(manifest)
+        XCTAssertGreaterThan(recoveryStore.terminationWorkGeneration, initialGeneration)
+    }
+
     func testDeadlineCancelsTerminationAndLateCheckpointCannotReplyAgain() async {
         let checkpoint = DelayedCaptureCheckpointer()
         let replies = TerminationReplySink()

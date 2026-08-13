@@ -147,3 +147,45 @@ Fix-round verification:
   before test compilation by KeyboardShortcuts' unavailable `PreviewsMacros`
   plugin under Command Line Tools. No full-Xcode, package, physical capture, or
   packaged-app result is claimed.
+
+## Fix round 2
+
+Closed the remaining normal-use presentation, recovery, clipboard, and meeting
+draft issues without changing AppKit reply ownership.
+
+- Termination deadline/failure now maps every live starting, recording,
+  transcribing/stopping, or delivering presentation to explicit protected
+  `checkpointed` state. This removes Discard/live controls and preserves the
+  existing Open Recovery and Retry Quit actions.
+- A synchronous `TerminationWorkGate` now owns both admission and generation.
+  Recovery is rejected while checkpointing, accepted recovery advances the same
+  generation observed by the reply owner, and Recovery/Discard/New Memo UI is
+  disabled while the checkpoint gate is closed.
+- Temporary clipboard ownership is centralized in a defer-backed transaction.
+  Once the delivery's clipboard revision is owned, success, verification error,
+  cancellation, and restore-delay cancellation all restore the prior snapshot
+  when no other application has replaced it. Paste verification and the final
+  cancellation check before Return remain intact.
+- When an in-flight meeting record commit durably wins, termination clears the
+  on-disk draft only if its capture identifier matches the commit's recovery
+  identifier. Draft-clear failure cancels termination after preserving the
+  durable record; failed commits and recovery-only checkpoints do not clear a
+  draft. The temporary-store check reopens the library and confirms the matching
+  draft stays absent while an unrelated draft survives.
+
+Fix-round 2 verification:
+
+- Rebuilt `evee-core-checks`, then ran `--filter termination-checkpoint` ten
+  consecutive times: 10/10 passed. The filter now includes protected
+  presentation, recovery admission/generation, cancellation-time clipboard
+  restoration, and matching meeting-draft relaunch coverage.
+- `--filter context-policy`: passed.
+- `--filter lifecycle-state`: passed.
+- `--filter webhook-generation`: passed.
+- `swift build --target EveeCore --jobs 2`: passed.
+- Direct `swiftc -typecheck` of every EveeApp source against built modules:
+  passed.
+- `swift test --filter ApplicationTerminationCoordinatorTests --jobs 1` remains
+  blocked before app-test compilation by KeyboardShortcuts' unavailable
+  `PreviewsMacros` plugin under Command Line Tools. No full-Xcode, package,
+  physical capture, or packaged-app result is claimed.

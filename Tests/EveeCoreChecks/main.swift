@@ -88,6 +88,15 @@ private actor SyntheticCounter {
     var value: Int { count }
 }
 
+@MainActor
+private final class SyntheticClipboard {
+    private(set) var value = "original"
+    private(set) var revision = 0
+    private(set) var restoreCount = 0
+    func writeTemporaryValue() { value = "temporary"; revision += 1 }
+    func restoreSnapshot() { value = "original"; revision += 1; restoreCount += 1 }
+}
+
 private final class BlockingSecretStore: LocalAPISecretStore, @unchecked Sendable {
     private let lock = NSLock()
     private let enteredRead = DispatchSemaphore(value: 0)
@@ -613,7 +622,23 @@ private func checkWebhookLegacyRows() async throws {
 
 @MainActor
 private func checkTerminationCheckpoint() async throws {
-    let successfulCheckpoint = SyntheticTerminationCheckpoint {}
+    var suspendedRecoveryGate = TerminationWorkGate()
+    let suspendedRecoveryGeneration = suspendedRecoveryGate.prepareCheckpoint()
+    try require(!suspendedRecoveryGate.beginWork(), "recovery began during a suspended checkpoint")
+    try require(suspendedRecoveryGate.generation == suspendedRecoveryGeneration, "rejected recovery changed termination generation")
+    var availableRecoveryGate = TerminationWorkGate()
+    let recoveryGeneration = availableRecoveryGate.generation
+    try require(availableRecoveryGate.beginWork(), "recovery was rejected without a checkpoint")
+    try require(availableRecoveryGate.generation > recoveryGeneration, "accepted recovery did not advance termination generation")
+
+    let protectedPresentation = CaptureState.recording(startedAt: .now, level: 0.5)
+        .protectedForTerminationFailure("Synthetic protected recovery")
+    guard case .checkpointed = protectedPresentation else {
+        throw CoreCheckError.assertionFailed("termination failure left live capture controls visible")
+    }
+    let successfulCheckpoint = SyntheticTerminationCheckpoint {
+        try await Task.sleep(for: .milliseconds(10))
+    }
     let coordinator = TerminationCheckpointCoordinator(checkpointer: successfulCheckpoint)
     async let first: Void = coordinator.checkpoint()
     async let repeated: Void = coordinator.checkpoint()
@@ -775,6 +800,47 @@ private func checkTerminationCheckpoint() async throws {
     _ = await deliveryJoin.value
     let sendCount = await sendCounter.value
     try require(sendCount == 0, "cancelled delivery auto-sent after checkpoint began")
+
+    let clipboard = SyntheticClipboard()
+    let clipboardGate = SyntheticOperationGate<Void>()
+    let clipboardTask = Task { @MainActor in
+        try await TemporaryClipboardTransaction.withRestoration(
+            currentRevision: { clipboard.revision },
+            restore: { clipboard.restoreSnapshot() }
+        ) { markOwned in
+            clipboard.writeTemporaryValue()
+            markOwned(clipboard.revision)
+            try await clipboardGate.wait()
+            try Task.checkCancellation()
+        }
+    }
+    await clipboardGate.waitUntilStarted()
+    clipboardTask.cancel()
+    await clipboardGate.release(())
+    _ = try? await clipboardTask.value
+    try require(clipboard.restoreCount == 1 && clipboard.value == "original", "clipboard snapshot was not restored after cancellation")
+
+    let meetingRoot = root.appendingPathComponent("meeting-commit")
+    let meetingStore = LibraryStore(rootURL: meetingRoot)
+    let meetingRecovery = try await meetingStore.beginRecoveryCapture(kind: .meeting)
+    try await meetingStore.saveMeetingDraft(MeetingDraft(captureID: meetingRecovery.id, title: "Synthetic", notes: "Retain until commit"))
+    _ = try await meetingStore.commitRecoveredRecord(
+        WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Saved"),
+        recoveryID: meetingRecovery.id,
+        keepAudio: false
+    )
+    let committedMeeting = try unwrapped(
+        try await meetingStore.loadRecords().first,
+        "committed meeting was not durable"
+    )
+    let clearedMeetingDraft = try await meetingStore.clearMeetingDraft(
+        forCommitted: committedMeeting,
+        recoveryID: meetingRecovery.id
+    )
+    try require(clearedMeetingDraft, "matching committed meeting did not clear its draft")
+    let relaunchedMeetingStore = LibraryStore(rootURL: meetingRoot)
+    let relaunchedMeetingDraft = try await relaunchedMeetingStore.loadMeetingDraft()
+    try require(relaunchedMeetingDraft == nil, "meeting draft returned after relaunch")
 
     print("termination-checkpoint: passed")
 }

@@ -125,3 +125,27 @@ public actor TerminationOwnedOperation<Value: Sendable> {
 
     public var isActive: Bool { inFlight != nil }
 }
+
+/// Synchronous admission gate shared by capture and recovery entry points.
+/// Starting work advances the generation used by the termination reply owner;
+/// a prepared checkpoint closes admission before any caller can suspend.
+public struct TerminationWorkGate: Sendable {
+    public private(set) var generation: UInt64 = 0
+    public private(set) var isCheckpointActive = false
+
+    public init() {}
+
+    public mutating func prepareCheckpoint() -> UInt64 {
+        if !isCheckpointActive {
+            isCheckpointActive = true
+            generation &+= 1
+        }
+        return generation
+    }
+
+    public mutating func beginWork() -> Bool {
+        guard !isCheckpointActive else { return false }
+        generation &+= 1
+        return true
+    }
+}

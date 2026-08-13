@@ -95,6 +95,26 @@ public enum TextInsertionVerification {
     }
 }
 
+/// Owns restoration for a temporary clipboard mutation. Once `markOwned` is
+/// called, every return, error, or task cancellation runs the restore closure
+/// while the caller's revision is still current.
+@MainActor
+public enum TemporaryClipboardTransaction {
+    public static func withRestoration<Result>(
+        currentRevision: () -> Int,
+        restore: () -> Void,
+        operation: (_ markOwned: (Int) -> Void) async throws -> Result
+    ) async rethrows -> Result {
+        var ownedRevision: Int?
+        defer {
+            if let ownedRevision, currentRevision() == ownedRevision {
+                restore()
+            }
+        }
+        return try await operation { ownedRevision = $0 }
+    }
+}
+
 @MainActor
 public enum TextDelivery {
     public enum DeliveryError: LocalizedError {
@@ -197,70 +217,56 @@ public enum TextDelivery {
         try Task.checkCancellation()
         let pasteboard = NSPasteboard.general
         let prior = PasteboardSnapshot(pasteboard)
-        pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
-            prior.restore(to: pasteboard)
-            throw DeliveryError.clipboardWriteFailed
-        }
-        let dictatedClipboardChange = pasteboard.changeCount
-
-        do {
-            try verifyTarget(target, expectedSelectedText: expectedSelectedText)
-        } catch {
-            if pasteboard.changeCount == dictatedClipboardChange {
+        try await TemporaryClipboardTransaction.withRestoration(
+            currentRevision: { pasteboard.changeCount },
+            restore: { prior.restore(to: pasteboard) }
+        ) { markOwned in
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
                 prior.restore(to: pasteboard)
+                throw DeliveryError.clipboardWriteFailed
             }
-            throw error
-        }
+            markOwned(pasteboard.changeCount)
 
-        try Task.checkCancellation()
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
-        down?.flags = .maskCommand
-        let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-        up?.flags = .maskCommand
-        down?.post(tap: .cghidEventTap)
-        up?.post(tap: .cghidEventTap)
-
-        if sendAfterPaste {
-            var insertionVerified = false
-            for _ in 0..<12 {
-                try await Task.sleep(for: .milliseconds(100))
-                try Task.checkCancellation()
-                do {
-                    try verifyTarget(target, expectedSelectedText: nil)
-                } catch {
-                    if pasteboard.changeCount == dictatedClipboardChange {
-                        prior.restore(to: pasteboard)
-                    }
-                    throw DeliveryError.autoSendDeclined(target.name)
-                }
-                if let before = valueBeforePaste,
-                   let after = focusedEditableValue(processIdentifier: target.processIdentifier),
-                   TextInsertionVerification.confirmsInsertion(
-                       before: before,
-                       after: after,
-                       insertedText: text,
-                       replacing: expectedSelectedText
-                   ) {
-                    insertionVerified = true
-                    break
-                }
-            }
-            guard insertionVerified else {
-                if pasteboard.changeCount == dictatedClipboardChange {
-                    prior.restore(to: pasteboard)
-                }
-                throw DeliveryError.autoSendDeclined(target.name)
-            }
+            try verifyTarget(target, expectedSelectedText: expectedSelectedText)
             try Task.checkCancellation()
-            postKey(virtualKey: 36)
-        }
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
+            down?.flags = .maskCommand
+            let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+            up?.flags = .maskCommand
+            down?.post(tap: .cghidEventTap)
+            up?.post(tap: .cghidEventTap)
 
-        try await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
-        try Task.checkCancellation()
-        if pasteboard.changeCount == dictatedClipboardChange {
-            prior.restore(to: pasteboard)
+            if sendAfterPaste {
+                var insertionVerified = false
+                for _ in 0..<12 {
+                    try await Task.sleep(for: .milliseconds(100))
+                    try Task.checkCancellation()
+                    do {
+                        try verifyTarget(target, expectedSelectedText: nil)
+                    } catch {
+                        throw DeliveryError.autoSendDeclined(target.name)
+                    }
+                    if let before = valueBeforePaste,
+                       let after = focusedEditableValue(processIdentifier: target.processIdentifier),
+                       TextInsertionVerification.confirmsInsertion(
+                           before: before,
+                           after: after,
+                           insertedText: text,
+                           replacing: expectedSelectedText
+                       ) {
+                        insertionVerified = true
+                        break
+                    }
+                }
+                guard insertionVerified else { throw DeliveryError.autoSendDeclined(target.name) }
+                try Task.checkCancellation()
+                postKey(virtualKey: 36)
+            }
+
+            try await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
+            try Task.checkCancellation()
         }
     }
 

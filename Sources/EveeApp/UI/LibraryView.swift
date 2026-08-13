@@ -45,7 +45,7 @@ struct LibraryView: View {
                         } else {
                             Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
                                 .buttonStyle(AlphaButtonStyle())
-                                .disabled(store.captureState != .idle)
+                                .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
                                 .help(store.captureState == .idle ? "Record a private voice memo" : "Finish the current capture first")
                         }
                     }
@@ -79,13 +79,17 @@ struct LibraryView: View {
                                 Task { await store.discardRecovery(capture) }
                             }
                             .controlSize(.small)
-                            .disabled(store.captureState != .idle)
+                            .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
                             Button("Transcribe") {
                                 Task { await store.recover(capture) }
                             }
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
-                            .disabled(store.captureState != .idle || !capture.tracks.contains(where: { $0.role == .microphone }))
+                            .disabled(
+                                store.captureState != .idle
+                                    || store.isTerminationCheckpointActive
+                                    || !capture.tracks.contains(where: { $0.role == .microphone })
+                            )
                         }
                         .accessibilityElement(children: .contain)
                     }

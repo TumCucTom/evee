@@ -600,4 +600,13 @@ public enum CaptureState: Equatable, Sendable {
     case delivering
     case checkpointed(String)
     case failed(String)
+
+    public func protectedForTerminationFailure(_ message: String) -> CaptureState {
+        switch self {
+        case .starting, .recording, .transcribing, .delivering:
+            .checkpointed(message)
+        case .idle, .checkpointed, .failed:
+            self
+        }
+    }
 }

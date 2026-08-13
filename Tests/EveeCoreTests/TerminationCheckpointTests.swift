@@ -114,6 +114,72 @@ final class TerminationCheckpointTests: XCTestCase {
 
         XCTAssertEqual(await sent.value, 0)
     }
+
+    func testTemporaryClipboardRestoresSnapshotWhenCancelledDuringDelay() async {
+        let clipboard = SyntheticClipboard()
+        let gate = SyntheticOperationGate<Void>()
+        let task = Task { @MainActor in
+            try await TemporaryClipboardTransaction.withRestoration(
+                currentRevision: { clipboard.revision },
+                restore: { clipboard.restoreSnapshot() }
+            ) { markOwned in
+                clipboard.writeTemporaryValue()
+                markOwned(clipboard.revision)
+                try await gate.wait()
+                try Task.checkCancellation()
+            }
+        }
+        await gate.waitUntilStarted()
+
+        task.cancel()
+        await gate.release(())
+        _ = try? await task.value
+
+        XCTAssertEqual(clipboard.restoreCount, 1)
+        XCTAssertEqual(clipboard.value, "original")
+    }
+
+    func testMeetingCommitWinnerClearsOnlyMatchingDraftAcrossRelaunch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-meeting-commit-draft-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let recovery = try await store.beginRecoveryCapture(kind: .meeting)
+        try await store.saveMeetingDraft(MeetingDraft(captureID: recovery.id, title: "Synthetic", notes: "Retain until commit"))
+        let record = WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Saved")
+
+        let committed = try await store.commitRecoveredRecord(record, recoveryID: recovery.id, keepAudio: false)
+        XCTAssertTrue(try await store.clearMeetingDraft(forCommitted: committed, recoveryID: recovery.id))
+
+        let relaunched = LibraryStore(rootURL: root)
+        XCTAssertNil(try await relaunched.loadMeetingDraft())
+
+        let unrelatedID = UUID()
+        try await relaunched.saveMeetingDraft(MeetingDraft(captureID: unrelatedID, title: "Other", notes: "Keep"))
+        XCTAssertFalse(try await relaunched.clearMeetingDraft(matching: recovery.id))
+        XCTAssertEqual(try await LibraryStore(rootURL: root).loadMeetingDraft()?.captureID, unrelatedID)
+    }
+
+    func testRecoveryAdmissionIsRejectedDuringCheckpointAndAdvancesGenerationAfterward() {
+        var suspendedGate = TerminationWorkGate()
+        let checkpointGeneration = suspendedGate.prepareCheckpoint()
+        XCTAssertFalse(suspendedGate.beginWork())
+        XCTAssertEqual(suspendedGate.generation, checkpointGeneration)
+
+        var availableGate = TerminationWorkGate()
+        let priorGeneration = availableGate.generation
+        XCTAssertTrue(availableGate.beginWork())
+        XCTAssertGreaterThan(availableGate.generation, priorGeneration)
+    }
+}
+
+@MainActor
+private final class SyntheticClipboard {
+    private(set) var value = "original"
+    private(set) var revision = 0
+    private(set) var restoreCount = 0
+    func writeTemporaryValue() { value = "temporary"; revision += 1 }
+    func restoreSnapshot() { value = "original"; revision += 1; restoreCount += 1 }
 }
 
 private actor SyntheticOperationGate<Value: Sendable> {
