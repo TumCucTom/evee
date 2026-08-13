@@ -575,6 +575,42 @@ private func checkTerminationCheckpoint() async throws {
     print("termination-checkpoint: passed")
 }
 
+private func checkLifecycleState() throws {
+    var download = ModelDownloadStateMachine()
+    let first = try unwrapped(download.begin(model: .parakeet), "model download did not start")
+    try require(download.begin(model: .parakeet) == nil, "model download allowed a concurrent operation")
+    download.cancel(first)
+    try require(!download.update(first, progress: ModelProgress(fraction: 0.5, status: "Synthetic progress")), "cancelled model download accepted stale progress")
+    try require(!download.complete(first), "cancelled model download accepted stale completion")
+
+    var hotMic = HotMicStateMachine()
+    let start = try unwrapped(hotMic.beginStart(), "hot mic did not begin starting")
+    hotMic.disable()
+    try require(!hotMic.didStart(start), "disabled hot mic accepted a stale start")
+
+    let recoveryID = UUID()
+    try require(CaptureShutdownPlan.make(for: .idle) == .terminateImmediately, "idle capture did not terminate immediately")
+    try require(CaptureShutdownPlan.make(for: .failed) == .terminateImmediately, "failed capture did not terminate immediately")
+    try require(CaptureShutdownPlan.make(for: .starting(kind: .dictation, recoveryID: recoveryID)) == .cancelStartAndCheckpoint, "starting capture did not checkpoint")
+    try require(CaptureShutdownPlan.make(for: .recording(kind: .meeting, recoveryID: recoveryID)) == .stopWritersAndCheckpoint(kind: .meeting, recoveryID: recoveryID), "recording capture did not stop writers")
+    try require(CaptureShutdownPlan.make(for: .finishing(recoveryID: recoveryID)) == .awaitDurableCommitOrCheckpoint(recoveryID: recoveryID), "finishing capture did not await durable commit")
+    try require(CaptureShutdownPlan.make(for: .delivering) == .invalidateDeliveryAndAwaitCommit, "delivery did not await commit")
+    try require(CaptureShutdownPlan.make(for: .cancelling) == .awaitCancellationCleanup, "cancelling capture did not await cleanup")
+
+    let unsafeSnapshots: [CaptureLifecycleSnapshot] = [
+        .starting(kind: .memo, recoveryID: nil),
+        .recording(kind: .dictation, recoveryID: nil),
+        .finishing(recoveryID: nil),
+    ]
+    for snapshot in unsafeSnapshots {
+        guard case .cancelTermination(let message) = CaptureShutdownPlan.make(for: snapshot), !message.isEmpty else {
+            throw CoreCheckError.assertionFailed("active capture without recovery ID allowed immediate termination")
+        }
+    }
+
+    print("lifecycle-state: passed")
+}
+
 private func checkWebhookTransactions() async throws {
     let queueRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: queueRoot) }
@@ -2696,9 +2732,11 @@ if arguments == ["--filter", "context-policy"] {
     try await checkWebhookLegacyRows()
 } else if arguments == ["--filter", "termination-checkpoint"] {
     try await checkTerminationCheckpoint()
+} else if arguments == ["--filter", "lifecycle-state"] {
+    try checkLifecycleState()
 } else if arguments == ["--filter", "webhook-transactions"] {
     try await checkWebhookTransactions()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state>\n", stderr)
     exit(EXIT_FAILURE)
 }
