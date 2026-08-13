@@ -181,3 +181,51 @@ data was accessed.
 - The existing full-Xcode, package XCTest, EveeApp package build, physical
   capture, and controller-owned restricted-scan limitations above remain
   unchanged and are not claimed as passing.
+
+## Fix round 2/5 — RED
+
+- Added fault checkpoints immediately after a private quarantine marker is
+  fsync'd and immediately after corrupt records are moved/verified but before
+  marker completion. Each case creates record audio under a temporary UUID
+  directory and exercises a second `LibraryStore` bootstrap.
+- The executable check initially failed to compile because quarantine had no
+  pending phase, transition checkpoints, or manual-recovery result. After the
+  state machine was introduced, extending the journey to direct record deletion
+  failed with `record delete bypassed quarantine audio protection`, proving the
+  existing reconciliation-only gate was insufficient.
+- Mirrored XCTest coverage names the same observable breaks. The host XCTest
+  gate remains unavailable, so executable temp-root/generated-WAV journeys are
+  the runnable evidence in this environment.
+
+## Fix round 2/5 — GREEN
+
+- Records preservation now fsyncs a private version-2 `pending` marker before
+  moving or removing canonical metadata. The marker alone gates reconciliation,
+  purge/delete file removal, superseded-track removal, retained-recovery source
+  cleanup, and launch recovery cleanup.
+- Preservation then atomically moves corrupt bytes to a unique private
+  `Corrupt` path, verifies exact bytes and permissions, fsyncs the file and both
+  directories, and replaces the marker with `complete` plus the verified path.
+  Version-1 complete markers decode compatibly.
+- On relaunch, a pending marker with canonical records still present resumes and
+  completes verified preservation. A pending marker with canonical records
+  absent remains pending, returns an empty safe library under active cleanup
+  protection, and surfaces a manual-recovery warning; it never fabricates a
+  complete marker or silently unquarantines.
+- App bootstrap now treats the marker itself as the authoritative protection
+  signal. Interrupted preservation points users at the private `Corrupt`
+  location and keeps automatic retention, webhook retirement, and all audio
+  reconciliation disabled.
+
+## Fix round 2/5 — verification and limits
+
+- `swift run evee-core-checks --filter corrupt-library-recovery`: passed with
+  both fault checkpoints, two bootstraps, canonical-present completion,
+  canonical-absent manual recovery, and audio survival.
+- `swift run evee-core-checks --filter recovery-tracks`: passed.
+- `swift run evee-core-checks --filter termination-checkpoint`: passed.
+- `swift build --target EveeCore`: passed.
+- Direct all-source EveeApp `swiftc -typecheck`, changed-source/test
+  `swiftc -parse`, and `git diff --check`: passed.
+- Full Xcode/XCTest/app-package/physical gates and the controller-owned
+  restricted scan remain unavailable exactly as documented above.

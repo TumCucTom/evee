@@ -37,6 +37,8 @@ public enum LibraryStoreError: LocalizedError, Sendable {
     case recordAudioDirectorySync
     case recordMetadataBeforeReplacement
     case recordMetadataAfterReplacement
+    case recordsQuarantineAfterArming
+    case recordsQuarantineAfterPreserving
 }
 
 private struct SchemaVersionProbe: Decodable {
@@ -129,24 +131,57 @@ public actor LibraryStore {
 
     public func loadRecordsRecoveringCorruption() throws -> RecoveredLibraryLoad<[WorkspaceRecord]> {
         try prepare()
-        let quarantine = try recordsQuarantine()
+        if let quarantine = try recordsQuarantine() {
+            return try loadRecords(under: quarantine)
+        }
         guard FileManager.default.fileExists(atPath: recordsURL.path) else {
-            return RecoveredLibraryLoad(
-                value: [],
-                preservedCorruptURL: try quarantine.map { try preservedURL(for: $0) }
-            )
+            return RecoveredLibraryLoad(value: [])
         }
         let data = try Data(contentsOf: recordsURL)
         do {
-            return RecoveredLibraryLoad(
-                value: try decodeRecords(data),
-                preservedCorruptURL: try quarantine.map { try preservedURL(for: $0) }
-            )
+            return RecoveredLibraryLoad(value: try decodeRecords(data))
         } catch let error as LibraryStoreError {
             throw error
         } catch {
             let preserved = try quarantineCorruptRecords(expectedData: data)
             return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+    }
+
+    private func loadRecords(
+        under quarantine: RecordsQuarantineMarker
+    ) throws -> RecoveredLibraryLoad<[WorkspaceRecord]> {
+        if quarantine.phase == .pending {
+            guard FileManager.default.fileExists(atPath: recordsURL.path) else {
+                return RecoveredLibraryLoad(
+                    value: [],
+                    manualRecoveryWarning: "Records preservation was interrupted after metadata protection was armed. The canonical source is unavailable, so record-audio cleanup remains disabled until you review the private library data and explicitly reset protection."
+                )
+            }
+            let preserved = try finishPendingRecordsQuarantine(
+                expectedData: Data(contentsOf: recordsURL),
+                createdAt: quarantine.createdAt
+            )
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+
+        guard let preserved = try preservedURL(for: quarantine) else {
+            return RecoveredLibraryLoad(
+                value: [],
+                manualRecoveryWarning: "Records metadata protection is active, but its verified preserved-copy path is unavailable. Record-audio cleanup remains disabled until you review the private library data and explicitly reset protection."
+            )
+        }
+        guard FileManager.default.fileExists(atPath: recordsURL.path) else {
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+        let data = try Data(contentsOf: recordsURL)
+        do {
+            return RecoveredLibraryLoad(value: try decodeRecords(data), preservedCorruptURL: preserved)
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let newPreserved = try quarantineCorruptRecords(expectedData: data)
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: newPreserved)
         }
     }
 
@@ -384,6 +419,7 @@ public actor LibraryStore {
         // Metadata is the source of ownership. Commit its removal before deleting
         // audio so a failed save cannot leave a record pointing at missing files.
         try save(records)
+        guard try recordsQuarantine() == nil else { return }
 
         let paths = [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
         for relativePath in Set(paths) {
@@ -404,6 +440,7 @@ public actor LibraryStore {
         // Commit metadata first so an interrupted purge can leave only harmless
         // orphaned audio, never records pointing at files we already removed.
         try save(retained)
+        guard try recordsQuarantine() == nil else { return removed.count }
         let paths = removed.flatMap { record in
             [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
         }
@@ -585,6 +622,7 @@ public actor LibraryStore {
         let capture = try recoverableCaptures().first { $0.id == recoveryID }
         record.recoverySourceID = recoveryID
         var copies: [URL] = []
+        let automaticAudioCleanupPermitted = try recordsQuarantine() == nil
 
         if keepAudio {
             guard let capture else { throw LibraryStoreError.missingRecoveryCapture(recoveryID) }
@@ -680,9 +718,11 @@ public actor LibraryStore {
                 }
                 try save(records)
 
-                let referencedPaths = Set(records.flatMap(recordAudioPaths))
-                for oldPath in previousRecord.map(recordAudioPaths) ?? [] where !referencedPaths.contains(oldPath) {
-                    removeOwnedRecordAudioIfPresent(relativePath: oldPath, recordID: record.id)
+                if automaticAudioCleanupPermitted {
+                    let referencedPaths = Set(records.flatMap(recordAudioPaths))
+                    for oldPath in previousRecord.map(recordAudioPaths) ?? [] where !referencedPaths.contains(oldPath) {
+                        removeOwnedRecordAudioIfPresent(relativePath: oldPath, recordID: record.id)
+                    }
                 }
                 try? reconcileRecordAudioIfPermitted(using: records)
             } catch {
@@ -708,7 +748,9 @@ public actor LibraryStore {
 
         // Metadata now owns the result (or intentionally owns no audio), so the
         // recovery copy is safe to remove. Failed cleanup is reconciled on launch.
-        try? removeRecoveryArtifacts(id: recoveryID, tracks: capture?.tracks ?? [])
+        if automaticAudioCleanupPermitted {
+            try? removeRecoveryArtifacts(id: recoveryID, tracks: capture?.tracks ?? [])
+        }
         return record
     }
 
@@ -718,8 +760,9 @@ public actor LibraryStore {
     }
 
     public func reconcileAudioStorage() throws {
+        guard try recordsQuarantine() == nil else { return }
         let records = try loadRecords()
-        try reconcileRecordAudioIfPermitted(using: records)
+        try reconcileRecordAudio(using: records)
         try reconcileRecoveryAudio(using: records)
     }
 
@@ -968,32 +1011,41 @@ public actor LibraryStore {
     }
 
     private func quarantineCorruptRecords(expectedData: Data) throws -> URL {
-        let preserved = try preserveCorruptCanonicalFile(recordsURL, expectedData: expectedData)
-        let marker = RecordsQuarantineMarker(
-            preservedCorruptRelativePath: relativePath(for: preserved),
-            reason: "Unreadable records metadata was preserved before safe fallback."
+        let createdAt = Date.now
+        let pending = RecordsQuarantineMarker(
+            phase: .pending,
+            reason: "Unreadable records metadata is awaiting verified private preservation.",
+            createdAt: createdAt
         )
-        do {
-            try writePrivate(encoder.encode(marker), to: recordsQuarantineURL)
-            return preserved
-        } catch {
-            if FileManager.default.fileExists(atPath: recordsQuarantineURL.path) {
-                try? FileManager.default.removeItem(at: recordsQuarantineURL)
-            }
-            if FileManager.default.fileExists(atPath: preserved.path),
-               !FileManager.default.fileExists(atPath: recordsURL.path) {
-                try? FileManager.default.moveItem(at: preserved, to: recordsURL)
-            }
-            throw error
+        try writePrivate(encoder.encode(pending), to: recordsQuarantineURL)
+        if failNextWritesAt.remove(.recordsQuarantineAfterArming) != nil {
+            throw POSIXError(.EIO)
         }
+        return try finishPendingRecordsQuarantine(expectedData: expectedData, createdAt: createdAt)
     }
 
-    private func preservedURL(for marker: RecordsQuarantineMarker) throws -> URL {
-        let url = try safeURL(forRelativePath: marker.preservedCorruptRelativePath)
+    private func finishPendingRecordsQuarantine(expectedData: Data, createdAt: Date) throws -> URL {
+        let preserved = try preserveCorruptCanonicalFile(recordsURL, expectedData: expectedData)
+        if failNextWritesAt.remove(.recordsQuarantineAfterPreserving) != nil {
+            throw POSIXError(.EIO)
+        }
+        let complete = RecordsQuarantineMarker(
+            phase: .complete,
+            preservedCorruptRelativePath: relativePath(for: preserved),
+            reason: "Unreadable records metadata was verified in private preservation before safe fallback.",
+            createdAt: createdAt
+        )
+        try writePrivate(encoder.encode(complete), to: recordsQuarantineURL)
+        return preserved
+    }
+
+    private func preservedURL(for marker: RecordsQuarantineMarker) throws -> URL? {
+        guard let relativePath = marker.preservedCorruptRelativePath else { return nil }
+        let url = try safeURL(forRelativePath: relativePath)
         guard url.deletingLastPathComponent().standardizedFileURL == rootURL
             .appendingPathComponent("Corrupt", isDirectory: true)
             .standardizedFileURL else {
-            throw LibraryStoreError.unsafeRelativePath(marker.preservedCorruptRelativePath)
+            throw LibraryStoreError.unsafeRelativePath(relativePath)
         }
         return url
     }

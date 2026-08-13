@@ -455,7 +455,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             records = recordsLoad.value.sorted { $0.createdAt > $1.createdAt }
             if let preserved = recordsLoad.preservedCorruptURL { preservedCorruptURLs.append(preserved) }
             recordsQuarantineActive = try await library.recordsQuarantine() != nil
-            let recordsWereRecovered = recordsLoad.preservedCorruptURL != nil
+            let recordsWereRecovered = recordsQuarantineActive
+            if recordsLoad.manualRecoveryWarning != nil {
+                let libraryRoot = await library.rootURL
+                preservedCorruptURLs.append(libraryRoot.appendingPathComponent("Corrupt", isDirectory: true))
+            }
             if !recordsWereRecovered {
                 if settings.historyRetentionDays > 0 {
                     let cutoff = Calendar.current.date(byAdding: .day, value: -settings.historyRetentionDays, to: .now) ?? .distantPast
@@ -481,7 +485,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 let protection = recordsQuarantineActive
                     ? " Record-audio cleanup remains disabled until you explicitly reset library metadata protection."
                     : ""
-                libraryRecoveryWarning = "Evee preserved unreadable local data and continued with safe defaults.\(protection) Review these private copies before deleting them:\n\(paths.joined(separator: "\n"))"
+                let recoverySummary = recordsLoad.manualRecoveryWarning
+                    ?? "Evee preserved unreadable local data and continued with safe defaults."
+                libraryRecoveryWarning = "\(recoverySummary)\(protection) Review this private location before deleting anything:\n\(paths.joined(separator: "\n"))"
             }
             let selectedTranscriber = try TranscriberFactory.make(settings.model)
             transcriber = selectedTranscriber

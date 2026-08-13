@@ -159,10 +159,16 @@ public struct MeetingDraft: Codable, Equatable, Sendable {
 public struct RecoveredLibraryLoad<Value: Sendable>: Sendable {
     public let value: Value
     public let preservedCorruptURL: URL?
+    public let manualRecoveryWarning: String?
 
-    public init(value: Value, preservedCorruptURL: URL? = nil) {
+    public init(
+        value: Value,
+        preservedCorruptURL: URL? = nil,
+        manualRecoveryWarning: String? = nil
+    ) {
         self.value = value
         self.preservedCorruptURL = preservedCorruptURL
+        self.manualRecoveryWarning = manualRecoveryWarning
     }
 }
 
@@ -170,21 +176,47 @@ public struct RecoveredLibraryLoad<Value: Sendable>: Sendable {
 /// marker exists, record-audio cleanup is disabled until the user explicitly
 /// resets metadata protection.
 public struct RecordsQuarantineMarker: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable {
+        case pending
+        case complete
+    }
+
     public let markerVersion: Int
-    public let preservedCorruptRelativePath: String
+    public let phase: Phase
+    public let preservedCorruptRelativePath: String?
     public let reason: String
     public let createdAt: Date
 
     public init(
-        markerVersion: Int = 1,
-        preservedCorruptRelativePath: String,
+        markerVersion: Int = 2,
+        phase: Phase,
+        preservedCorruptRelativePath: String? = nil,
         reason: String,
         createdAt: Date = .now
     ) {
         self.markerVersion = markerVersion
+        self.phase = phase
         self.preservedCorruptRelativePath = preservedCorruptRelativePath
         self.reason = reason
         self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case markerVersion
+        case phase
+        case preservedCorruptRelativePath
+        case reason
+        case createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        markerVersion = try container.decodeIfPresent(Int.self, forKey: .markerVersion) ?? 1
+        preservedCorruptRelativePath = try container.decodeIfPresent(String.self, forKey: .preservedCorruptRelativePath)
+        phase = try container.decodeIfPresent(Phase.self, forKey: .phase)
+            ?? (preservedCorruptRelativePath == nil ? .pending : .complete)
+        reason = try container.decode(String.self, forKey: .reason)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
     }
 }
 

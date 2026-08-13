@@ -3492,14 +3492,32 @@ private func checkCorruptLibraryRecovery() async throws {
     let relaunchedStore = LibraryStore(rootURL: quarantineRoot)
     let relaunchedLoad = try await relaunchedStore.loadRecordsRecoveringCorruption()
     try require(relaunchedLoad.preservedCorruptURL == firstPreserved, "quarantine warning did not survive relaunch")
-    try await relaunchedStore.save([WorkspaceRecord(kind: .memo, title: "Later", text: "Saved")])
+    let protectedID = UUID()
+    let protectedDirectory = quarantineRoot.appendingPathComponent("Audio/Records/\(protectedID.uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: protectedDirectory, withIntermediateDirectories: true)
+    let protectedAudio = protectedDirectory.appendingPathComponent("known.wav")
+    try coreCheckSilentWAV().write(to: protectedAudio)
+    let protectedRecord = WorkspaceRecord(
+        id: protectedID,
+        kind: .memo,
+        title: "Later",
+        text: "Saved",
+        audioTracks: [WorkspaceAudioTrack(role: .microphone, relativePath: "Audio/Records/\(protectedID.uuidString)/known.wav")]
+    )
+    try await relaunchedStore.save([protectedRecord])
     try await relaunchedStore.reconcileAudioStorage()
     try require(FileManager.default.fileExists(atPath: orphanAudio.path), "ordinary save/reconciliation deleted quarantined record audio")
+    try await relaunchedStore.delete(id: protectedID)
+    try require(FileManager.default.fileExists(atPath: protectedAudio.path), "record delete bypassed quarantine audio protection")
 
     let recoveryInput = quarantineRoot.appendingPathComponent("recovery-input.wav")
     try coreCheckSilentWAV().write(to: recoveryInput)
     let recovery = try await relaunchedStore.beginRecoveryCapture(kind: .memo)
-    _ = try await relaunchedStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: recoveryInput)
+    let recoveryManifest = try await relaunchedStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: recoveryInput)
+    var recoveryOriginals: [URL] = []
+    for track in recoveryManifest.tracks {
+        recoveryOriginals.append(try await relaunchedStore.safeURL(forRelativePath: track.relativePath))
+    }
     _ = try await relaunchedStore.commitRecoveredRecord(
         WorkspaceRecord(kind: .memo, title: "Recovered", text: "Retained"),
         recoveryID: recovery.id,
@@ -3507,10 +3525,64 @@ private func checkCorruptLibraryRecovery() async throws {
         keepAudio: true
     )
     try require(FileManager.default.fileExists(atPath: orphanAudio.path), "new retained recovery reconciled quarantined audio")
+    try require(recoveryOriginals.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "retained recovery cleanup bypassed quarantine protection")
     try await relaunchedStore.resetRecordsQuarantine()
     let resetMarker = try await relaunchedStore.recordsQuarantine()
     try require(resetMarker == nil, "explicit reset left the quarantine marker")
     try require(FileManager.default.fileExists(atPath: orphanAudio.path), "explicit reset deleted audio in the same action")
+
+    let crashCases: [(LibraryStoreWritePoint, Bool)] = [
+        (.recordsQuarantineAfterArming, true),
+        (.recordsQuarantineAfterPreserving, false),
+    ]
+    for (checkpoint, canonicalRemainsAfterFault) in crashCases {
+        let crashRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-quarantine-crash-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: crashRoot) }
+        let seedStore = LibraryStore(rootURL: crashRoot)
+        try await seedStore.prepare()
+        let crashOrphanID = UUID()
+        let crashOrphanDirectory = crashRoot.appendingPathComponent("Audio/Records/\(crashOrphanID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: crashOrphanDirectory, withIntermediateDirectories: true)
+        let crashOrphanAudio = crashOrphanDirectory.appendingPathComponent("unknown.wav")
+        try coreCheckSilentWAV().write(to: crashOrphanAudio)
+        let crashCanonical = crashRoot.appendingPathComponent("records.json")
+        try Data("{".utf8).write(to: crashCanonical)
+        let faultingStore = LibraryStore(rootURL: crashRoot, failNextWritesAt: [checkpoint])
+        do {
+            _ = try await faultingStore.loadRecordsRecoveringCorruption()
+            throw CoreCheckError.assertionFailed("quarantine fault checkpoint did not interrupt preservation")
+        } catch CoreCheckError.assertionFailed(let message) {
+            throw CoreCheckError.assertionFailed(message)
+        } catch {
+            // Expected synthetic crash boundary.
+        }
+        guard let armed = try await faultingStore.recordsQuarantine() else {
+            throw CoreCheckError.assertionFailed("fault checkpoint left no armed quarantine marker")
+        }
+        try require(armed.phase == .pending, "fault checkpoint completed or cleared its quarantine marker")
+        try require(
+            FileManager.default.fileExists(atPath: crashCanonical.path) == canonicalRemainsAfterFault,
+            "fault checkpoint left canonical records in the wrong state"
+        )
+
+        let resumedStore = LibraryStore(rootURL: crashRoot)
+        let resumed = try await resumedStore.loadRecordsRecoveringCorruption()
+        try await resumedStore.reconcileAudioStorage()
+        try require(FileManager.default.fileExists(atPath: crashOrphanAudio.path), "second bootstrap deleted audio under a pending quarantine")
+        guard let resumedMarker = try await resumedStore.recordsQuarantine() else {
+            throw CoreCheckError.assertionFailed("second bootstrap silently removed quarantine")
+        }
+        if canonicalRemainsAfterFault {
+            try require(resumedMarker.phase == .complete, "pending marker with canonical source did not finish preservation")
+            try require(resumed.preservedCorruptURL != nil, "finished pending preservation did not surface its copy")
+            try require(resumed.manualRecoveryWarning == nil, "finished pending preservation still required manual recovery")
+        } else {
+            try require(resumedMarker.phase == .pending, "missing canonical source silently completed quarantine")
+            try require(resumed.preservedCorruptURL == nil, "missing canonical source claimed a completed preserved copy")
+            try require(resumed.manualRecoveryWarning != nil, "missing canonical source did not surface manual recovery")
+        }
+    }
     print("corrupt-library-recovery: passed")
 }
 

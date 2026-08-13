@@ -299,14 +299,29 @@ final class WorkspaceLifecycleTests: XCTestCase {
         let secondStore = LibraryStore(rootURL: root)
         let secondLoad = try await secondStore.loadRecordsRecoveringCorruption()
         XCTAssertEqual(secondLoad.preservedCorruptURL, preserved)
-        try await secondStore.save([WorkspaceRecord(kind: .memo, title: "Later", text: "Saved")])
+        let protectedID = UUID()
+        let protectedDirectory = root.appendingPathComponent("Audio/Records/\(protectedID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: protectedDirectory, withIntermediateDirectories: true)
+        let protectedAudio = protectedDirectory.appendingPathComponent("known.wav")
+        try syntheticSilentWAV().write(to: protectedAudio)
+        let protectedRecord = WorkspaceRecord(
+            id: protectedID,
+            kind: .memo,
+            title: "Later",
+            text: "Saved",
+            audioTracks: [WorkspaceAudioTrack(role: .microphone, relativePath: "Audio/Records/\(protectedID.uuidString)/known.wav")]
+        )
+        try await secondStore.save([protectedRecord])
         try await secondStore.reconcileAudioStorage()
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path))
+        try await secondStore.delete(id: protectedID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: protectedAudio.path), "quarantine must suppress direct record-audio cleanup")
 
         let input = root.appendingPathComponent("input.wav")
         try syntheticSilentWAV().write(to: input)
         let recovery = try await secondStore.beginRecoveryCapture(kind: .memo)
-        _ = try await secondStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: input)
+        let manifest = try await secondStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: input)
+        let recoveryOriginals = try await resolvedURLs(manifest.tracks, in: secondStore)
         _ = try await secondStore.commitRecoveredRecord(
             WorkspaceRecord(kind: .memo, title: "Recovered", text: "Retained"),
             recoveryID: recovery.id,
@@ -314,11 +329,60 @@ final class WorkspaceLifecycleTests: XCTestCase {
             keepAudio: true
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path))
+        XCTAssertTrue(recoveryOriginals.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
 
         try await secondStore.resetRecordsQuarantine()
         let resetMarker = try await secondStore.recordsQuarantine()
         XCTAssertNil(resetMarker)
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path), "reset action must not delete audio")
+    }
+
+    func testPendingRecordsQuarantineSurvivesBothCrashWindowsAndSecondBootstrap() async throws {
+        let cases: [(LibraryStoreWritePoint, Bool)] = [
+            (.recordsQuarantineAfterArming, true),
+            (.recordsQuarantineAfterPreserving, false),
+        ]
+
+        for (checkpoint, canonicalRemainsAfterFault) in cases {
+            let root = temporaryLibraryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let seedingStore = LibraryStore(rootURL: root)
+            try await seedingStore.prepare()
+            let orphanID = UUID()
+            let orphanDirectory = root.appendingPathComponent("Audio/Records/\(orphanID.uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: orphanDirectory, withIntermediateDirectories: true)
+            let orphanAudio = orphanDirectory.appendingPathComponent("unknown.wav")
+            try syntheticSilentWAV().write(to: orphanAudio)
+            let canonical = root.appendingPathComponent("records.json")
+            try Data("{".utf8).write(to: canonical)
+            let faultingStore = LibraryStore(rootURL: root, failNextWritesAt: [checkpoint])
+
+            await XCTAssertThrowsErrorAsync {
+                _ = try await faultingStore.loadRecordsRecoveringCorruption()
+            }
+
+            let loadedArmedMarker = try await faultingStore.recordsQuarantine()
+            let armedMarker = try XCTUnwrap(loadedArmedMarker)
+            XCTAssertEqual(armedMarker.phase, .pending)
+            XCTAssertEqual(FileManager.default.fileExists(atPath: canonical.path), canonicalRemainsAfterFault)
+
+            let relaunchedStore = LibraryStore(rootURL: root)
+            let resumed = try await relaunchedStore.loadRecordsRecoveringCorruption()
+            try await relaunchedStore.reconcileAudioStorage()
+            XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path))
+
+            let loadedResumedMarker = try await relaunchedStore.recordsQuarantine()
+            let resumedMarker = try XCTUnwrap(loadedResumedMarker)
+            if canonicalRemainsAfterFault {
+                XCTAssertEqual(resumedMarker.phase, .complete)
+                XCTAssertNotNil(resumed.preservedCorruptURL)
+                XCTAssertNil(resumed.manualRecoveryWarning)
+            } else {
+                XCTAssertEqual(resumedMarker.phase, .pending)
+                XCTAssertNil(resumed.preservedCorruptURL)
+                XCTAssertNotNil(resumed.manualRecoveryWarning)
+            }
+        }
     }
 
     func testPostReplacementFailureKeepsInstalledRecordAndReferencedAudio() async throws {
