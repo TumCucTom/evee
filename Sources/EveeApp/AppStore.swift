@@ -266,6 +266,23 @@ final class AppStore: ObservableObject {
         do {
             try await library.prepare()
             settings = try await library.loadSettings()
+            let helperStorageRoot = await library.rootURL
+            do {
+                let recovery = try await MCPOwnedRegistration.recover(
+                    allowedRootURLs: [FileManager.default.homeDirectoryForCurrentUser],
+                    storageRootURL: helperStorageRoot,
+                    settings: settings,
+                    saveSettings: { [library] settings in try await library.save(settings) }
+                )
+                settings = try await library.loadSettings()
+                if !recovery.cleanupFailures.isEmpty {
+                    statusMessage = "Local helper access is disabled. An unfinished client registration needs manual cleanup."
+                }
+            } catch {
+                settings.mcpEnabled = false
+                try await library.save(settings)
+                statusMessage = "Local helper access is disabled. Registration recovery needs manual cleanup: \(error.localizedDescription)"
+            }
             configuredWebhookDestination = normalizedWebhookDestination(settings.webhookURL)
             try await loadAndMigrateSecrets()
             if settings.historyRetentionDays > 0 {

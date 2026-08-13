@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum LibraryStoreError: LocalizedError, Sendable {
@@ -589,6 +590,14 @@ public actor LibraryStore {
     private func writePrivate(_ data: Data, to url: URL) throws {
         try data.write(to: url, options: .atomic)
         try makePrivate(url)
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard directory >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(directory) }
+        guard fsync(directory) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     private func makePrivate(_ url: URL) throws {

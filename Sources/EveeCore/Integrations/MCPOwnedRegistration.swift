@@ -21,10 +21,14 @@ public struct MCPRevocationOutcome: Equatable, Sendable {
     }
 }
 
+public typealias MCPRecoveryOutcome = MCPRevocationOutcome
+
 public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
     case manifestAlreadyExists(URL)
     case invalidManifest(URL)
     case unsafeConfiguration(URL)
+    case conflict(URL)
+    case recoveryRequired([String])
     case rollbackFailed(primary: String, failures: [String])
 
     public var errorDescription: String? {
@@ -34,7 +38,11 @@ public enum MCPOwnedRegistrationError: LocalizedError, Sendable {
         case .invalidManifest:
             return "The local helper registration record is invalid, so no client configuration was changed."
         case .unsafeConfiguration:
-            return "A selected client configuration resolves outside its approved local configuration area."
+            return "A selected client configuration no longer resolves to its validated local target."
+        case .conflict:
+            return "The Evee-owned client entry has a cleanup conflict. It was left unchanged and needs manual cleanup."
+        case .recoveryRequired(let failures):
+            return "An unfinished local helper transaction needs manual cleanup: \(failures.joined(separator: "; "))"
         case .rollbackFailed(let primary, let failures):
             return "Registration failed: \(primary) Rollback also failed: \(failures.joined(separator: "; "))"
         }
@@ -46,9 +54,7 @@ public final class MCPAuthorizationLease: @unchecked Sendable {
     private let stateLock = NSLock()
     private var released = false
 
-    fileprivate init(descriptor: Int32) {
-        self.descriptor = descriptor
-    }
+    fileprivate init(descriptor: Int32) { self.descriptor = descriptor }
 
     public func release() {
         stateLock.lock()
@@ -81,38 +87,77 @@ public enum MCPAuthorization {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        let path = lockURL(storageRootURL: storageRootURL).path
-        let descriptor = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let descriptor = open(lockURL(storageRootURL: storageRootURL).path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw posixError() }
         guard flock(descriptor, operation) == 0 else {
-            let code = errno
+            let error = posixError()
             _ = close(descriptor)
-            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            throw error
         }
         guard fchmod(descriptor, 0o600) == 0 else {
-            let code = errno
+            let error = posixError()
             _ = flock(descriptor, LOCK_UN)
             _ = close(descriptor)
-            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+            throw error
         }
         return MCPAuthorizationLease(descriptor: descriptor)
     }
 }
 
 @_spi(Testing)
+public enum MCPRegistrationCheckpoint: String, Sendable {
+    case transactionLeaseAcquired
+    case beforeTargetMutation
+    case afterFirstClientMutation
+    case beforeManifestWrite
+    case beforeDirectoryCleanup
+}
+
+@_spi(Testing)
+public enum MCPRegistrationInjectedCrash: Error, Equatable, Sendable {
+    case checkpoint(MCPRegistrationCheckpoint)
+}
+
+@_spi(Testing)
 public struct MCPRegistrationTesting: Sendable {
     public var beforeRestore: @Sendable (URL) throws -> Void
+    public var checkpoint: @Sendable (MCPRegistrationCheckpoint, URL?) throws -> Void
+    public var crashAt: MCPRegistrationCheckpoint?
 
     public init(beforeRestore: @escaping @Sendable (URL) throws -> Void) {
         self.beforeRestore = beforeRestore
+        self.checkpoint = { _, _ in }
+        self.crashAt = nil
+    }
+
+    public init(checkpoint: @escaping @Sendable (MCPRegistrationCheckpoint, URL?) throws -> Void) {
+        self.beforeRestore = { _ in }
+        self.checkpoint = checkpoint
+        self.crashAt = nil
+    }
+
+    public init(crashAt: MCPRegistrationCheckpoint) {
+        self.beforeRestore = { _ in }
+        self.checkpoint = { _, _ in }
+        self.crashAt = crashAt
+    }
+
+    fileprivate func hit(_ value: MCPRegistrationCheckpoint, url: URL? = nil) throws {
+        try checkpoint(value, url)
+        if crashAt == value { throw MCPRegistrationInjectedCrash.checkpoint(value) }
     }
 }
 
 public enum MCPOwnedRegistration {
     private static let manifestName = "local-helper-registrations.json"
+    private static let journalName = "local-helper-transaction.json"
 
     public static func manifestURL(storageRootURL: URL) -> URL {
         storageRootURL.appendingPathComponent(manifestName)
+    }
+
+    public static func journalURL(storageRootURL: URL) -> URL {
+        storageRootURL.appendingPathComponent(journalName)
     }
 
     public static func enable(
@@ -161,58 +206,47 @@ public enum MCPOwnedRegistration {
         settings: EveeSettings,
         saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
     ) async throws -> MCPRevocationOutcome {
-        let url = manifestURL(storageRootURL: storageRootURL)
-        var disabled = settings
-        disabled.mcpEnabled = false
-        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
-        do {
-            try await saveSettings(disabled)
-        } catch {
-            lease.release()
-            throw error
-        }
-        lease.release()
+        try await revokeImpl(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: nil
+        )
+    }
 
-        let manifest: OwnedRegistrationManifest?
-        do {
-            manifest = try loadManifest(at: url, allowedRootURLs: allowedRootURLs)
-        } catch {
-            return MCPRevocationOutcome(
-                removals: [],
-                cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: url, message: error.localizedDescription)]
-            )
-        }
-        guard let manifest else { return MCPRevocationOutcome(removals: [], cleanupFailures: []) }
-        var removals: [MCPRemovalResult] = []
-        var failures: [MCPRegistrationCleanupFailure] = []
-        for snapshot in manifest.snapshots.reversed() {
-            do {
-                try snapshot.restore(allowedRootURLs: allowedRootURLs)
-                removals.append(MCPRemovalResult(configurationURL: snapshot.selectedURL, removedRegistration: true))
-            } catch {
-                failures.append(MCPRegistrationCleanupFailure(
-                    configurationURL: snapshot.selectedURL,
-                    message: error.localizedDescription
-                ))
-            }
-        }
-        for directoryFailure in cleanupCreatedDirectories(manifest.createdDirectories) {
-            failures.append(MCPRegistrationCleanupFailure(
-                configurationURL: URL(fileURLWithPath: directoryFailure.path, isDirectory: true),
-                message: directoryFailure.message
-            ))
-        }
-        if failures.isEmpty {
-            do {
-                try FileManager.default.removeItem(at: url)
-            } catch {
-                failures.append(MCPRegistrationCleanupFailure(
-                    configurationURL: url,
-                    message: error.localizedDescription
-                ))
-            }
-        }
-        return MCPRevocationOutcome(removals: removals.reversed(), cleanupFailures: failures)
+    @_spi(Testing)
+    public static func revoke(
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        testing: MCPRegistrationTesting
+    ) async throws -> MCPRevocationOutcome {
+        try await revokeImpl(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: testing
+        )
+    }
+
+    public static func recover(
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void
+    ) async throws -> MCPRecoveryOutcome {
+        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        return try await recoverLocked(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: nil
+        )
     }
 
     private static func enableImpl(
@@ -225,10 +259,6 @@ public enum MCPOwnedRegistration {
         testing: MCPRegistrationTesting?
     ) async throws -> [MCPRegistrationResult] {
         guard !clients.isEmpty else { return [] }
-        let url = manifestURL(storageRootURL: storageRootURL)
-        guard !FileManager.default.fileExists(atPath: url.path) else {
-            throw MCPOwnedRegistrationError.manifestAlreadyExists(url)
-        }
         let executable = executableURL.standardizedFileURL
         guard FileManager.default.fileExists(atPath: executable.path) else {
             throw MCPRegistrationError.executableMissing(executable)
@@ -236,241 +266,437 @@ public enum MCPOwnedRegistration {
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw MCPRegistrationError.executableNotRunnable(executable)
         }
-        var snapshots = try clients.map {
-            try ManagedConfigurationSnapshot(selectedURL: $0.configurationURL, allowedRootURLs: allowedRootURLs)
+
+        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        try testing?.hit(.transactionLeaseAcquired)
+
+        let recovery = try await recoverLocked(
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            settings: settings,
+            saveSettings: saveSettings,
+            testing: testing
+        )
+        guard recovery.cleanupFailures.isEmpty else {
+            throw MCPOwnedRegistrationError.recoveryRequired(recovery.cleanupFailures.map(\.message))
         }
-        guard Set(snapshots.map(\.canonicalTargetPath)).count == snapshots.count else {
-            throw MCPOwnedRegistrationError.invalidManifest(url)
+        let manifestURL = manifestURL(storageRootURL: storageRootURL)
+        guard !FileManager.default.fileExists(atPath: manifestURL.path) else {
+            throw MCPOwnedRegistrationError.manifestAlreadyExists(manifestURL)
         }
-        let createdDirectories = transactionCreatedDirectories(for: snapshots.map(\.canonicalTargetURL))
-        let results: [MCPRegistrationResult]
+
+        var handles: [AnchoredTarget] = []
+        var snapshots: [ManagedTargetSnapshot] = []
+        for client in clients {
+            let plan = try AnchoredTarget.plan(
+                selectedURL: client.configurationURL,
+                allowedRootURLs: allowedRootURLs,
+                executableURL: executable
+            )
+            handles.append(plan.handle)
+            snapshots.append(plan.snapshot)
+        }
+        guard Set(snapshots.map { $0.rootPath + "/" + $0.targetRelativePath }).count == snapshots.count else {
+            throw MCPOwnedRegistrationError.invalidManifest(manifestURL)
+        }
+
+        let plannedDirectories = handles.flatMap(\.plannedCreatedDirectories).reduce(into: [CreatedDirectoryRecord]()) { result, record in
+            if !result.contains(where: { $0.rootPath == record.rootPath && $0.relativePath == record.relativePath }) {
+                result.append(record)
+            }
+        }
+        var journal = RegistrationTransactionJournal(
+            version: 2,
+            operation: .enable,
+            phase: .prepared,
+            snapshots: snapshots,
+            createdDirectories: plannedDirectories
+        )
+        try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+
         do {
-            var completed: [MCPRegistrationResult] = []
-            for index in clients.indices {
-                snapshots[index].wasWritten = true
-                do {
-                    let result = try MCPRegistration.writeConfiguration(
-                        at: snapshots[index].canonicalTargetURL,
-                        executableURL: executable
-                    ).withConfigurationURL(clients[index].configurationURL)
-                    try snapshots[index].recordRegisteredIdentity()
-                    completed.append(result)
-                } catch {
-                    let writeError = error
-                    do {
-                        try snapshots[index].recordRegisteredIdentity()
-                    } catch {
-                        throw MCPOwnedRegistrationError.rollbackFailed(
-                            primary: writeError.localizedDescription,
-                            failures: ["Could not bind the touched configuration for rollback: \(error.localizedDescription)"]
-                        )
+            for index in handles.indices {
+                let created = try handles[index].prepareMissingDirectories()
+                for record in created {
+                    if let existing = journal.createdDirectories.firstIndex(where: {
+                        $0.rootPath == record.rootPath && $0.relativePath == record.relativePath
+                    }) {
+                        journal.createdDirectories[existing] = record
+                    } else {
+                        journal.createdDirectories.append(record)
                     }
-                    throw writeError
+                }
+                snapshots[index].parentIdentities = handles[index].parentIdentities
+                journal.snapshots = snapshots
+                try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+
+                try testing?.hit(.beforeTargetMutation, url: snapshots[index].selectedURL)
+                try handles[index].verifyCurrentBinding(snapshot: snapshots[index])
+                try handles[index].prepareTarget(snapshot: &snapshots[index])
+                journal.snapshots = snapshots
+                try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+                try handles[index].writeRegistration(snapshot: &snapshots[index])
+                journal.snapshots = snapshots
+                journal.phase = .clientsMutated
+                try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+                if index == handles.startIndex {
+                    try testing?.hit(.afterFirstClientMutation, url: snapshots[index].selectedURL)
                 }
             }
-            results = completed
+            try testing?.hit(.beforeManifestWrite)
             let manifest = OwnedRegistrationManifest(
-                version: 1,
+                version: 2,
                 snapshots: snapshots,
-                createdDirectories: createdDirectories.map(\.path)
+                createdDirectories: journal.createdDirectories
             )
-            try writeManifest(manifest, at: url)
-        } catch {
-            var failures = restoreForRollback(
-                snapshots: snapshots,
-                createdDirectories: createdDirectories.map(\.path),
-                testing: testing
-            )
-            if failures.isEmpty { failures.append(contentsOf: removeManifestForRollback(at: url)) }
-            guard !failures.isEmpty else {
-                throw error
-            }
-            throw MCPOwnedRegistrationError.rollbackFailed(
-                primary: error.localizedDescription,
-                failures: failures
-            )
-        }
+            try writeDurable(manifest, to: manifestURL)
+            journal.phase = .manifestDurable
+            journal.snapshots = snapshots
+            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
 
-        let lease: MCPAuthorizationLease
-        do {
-            lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
-        } catch {
-            var failures = restoreForRollback(
-                snapshots: snapshots,
-                createdDirectories: createdDirectories.map(\.path),
-                testing: testing
-            )
-            if failures.isEmpty { failures.append(contentsOf: removeManifestForRollback(at: url)) }
-            guard !failures.isEmpty else { throw error }
-            throw MCPOwnedRegistrationError.rollbackFailed(primary: error.localizedDescription, failures: failures)
-        }
-
-        var enabled = settings
-        enabled.mcpEnabled = true
-        do {
+            var enabled = settings
+            enabled.mcpEnabled = true
             try await saveSettings(enabled)
-            lease.release()
-            return results
+            journal.phase = .committed
+            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+            try removeDurable(journalURL(storageRootURL: storageRootURL))
+            return zip(clients, snapshots).map { client, snapshot in
+                MCPRegistrationResult(
+                    configurationURL: client.configurationURL,
+                    executableURL: executable,
+                    replacedExistingRegistration: snapshot.beforeOwned != nil
+                )
+            }
+        } catch let crash as MCPRegistrationInjectedCrash {
+            throw crash
         } catch {
             let primary = error
-            var failures: [String] = []
             var disabled = settings
             disabled.mcpEnabled = false
-            do {
-                try await saveSettings(disabled)
-            } catch {
+            var failures: [String] = []
+            do { try await saveSettings(disabled) } catch {
                 failures.append("Fail-closed authorization restore: \(error.localizedDescription)")
             }
-            failures.append(contentsOf: restoreForRollback(
-                snapshots: snapshots,
-                createdDirectories: createdDirectories.map(\.path),
+            let outcome = try await recoverLocked(
+                allowedRootURLs: allowedRootURLs,
+                storageRootURL: storageRootURL,
+                settings: disabled,
+                saveSettings: saveSettings,
                 testing: testing
-            ))
-            if failures.isEmpty { failures.append(contentsOf: removeManifestForRollback(at: url)) }
-            lease.release()
+            )
+            failures.append(contentsOf: outcome.cleanupFailures.map { "\($0.configurationURL.path): \($0.message)" })
             guard !failures.isEmpty else { throw primary }
-            throw MCPOwnedRegistrationError.rollbackFailed(
-                primary: primary.localizedDescription,
-                failures: failures
+            throw MCPOwnedRegistrationError.rollbackFailed(primary: primary.localizedDescription, failures: failures)
+        }
+    }
+
+    private static func revokeImpl(
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
+        testing: MCPRegistrationTesting?
+    ) async throws -> MCPRevocationOutcome {
+        let lease = try MCPAuthorization.exclusiveLease(storageRootURL: storageRootURL)
+        defer { lease.release() }
+        try testing?.hit(.transactionLeaseAcquired)
+
+        var disabled = settings
+        disabled.mcpEnabled = false
+        try await saveSettings(disabled)
+
+        let recovery: MCPRecoveryOutcome
+        do {
+            recovery = try await recoverLocked(
+                allowedRootURLs: allowedRootURLs,
+                storageRootURL: storageRootURL,
+                settings: disabled,
+                saveSettings: saveSettings,
+                testing: testing
+            )
+        } catch {
+            return MCPRevocationOutcome(
+                removals: [],
+                cleanupFailures: [MCPRegistrationCleanupFailure(
+                    configurationURL: journalURL(storageRootURL: storageRootURL),
+                    message: error.localizedDescription
+                )]
+            )
+        }
+        guard recovery.cleanupFailures.isEmpty else { return recovery }
+
+        let manifestURL = manifestURL(storageRootURL: storageRootURL)
+        let manifest: OwnedRegistrationManifest
+        do {
+            guard let loaded: OwnedRegistrationManifest = try loadDurableIfPresent(
+                OwnedRegistrationManifest.self,
+                from: manifestURL
+            ) else { return MCPRevocationOutcome(removals: [], cleanupFailures: []) }
+            try validate(manifest: loaded, allowedRootURLs: allowedRootURLs, sourceURL: manifestURL)
+            manifest = loaded
+        } catch {
+            return MCPRevocationOutcome(
+                removals: [],
+                cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: manifestURL, message: error.localizedDescription)]
+            )
+        }
+        let journal = RegistrationTransactionJournal(
+            version: 2,
+            operation: .revoke,
+            phase: .prepared,
+            snapshots: manifest.snapshots,
+            createdDirectories: manifest.createdDirectories
+        )
+        do {
+            try writeDurable(journal, to: journalURL(storageRootURL: storageRootURL))
+            return try reverseLocked(
+                journal: journal,
+                allowedRootURLs: allowedRootURLs,
+                storageRootURL: storageRootURL,
+                testing: testing
+            )
+        } catch {
+            return MCPRevocationOutcome(
+                removals: [],
+                cleanupFailures: [MCPRegistrationCleanupFailure(
+                    configurationURL: journalURL(storageRootURL: storageRootURL),
+                    message: error.localizedDescription
+                )]
             )
         }
     }
 
-    private static func restoreForRollback(
-        snapshots: [ManagedConfigurationSnapshot],
-        createdDirectories: [String],
+    private static func recoverLocked(
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        settings: EveeSettings,
+        saveSettings: @escaping @Sendable (EveeSettings) async throws -> Void,
         testing: MCPRegistrationTesting?
-    ) -> [String] {
-        var failures: [String] = []
-        for snapshot in snapshots.reversed() where snapshot.wasWritten {
+    ) async throws -> MCPRecoveryOutcome {
+        let url = journalURL(storageRootURL: storageRootURL)
+        guard let journal: RegistrationTransactionJournal = try loadDurableIfPresent(
+            RegistrationTransactionJournal.self,
+            from: url
+        ) else { return MCPRecoveryOutcome(removals: [], cleanupFailures: []) }
+        try validate(journal: journal, allowedRootURLs: allowedRootURLs, sourceURL: url)
+        if journal.operation == .enable, journal.phase == .committed {
+            try removeDurable(url)
+            return MCPRecoveryOutcome(removals: [], cleanupFailures: [])
+        }
+        var disabled = settings
+        disabled.mcpEnabled = false
+        do {
+            try await saveSettings(disabled)
+        } catch {
+            return MCPRecoveryOutcome(
+                removals: [],
+                cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: url, message: error.localizedDescription)]
+            )
+        }
+        return try reverseLocked(
+            journal: journal,
+            allowedRootURLs: allowedRootURLs,
+            storageRootURL: storageRootURL,
+            testing: testing
+        )
+    }
+
+    private static func reverseLocked(
+        journal: RegistrationTransactionJournal,
+        allowedRootURLs: [URL],
+        storageRootURL: URL,
+        testing: MCPRegistrationTesting?
+    ) throws -> MCPRevocationOutcome {
+        var removals: [MCPRemovalResult] = []
+        var failures: [MCPRegistrationCleanupFailure] = []
+        for snapshot in journal.snapshots.reversed() where snapshot.mutationApplied {
             do {
                 try testing?.beforeRestore(snapshot.selectedURL)
-                try snapshot.restoreWithoutRootRevalidation()
-            } catch {
-                failures.append("\(snapshot.selectedURL.path): \(error.localizedDescription)")
-            }
-        }
-        failures.append(contentsOf: cleanupCreatedDirectories(createdDirectories).map {
-            "\($0.path): \($0.message)"
-        })
-        return failures
-    }
-
-    private static func removeManifestForRollback(at url: URL) -> [String] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        do {
-            try FileManager.default.removeItem(at: url)
-            return []
-        } catch {
-            return ["\(url.path): \(error.localizedDescription)"]
-        }
-    }
-
-    private static func transactionCreatedDirectories(for targets: [URL]) -> [URL] {
-        var paths = Set<String>()
-        for target in targets {
-            var directory = target.deletingLastPathComponent()
-            while !FileManager.default.fileExists(atPath: directory.path), directory.path != "/" {
-                paths.insert(directory.path)
-                directory.deleteLastPathComponent()
-            }
-        }
-        return paths.sorted { $0.count < $1.count }.map { URL(fileURLWithPath: $0, isDirectory: true) }
-    }
-
-    private static func cleanupCreatedDirectories(_ paths: [String]) -> [(path: String, message: String)] {
-        var failures: [(path: String, message: String)] = []
-        for path in paths.sorted(by: { $0.count > $1.count }) {
-            var info = stat()
-            guard lstat(path, &info) == 0 else {
-                if errno != ENOENT {
-                    failures.append((path, POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO).localizedDescription))
+                let handle = try AnchoredTarget.reopen(snapshot: snapshot, allowedRootURLs: allowedRootURLs)
+                let result = try handle.reverse(snapshot: snapshot)
+                if result == .reversed {
+                    removals.append(MCPRemovalResult(configurationURL: snapshot.selectedURL, removedRegistration: true))
                 }
-                continue
-            }
-            guard info.st_mode & S_IFMT == S_IFDIR else {
-                failures.append((path, "The transaction-created path is no longer an ordinary directory."))
-                continue
-            }
-            do {
-                let contents = try FileManager.default.contentsOfDirectory(atPath: path)
-                guard contents.isEmpty else { continue }
-                try FileManager.default.removeItem(atPath: path)
-            } catch let error as CocoaError where error.code == .fileNoSuchFile {
-                continue
             } catch {
-                failures.append((path, error.localizedDescription))
+                failures.append(MCPRegistrationCleanupFailure(
+                    configurationURL: snapshot.selectedURL,
+                    message: error.localizedDescription
+                ))
             }
         }
-        return failures
+        if failures.isEmpty {
+            for directory in journal.createdDirectories.reversed() {
+                do {
+                    try testing?.hit(.beforeDirectoryCleanup, url: directory.url)
+                    try removeCreatedDirectoryIfOwned(directory, allowedRootURLs: allowedRootURLs)
+                } catch {
+                    failures.append(MCPRegistrationCleanupFailure(
+                        configurationURL: directory.url,
+                        message: error.localizedDescription
+                    ))
+                }
+            }
+        }
+        guard failures.isEmpty else {
+            return MCPRevocationOutcome(removals: removals.reversed(), cleanupFailures: failures)
+        }
+        let manifest = manifestURL(storageRootURL: storageRootURL)
+        if FileManager.default.fileExists(atPath: manifest.path) {
+            do { try removeDurable(manifest) } catch {
+                return MCPRevocationOutcome(
+                    removals: removals.reversed(),
+                    cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: manifest, message: error.localizedDescription)]
+                )
+            }
+        }
+        let journalURL = journalURL(storageRootURL: storageRootURL)
+        do { try removeDurable(journalURL) } catch {
+            return MCPRevocationOutcome(
+                removals: removals.reversed(),
+                cleanupFailures: [MCPRegistrationCleanupFailure(configurationURL: journalURL, message: error.localizedDescription)]
+            )
+        }
+        return MCPRevocationOutcome(removals: removals.reversed(), cleanupFailures: [])
     }
 
-    private static func writeManifest(_ manifest: OwnedRegistrationManifest, at url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
+    private static func validate(
+        manifest: OwnedRegistrationManifest,
+        allowedRootURLs: [URL],
+        sourceURL: URL
+    ) throws {
+        guard manifest.version == 2 else { throw MCPOwnedRegistrationError.invalidManifest(sourceURL) }
+        try validateRecords(
+            snapshots: manifest.snapshots,
+            directories: manifest.createdDirectories,
+            allowedRootURLs: allowedRootURLs,
+            sourceURL: sourceURL
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(manifest).write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    private static func loadManifest(at url: URL, allowedRootURLs: [URL]) throws -> OwnedRegistrationManifest? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        do {
-            let manifest = try JSONDecoder().decode(OwnedRegistrationManifest.self, from: Data(contentsOf: url))
-            guard manifest.version == 1,
-                  Set(manifest.snapshots.map(\.canonicalTargetPath)).count == manifest.snapshots.count else {
-                throw MCPOwnedRegistrationError.invalidManifest(url)
-            }
-            for snapshot in manifest.snapshots {
-                try snapshot.validateStoredTarget(allowedRootURLs: allowedRootURLs)
-            }
-            for directoryPath in manifest.createdDirectories {
-                let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true).standardizedFileURL
-                guard directoryURL.path == directoryPath,
-                      isPath(directoryURL.path, allowedBy: allowedRootURLs),
-                      manifest.snapshots.contains(where: {
-                          $0.canonicalTargetPath.hasPrefix(directoryPath.hasSuffix("/") ? directoryPath : directoryPath + "/")
-                      }) else {
-                    throw MCPOwnedRegistrationError.invalidManifest(url)
-                }
-            }
-            return manifest
-        } catch let error as MCPOwnedRegistrationError {
-            throw error
-        } catch {
-            throw MCPOwnedRegistrationError.invalidManifest(url)
+    private static func validate(
+        journal: RegistrationTransactionJournal,
+        allowedRootURLs: [URL],
+        sourceURL: URL
+    ) throws {
+        guard journal.version == 2 else { throw MCPOwnedRegistrationError.invalidManifest(sourceURL) }
+        try validateRecords(
+            snapshots: journal.snapshots,
+            directories: journal.createdDirectories,
+            allowedRootURLs: allowedRootURLs,
+            sourceURL: sourceURL
+        )
+    }
+
+    private static func validateRecords(
+        snapshots: [ManagedTargetSnapshot],
+        directories: [CreatedDirectoryRecord],
+        allowedRootURLs: [URL],
+        sourceURL: URL
+    ) throws {
+        let allowed = Set(allowedRootURLs.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
+        guard snapshots.allSatisfy({ snapshot in
+            allowed.contains(snapshot.rootPath)
+                && safeRelativePath(snapshot.targetRelativePath)
+                && safeRelativePath(snapshot.selectedRelativePath)
+        }), Set(snapshots.map { $0.rootPath + "/" + $0.targetRelativePath }).count == snapshots.count,
+        directories.allSatisfy({ allowed.contains($0.rootPath) && safeRelativePath($0.relativePath) }) else {
+            throw MCPOwnedRegistrationError.invalidManifest(sourceURL)
         }
     }
 
-    private static func isPath(_ path: String, allowedBy roots: [URL]) -> Bool {
-        roots.contains { root in
-            let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
-            return path == rootPath || path.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+    private static func removeCreatedDirectoryIfOwned(
+        _ record: CreatedDirectoryRecord,
+        allowedRootURLs: [URL]
+    ) throws {
+        guard allowedRootURLs.map({ $0.resolvingSymlinksInPath().standardizedFileURL.path }).contains(record.rootPath) else {
+            throw MCPOwnedRegistrationError.invalidManifest(record.url)
         }
+        let traversal = try DirectoryTraversal(rootPath: record.rootPath)
+        let planned = try traversal.openDeepestDirectory(relativePath: record.relativePath)
+        guard planned.missing.isEmpty else {
+            _ = close(planned.descriptor)
+            return
+        }
+        defer { _ = close(planned.descriptor) }
+        guard let identity = record.identity else { return }
+        guard try descriptorIdentity(planned.descriptor) == identity else {
+            throw MCPOwnedRegistrationError.rollbackFailed(
+                primary: "Created-directory identity conflict.",
+                failures: [record.url.path]
+            )
+        }
+        let parts = pathComponents(record.relativePath)
+        guard let name = parts.last else { throw MCPOwnedRegistrationError.invalidManifest(record.url) }
+        let parentPath = parts.dropLast().joined(separator: "/")
+        let parent = try traversal.openDirectory(relativePath: parentPath, verify: nil)
+        defer { _ = close(parent.descriptor) }
+        guard unlinkat(parent.descriptor, name, AT_REMOVEDIR) == 0 else {
+            if errno == ENOTEMPTY { return }
+            throw posixError()
+        }
+        guard fsync(parent.descriptor) == 0 else { throw posixError() }
     }
+}
+
+private enum TransactionOperation: String, Codable { case enable, revoke }
+private enum TransactionPhase: String, Codable { case prepared, clientsMutated, manifestDurable, committed }
+
+private struct RegistrationTransactionJournal: Codable {
+    var version: Int
+    var operation: TransactionOperation
+    var phase: TransactionPhase
+    var snapshots: [ManagedTargetSnapshot]
+    var createdDirectories: [CreatedDirectoryRecord]
 }
 
 private struct OwnedRegistrationManifest: Codable {
     var version: Int
-    var snapshots: [ManagedConfigurationSnapshot]
-    var createdDirectories: [String]
+    var snapshots: [ManagedTargetSnapshot]
+    var createdDirectories: [CreatedDirectoryRecord]
 }
 
-private struct ManagedConfigurationSnapshot: Codable {
-    var selectedPath: String
-    var canonicalTargetPath: String
-    var symbolicLinkDestination: String?
+private struct FileIdentity: Codable, Equatable {
+    var deviceID: UInt64
+    var fileID: UInt64
+
+    init(_ info: stat) {
+        deviceID = UInt64(info.st_dev)
+        fileID = UInt64(info.st_ino)
+    }
+}
+
+private struct ParentIdentity: Codable, Equatable {
+    var relativePath: String
+    var identity: FileIdentity
+}
+
+private struct CreatedDirectoryRecord: Codable {
+    var rootPath: String
+    var relativePath: String
+    var identity: FileIdentity?
+    var url: URL { URL(fileURLWithPath: rootPath).appendingPathComponent(relativePath, isDirectory: true) }
+}
+
+private enum ConfigurationFormat: String, Codable { case json, toml }
+
+private struct ManagedTargetSnapshot: Codable {
+    var clientName: String
+    var rootPath: String
+    var selectedRelativePath: String
+    var targetRelativePath: String
+    var symlinkDestination: String?
+    var symlinkIdentity: FileIdentity?
+    var parentIdentities: [ParentIdentity]
+    var format: ConfigurationFormat
     var existed: Bool
-    var wasWritten: Bool
-    var originalDeviceID: UInt64?
-    var originalFileID: UInt64?
-    var registeredDeviceID: UInt64?
-    var registeredFileID: UInt64?
-    var data: Data?
+    var mutationApplied: Bool
+    var originalIdentity: FileIdentity?
+    var registeredIdentity: FileIdentity?
+    var beforeData: Data?
+    var afterData: Data
+    var beforeOwned: Data?
+    var afterOwned: Data
     var permissions: UInt16?
     var ownerID: UInt32?
     var groupID: UInt32?
@@ -481,300 +707,747 @@ private struct ManagedConfigurationSnapshot: Codable {
     var accessControlList: String?
     var extendedAttributes: [String: Data]
 
-    var selectedURL: URL { URL(fileURLWithPath: selectedPath) }
-    var canonicalTargetURL: URL { URL(fileURLWithPath: canonicalTargetPath) }
+    var selectedURL: URL {
+        URL(fileURLWithPath: rootPath).appendingPathComponent(selectedRelativePath)
+    }
+}
 
-    init(selectedURL: URL, allowedRootURLs: [URL]) throws {
-        let selected = selectedURL.standardizedFileURL
-        self.selectedPath = selected.path
-        let linkDestination = try Self.symbolicLinkDestination(at: selected)
-        self.symbolicLinkDestination = linkDestination
-        let canonical: URL
-        if linkDestination != nil {
-            canonical = selected.resolvingSymlinksInPath().standardizedFileURL
-        } else {
-            canonical = selected.deletingLastPathComponent().resolvingSymlinksInPath()
-                .appendingPathComponent(selected.lastPathComponent).standardizedFileURL
+private enum ReverseResult { case reversed, alreadyReversed }
+
+private final class AnchoredTarget {
+    let rootPath: String
+    let selectedRelativePath: String
+    let targetRelativePath: String
+    let traversal: DirectoryTraversal
+    var parentDescriptor: Int32
+    var targetDescriptor: Int32?
+    var parentIdentities: [ParentIdentity]
+    private let missingDirectories: [String]
+    private let symlinkIdentity: FileIdentity?
+    private let symlinkDestination: String?
+
+    var plannedCreatedDirectories: [CreatedDirectoryRecord] {
+        var relative = parentIdentities.last?.relativePath ?? ""
+        return missingDirectories.map { component in
+            relative = relative.isEmpty ? component : relative + "/" + component
+            return CreatedDirectoryRecord(rootPath: rootPath, relativePath: relative, identity: nil)
         }
-        guard Self.isAllowed(selected, roots: allowedRootURLs),
-              Self.isAllowed(canonical, roots: allowedRootURLs) else {
+    }
+
+    private init(
+        rootPath: String,
+        selectedRelativePath: String,
+        targetRelativePath: String,
+        traversal: DirectoryTraversal,
+        parentDescriptor: Int32,
+        targetDescriptor: Int32?,
+        parentIdentities: [ParentIdentity],
+        missingDirectories: [String],
+        symlinkIdentity: FileIdentity?,
+        symlinkDestination: String?
+    ) {
+        self.rootPath = rootPath
+        self.selectedRelativePath = selectedRelativePath
+        self.targetRelativePath = targetRelativePath
+        self.traversal = traversal
+        self.parentDescriptor = parentDescriptor
+        self.targetDescriptor = targetDescriptor
+        self.parentIdentities = parentIdentities
+        self.missingDirectories = missingDirectories
+        self.symlinkIdentity = symlinkIdentity
+        self.symlinkDestination = symlinkDestination
+    }
+
+    deinit {
+        if parentDescriptor >= 0 { _ = close(parentDescriptor) }
+        if let targetDescriptor { _ = close(targetDescriptor) }
+    }
+
+    static func plan(
+        selectedURL: URL,
+        allowedRootURLs: [URL],
+        executableURL: URL
+    ) throws -> (handle: AnchoredTarget, snapshot: ManagedTargetSnapshot) {
+        let selected = selectedURL.standardizedFileURL
+        let roots = allowedRootURLs.map { $0.resolvingSymlinksInPath().standardizedFileURL }
+        guard let root = roots.first(where: { contains(path: selected.path, root: $0.path) }) else {
             throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
         }
-        self.canonicalTargetPath = canonical.path
-
-        var info = stat()
-        if lstat(canonical.path, &info) == 0 {
-            guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1 else {
-                throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
-            }
-            existed = true
-            wasWritten = false
-            originalDeviceID = UInt64(info.st_dev)
-            originalFileID = UInt64(info.st_ino)
-            registeredDeviceID = nil
-            registeredFileID = nil
-            data = try Data(contentsOf: canonical)
-            permissions = UInt16(info.st_mode & 0o7777)
-            ownerID = info.st_uid
-            groupID = info.st_gid
-            accessTimeSeconds = Int64(info.st_atimespec.tv_sec)
-            accessTimeNanoseconds = Int64(info.st_atimespec.tv_nsec)
-            modificationTimeSeconds = Int64(info.st_mtimespec.tv_sec)
-            modificationTimeNanoseconds = Int64(info.st_mtimespec.tv_nsec)
-            accessControlList = try Self.readACL(at: canonical.path)
-            extendedAttributes = try Self.readExtendedAttributes(at: canonical.path)
-            var verifiedInfo = stat()
-            guard lstat(canonical.path, &verifiedInfo) == 0,
-                  verifiedInfo.st_mode & S_IFMT == S_IFREG,
-                  UInt64(verifiedInfo.st_dev) == originalDeviceID,
-                  UInt64(verifiedInfo.st_ino) == originalFileID else {
-                throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
-            }
-        } else if errno == ENOENT {
-            existed = false
-            wasWritten = false
-            originalDeviceID = nil
-            originalFileID = nil
-            registeredDeviceID = nil
-            registeredFileID = nil
-            data = nil
-            permissions = nil
-            ownerID = nil
-            groupID = nil
-            accessTimeSeconds = nil
-            accessTimeNanoseconds = nil
-            modificationTimeSeconds = nil
-            modificationTimeNanoseconds = nil
-            accessControlList = nil
-            extendedAttributes = [:]
-        } else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        let selectedRelative = relativePath(selected.path, root: root.path)
+        guard safeRelativePath(selectedRelative), let selectedName = pathComponents(selectedRelative).last else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
         }
-    }
-
-    mutating func recordRegisteredIdentity() throws {
-        var info = stat()
-        guard lstat(canonicalTargetPath, &info) == 0,
-              info.st_mode & S_IFMT == S_IFREG,
-              info.st_nlink == 1 else {
-            throw MCPOwnedRegistrationError.unsafeConfiguration(selectedURL)
-        }
-        registeredDeviceID = UInt64(info.st_dev)
-        registeredFileID = UInt64(info.st_ino)
-        if existed,
-           (registeredDeviceID != originalDeviceID || registeredFileID != originalFileID) {
-            throw MCPOwnedRegistrationError.unsafeConfiguration(selectedURL)
-        }
-    }
-
-    func validateBinding(allowedRootURLs: [URL]) throws {
-        try validateStoredTarget(allowedRootURLs: allowedRootURLs)
-        let currentLink = try Self.symbolicLinkDestination(at: selectedURL)
-        guard currentLink == symbolicLinkDestination else {
-            throw MCPOwnedRegistrationError.invalidManifest(selectedURL)
-        }
-        let currentCanonical: URL
-        if symbolicLinkDestination != nil {
-            currentCanonical = selectedURL.resolvingSymlinksInPath().standardizedFileURL
-        } else {
-            currentCanonical = selectedURL.deletingLastPathComponent().resolvingSymlinksInPath()
-                .appendingPathComponent(selectedURL.lastPathComponent).standardizedFileURL
-        }
-        guard currentCanonical.path == canonicalTargetPath else {
-            throw MCPOwnedRegistrationError.invalidManifest(selectedURL)
-        }
-    }
-
-    func validateStoredTarget(allowedRootURLs: [URL]) throws {
-        guard selectedURL.path == selectedPath,
-              canonicalTargetURL.path == canonicalTargetPath,
-              Self.isAllowed(selectedURL, roots: allowedRootURLs),
-              Self.isAllowed(canonicalTargetURL, roots: allowedRootURLs) else {
-            throw MCPOwnedRegistrationError.unsafeConfiguration(selectedURL)
-        }
-    }
-
-    func restore(allowedRootURLs: [URL]) throws {
-        try validateBinding(allowedRootURLs: allowedRootURLs)
-        try restoreWithoutRootRevalidation()
-    }
-
-    func restoreWithoutRootRevalidation() throws {
-        var currentInfo = stat()
-        let currentExists = lstat(canonicalTargetPath, &currentInfo) == 0
-        if currentExists {
-            guard currentInfo.st_mode & S_IFMT == S_IFREG,
-                  currentInfo.st_nlink == 1,
-                  UInt64(currentInfo.st_dev) == registeredDeviceID,
-                  UInt64(currentInfo.st_ino) == registeredFileID else {
-                throw MCPOwnedRegistrationError.invalidManifest(selectedURL)
-            }
-        } else if errno != ENOENT {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        if existed {
-            guard currentExists,
-                  originalDeviceID == registeredDeviceID,
-                  originalFileID == registeredFileID else {
-                throw MCPOwnedRegistrationError.invalidManifest(selectedURL)
-            }
-            guard let data, let permissions, let ownerID, let groupID,
-                  let accessTimeSeconds, let accessTimeNanoseconds,
-                  let modificationTimeSeconds, let modificationTimeNanoseconds else {
-                throw MCPOwnedRegistrationError.invalidManifest(selectedURL)
-            }
-            try Self.writeInPlace(
-                data,
-                to: canonicalTargetURL,
-                expectedDeviceID: registeredDeviceID,
-                expectedFileID: registeredFileID
-            )
-            guard chown(canonicalTargetPath, uid_t(ownerID), gid_t(groupID)) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            guard chmod(canonicalTargetPath, mode_t(permissions)) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            try Self.restoreACL(accessControlList, at: canonicalTargetPath)
-            try Self.restoreExtendedAttributes(extendedAttributes, at: canonicalTargetPath)
-            var times = [
-                timespec(tv_sec: time_t(accessTimeSeconds), tv_nsec: Int(accessTimeNanoseconds)),
-                timespec(tv_sec: time_t(modificationTimeSeconds), tv_nsec: Int(modificationTimeNanoseconds)),
-            ]
-            guard utimensat(AT_FDCWD, canonicalTargetPath, &times, 0) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-        } else {
-            if currentExists {
-                guard unlink(canonicalTargetPath) == 0 else {
-                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        let traversal = try DirectoryTraversal(rootPath: root.path)
+        let selectedParentPath = pathComponents(selectedRelative).dropLast().joined(separator: "/")
+        let parentPlan = try traversal.openDeepestDirectory(relativePath: selectedParentPath)
+        var targetRelative = selectedRelative
+        var linkIdentity: FileIdentity?
+        var linkDestination: String?
+        if parentPlan.missing.isEmpty {
+            var linkInfo = stat()
+            let linkResult = fstatat(parentPlan.descriptor, selectedName, &linkInfo, AT_SYMLINK_NOFOLLOW)
+            if linkResult == 0, linkInfo.st_mode & S_IFMT == S_IFLNK {
+                linkIdentity = FileIdentity(linkInfo)
+                linkDestination = try readLink(at: parentPlan.descriptor, name: selectedName)
+                let targetURL: URL
+                if linkDestination!.hasPrefix("/") {
+                    targetURL = URL(fileURLWithPath: linkDestination!).standardizedFileURL
+                } else {
+                    targetURL = selected.deletingLastPathComponent().appendingPathComponent(linkDestination!).standardizedFileURL
                 }
+                guard contains(path: targetURL.path, root: root.path) else {
+                    throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
+                }
+                targetRelative = relativePath(targetURL.path, root: root.path)
+            } else if linkResult != 0, errno != ENOENT {
+                throw posixError()
             }
         }
-    }
 
-    private static func symbolicLinkDestination(at url: URL) throws -> String? {
+        let targetParts = pathComponents(targetRelative)
+        guard let targetName = targetParts.last else { throw MCPOwnedRegistrationError.unsafeConfiguration(selected) }
+        let targetParentPath = targetParts.dropLast().joined(separator: "/")
+        let targetParentPlan = try traversal.openDeepestDirectory(relativePath: targetParentPath)
+        var descriptor: Int32?
         var info = stat()
-        guard lstat(url.path, &info) == 0 else {
-            if errno == ENOENT { return nil }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        guard info.st_mode & S_IFMT == S_IFLNK else { return nil }
-        return try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
-    }
-
-    private static func isAllowed(_ url: URL, roots: [URL]) -> Bool {
-        let path = url.standardizedFileURL.path
-        return roots.contains { root in
-            let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
-            return path == rootPath || path.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
-        }
-    }
-
-    private static func writeInPlace(
-        _ data: Data,
-        to url: URL,
-        expectedDeviceID: UInt64?,
-        expectedFileID: UInt64?
-    ) throws {
-        let descriptor = open(url.path, O_WRONLY | O_NOFOLLOW, 0o600)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { _ = close(descriptor) }
-        var info = stat()
-        guard fstat(descriptor, &info) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        guard info.st_mode & S_IFMT == S_IFREG,
-              info.st_nlink == 1,
-              UInt64(info.st_dev) == expectedDeviceID,
-              UInt64(info.st_ino) == expectedFileID else {
-            throw MCPOwnedRegistrationError.invalidManifest(url)
-        }
-        guard ftruncate(descriptor, 0) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        try data.withUnsafeBytes { rawBuffer in
-            guard var pointer = rawBuffer.baseAddress else { return }
-            var remaining = rawBuffer.count
-            while remaining > 0 {
-                let count = Darwin.write(descriptor, pointer, remaining)
-                guard count >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-                remaining -= count
-                pointer = pointer.advanced(by: count)
+        var data: Data?
+        var metadata = FileMetadata.empty
+        if targetParentPlan.missing.isEmpty {
+            let fd = openat(targetParentPlan.descriptor, targetName, O_RDWR | O_NOFOLLOW)
+            if fd >= 0 {
+                guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1 else {
+                    _ = close(fd)
+                    throw MCPOwnedRegistrationError.unsafeConfiguration(selected)
+                }
+                descriptor = fd
+                data = try readAll(fd)
+                metadata = try FileMetadata(descriptor: fd, info: info)
+            } else if errno != ENOENT {
+                throw posixError()
             }
         }
-        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let format: ConfigurationFormat = selected.pathExtension.lowercased() == "toml" ? .toml : .json
+        let image = try ConfigurationImage.make(format: format, before: data, executableURL: executableURL, sourceURL: selected)
+        let handle = AnchoredTarget(
+            rootPath: root.path,
+            selectedRelativePath: selectedRelative,
+            targetRelativePath: targetRelative,
+            traversal: traversal,
+            parentDescriptor: targetParentPlan.descriptor,
+            targetDescriptor: descriptor,
+            parentIdentities: targetParentPlan.identities,
+            missingDirectories: targetParentPlan.missing,
+            symlinkIdentity: linkIdentity,
+            symlinkDestination: linkDestination
+        )
+        let snapshot = ManagedTargetSnapshot(
+            clientName: selectedURL.lastPathComponent,
+            rootPath: root.path,
+            selectedRelativePath: selectedRelative,
+            targetRelativePath: targetRelative,
+            symlinkDestination: linkDestination,
+            symlinkIdentity: linkIdentity,
+            parentIdentities: targetParentPlan.identities,
+            format: format,
+            existed: data != nil,
+            mutationApplied: false,
+            originalIdentity: descriptor == nil ? nil : FileIdentity(info),
+            registeredIdentity: nil,
+            beforeData: data,
+            afterData: image.afterData,
+            beforeOwned: image.beforeOwned,
+            afterOwned: image.afterOwned,
+            permissions: metadata.permissions,
+            ownerID: metadata.ownerID,
+            groupID: metadata.groupID,
+            accessTimeSeconds: metadata.accessTimeSeconds,
+            accessTimeNanoseconds: metadata.accessTimeNanoseconds,
+            modificationTimeSeconds: metadata.modificationTimeSeconds,
+            modificationTimeNanoseconds: metadata.modificationTimeNanoseconds,
+            accessControlList: metadata.accessControlList,
+            extendedAttributes: metadata.extendedAttributes
+        )
+        return (handle, snapshot)
     }
 
-    private static func readExtendedAttributes(at path: String) throws -> [String: Data] {
-        let size = listxattr(path, nil, 0, 0)
-        guard size >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        guard size > 0 else { return [:] }
-        var buffer = [CChar](repeating: 0, count: size)
-        let read = buffer.withUnsafeMutableBufferPointer { listxattr(path, $0.baseAddress, size, 0) }
-        guard read >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        let names = Data(bytes: buffer, count: read).split(separator: 0).compactMap { String(data: $0, encoding: .utf8) }
-        var result: [String: Data] = [:]
-        for name in names {
-            let valueSize = getxattr(path, name, nil, 0, 0, 0)
-            guard valueSize >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            var value = Data(count: valueSize)
-            let valueRead = value.withUnsafeMutableBytes { getxattr(path, name, $0.baseAddress, valueSize, 0, 0) }
-            guard valueRead >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            result[name] = value
+    static func reopen(snapshot: ManagedTargetSnapshot, allowedRootURLs: [URL]) throws -> AnchoredTarget {
+        guard allowedRootURLs.map({ $0.resolvingSymlinksInPath().standardizedFileURL.path }).contains(snapshot.rootPath) else {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
         }
-        return result
+        let traversal = try DirectoryTraversal(rootPath: snapshot.rootPath)
+        let targetParts = pathComponents(snapshot.targetRelativePath)
+        guard let targetName = targetParts.last else { throw MCPOwnedRegistrationError.invalidManifest(snapshot.selectedURL) }
+        let parentPath = targetParts.dropLast().joined(separator: "/")
+        let parent = try traversal.openDirectory(relativePath: parentPath, verify: snapshot.parentIdentities)
+        let fd = openat(parent.descriptor, targetName, O_RDWR | O_NOFOLLOW)
+        var descriptor: Int32?
+        if fd >= 0 { descriptor = fd } else if errno != ENOENT { _ = close(parent.descriptor); throw posixError() }
+        let handle = AnchoredTarget(
+            rootPath: snapshot.rootPath,
+            selectedRelativePath: snapshot.selectedRelativePath,
+            targetRelativePath: snapshot.targetRelativePath,
+            traversal: traversal,
+            parentDescriptor: parent.descriptor,
+            targetDescriptor: descriptor,
+            parentIdentities: parent.identities,
+            missingDirectories: [],
+            symlinkIdentity: snapshot.symlinkIdentity,
+            symlinkDestination: snapshot.symlinkDestination
+        )
+        try handle.verifyCurrentBinding(snapshot: snapshot)
+        return handle
     }
 
-    private static func restoreExtendedAttributes(_ attributes: [String: Data], at path: String) throws {
-        let current = try readExtendedAttributes(at: path)
-        for name in current.keys where attributes[name] == nil {
-            guard removexattr(path, name, 0) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    func prepareMissingDirectories() throws -> [CreatedDirectoryRecord] {
+        guard !missingDirectories.isEmpty else { return [] }
+        _ = close(parentDescriptor)
+        var current = try traversal.duplicateRoot()
+        var relative = ""
+        var identities: [ParentIdentity] = [ParentIdentity(relativePath: "", identity: try descriptorIdentity(current))]
+        var created: [CreatedDirectoryRecord] = []
+        let allParentComponents = pathComponents(targetRelativePath).dropLast()
+        for component in allParentComponents {
+            relative = relative.isEmpty ? component : relative + "/" + component
+            var next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            if next < 0, errno == ENOENT {
+                guard mkdirat(current, component, 0o700) == 0, fsync(current) == 0 else { _ = close(current); throw posixError() }
+                next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+                guard next >= 0 else { _ = close(current); throw posixError() }
+                let identity = try descriptorIdentity(next)
+                created.append(CreatedDirectoryRecord(rootPath: rootPath, relativePath: relative, identity: identity))
+            } else if next < 0 {
+                _ = close(current)
+                throw posixError()
+            }
+            _ = close(current)
+            current = next
+            identities.append(ParentIdentity(relativePath: relative, identity: try descriptorIdentity(current)))
+        }
+        parentDescriptor = current
+        parentIdentities = identities
+        return created
+    }
+
+    func verifyCurrentBinding(snapshot: ManagedTargetSnapshot) throws {
+        if let expectedLink = snapshot.symlinkIdentity {
+            let selectedParts = pathComponents(snapshot.selectedRelativePath)
+            guard let name = selectedParts.last else { throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL) }
+            let parentPath = selectedParts.dropLast().joined(separator: "/")
+            let parent = try traversal.openDirectory(relativePath: parentPath, verify: nil)
+            defer { _ = close(parent.descriptor) }
+            var info = stat()
+            guard fstatat(parent.descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                  info.st_mode & S_IFMT == S_IFLNK,
+                  FileIdentity(info) == expectedLink,
+                  try readLink(at: parent.descriptor, name: name) == snapshot.symlinkDestination else {
+                throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
             }
         }
-        for (name, value) in attributes {
-            let result = value.withUnsafeBytes { setxattr(path, name, $0.baseAddress, value.count, 0, 0) }
-            guard result == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        _ = try traversal.openDirectory(relativePath: pathComponents(snapshot.targetRelativePath).dropLast().joined(separator: "/"), verify: snapshot.parentIdentities, closeResult: true)
+        if let fd = targetDescriptor {
+            let identity = try descriptorIdentity(fd)
+            let expected = snapshot.mutationApplied ? snapshot.registeredIdentity : snapshot.originalIdentity
+            if let expected, identity != expected {
+                throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+            }
         }
     }
 
-    private static func readACL(at path: String) throws -> String? {
-        errno = 0
-        guard let acl = acl_get_file(path, ACL_TYPE_EXTENDED) else {
-            if errno == 0 || errno == ENOENT { return nil }
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    func writeRegistration(snapshot: inout ManagedTargetSnapshot) throws {
+        guard let fd = targetDescriptor else { throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL) }
+        try writeAll(snapshot.afterData, descriptor: fd)
+        guard fchmod(fd, 0o600) == 0 else { throw posixError("fchmod client") }
+        guard fsync(fd) == 0 else { throw posixError("fsync client") }
+        guard fsync(parentDescriptor) == 0 else { throw posixError("fsync client directory") }
+        snapshot.registeredIdentity = try descriptorIdentity(fd)
+        if snapshot.existed, snapshot.registeredIdentity != snapshot.originalIdentity {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
         }
-        defer { acl_free(UnsafeMutableRawPointer(acl)) }
-        var length: ssize_t = 0
-        guard let text = acl_to_text(acl, &length) else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        defer { acl_free(text) }
-        return String(bytes: UnsafeRawBufferPointer(start: text, count: length), encoding: .utf8)
     }
 
-    private static func restoreACL(_ text: String?, at path: String) throws {
-        let acl: acl_t?
-        if let text {
-            acl = text.withCString { acl_from_text($0) }
+    func prepareTarget(snapshot: inout ManagedTargetSnapshot) throws {
+        if targetDescriptor == nil {
+            let targetName = pathComponents(targetRelativePath).last!
+            let fd = openat(parentDescriptor, targetName, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { throw posixError() }
+            targetDescriptor = fd
+            guard fsync(fd) == 0, fsync(parentDescriptor) == 0 else { throw posixError() }
+        }
+        guard let fd = targetDescriptor else { throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL) }
+        snapshot.registeredIdentity = try descriptorIdentity(fd)
+        if snapshot.existed, snapshot.registeredIdentity != snapshot.originalIdentity {
+            throw MCPOwnedRegistrationError.unsafeConfiguration(snapshot.selectedURL)
+        }
+        snapshot.mutationApplied = true
+    }
+
+    func reverse(snapshot: ManagedTargetSnapshot) throws -> ReverseResult {
+        let targetName = pathComponents(targetRelativePath).last!
+        guard let fd = targetDescriptor else {
+            if !snapshot.existed { return .alreadyReversed }
+            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
+        }
+        let current = try readAll(fd)
+        if current == snapshot.beforeData { return .alreadyReversed }
+        guard try descriptorIdentity(fd) == snapshot.registeredIdentity else {
+            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
+        }
+        let currentOwned = try ConfigurationImage.ownedRepresentation(
+            format: snapshot.format,
+            data: current,
+            sourceURL: snapshot.selectedURL
+        )
+        if currentOwned == snapshot.beforeOwned { return .alreadyReversed }
+        guard currentOwned == snapshot.afterOwned else {
+            throw MCPOwnedRegistrationError.conflict(snapshot.selectedURL)
+        }
+        if !snapshot.existed {
+            guard unlinkat(parentDescriptor, targetName, 0) == 0, fsync(parentDescriptor) == 0 else { throw posixError() }
+            return .reversed
+        }
+        let fullRestore = current == snapshot.afterData
+        let restored: Data
+        if fullRestore, let before = snapshot.beforeData {
+            restored = before
         } else {
-            acl = acl_init(0)
+            restored = try ConfigurationImage.reversingOwned(
+                format: snapshot.format,
+                currentData: current,
+                beforeOwned: snapshot.beforeOwned,
+                sourceURL: snapshot.selectedURL
+            )
         }
-        guard let acl else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { acl_free(UnsafeMutableRawPointer(acl)) }
-        guard acl_set_file(path, ACL_TYPE_EXTENDED, acl) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        try writeAll(restored, descriptor: fd)
+        if fullRestore { try restoreMetadata(snapshot: snapshot, descriptor: fd) }
+        guard fsync(fd) == 0, fsync(parentDescriptor) == 0 else { throw posixError() }
+        return .reversed
+    }
+}
+
+private final class DirectoryTraversal {
+    let rootPath: String
+    private let rootDescriptor: Int32
+
+    init(rootPath: String) throws {
+        self.rootPath = rootPath
+        rootDescriptor = open(rootPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard rootDescriptor >= 0 else { throw posixError() }
+    }
+
+    deinit { _ = close(rootDescriptor) }
+
+    func duplicateRoot() throws -> Int32 {
+        let value = dup(rootDescriptor)
+        guard value >= 0 else { throw posixError() }
+        return value
+    }
+
+    func openDeepestDirectory(relativePath: String) throws -> (descriptor: Int32, identities: [ParentIdentity], missing: [String]) {
+        var current = try duplicateRoot()
+        var identities = [ParentIdentity(relativePath: "", identity: try descriptorIdentity(current))]
+        let components = pathComponents(relativePath)
+        for (index, component) in components.enumerated() {
+            let next = openat(current, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            if next < 0, errno == ENOENT {
+                return (current, identities, Array(components[index...]))
+            }
+            guard next >= 0 else {
+                _ = close(current)
+                throw MCPOwnedRegistrationError.unsafeConfiguration(
+                    URL(fileURLWithPath: rootPath).appendingPathComponent(relativePath)
+                )
+            }
+            _ = close(current)
+            current = next
+            let path = components[...index].joined(separator: "/")
+            identities.append(ParentIdentity(relativePath: path, identity: try descriptorIdentity(current)))
+        }
+        return (current, identities, [])
+    }
+
+    func openDirectory(
+        relativePath: String,
+        verify expected: [ParentIdentity]?,
+        closeResult: Bool = false
+    ) throws -> (descriptor: Int32, identities: [ParentIdentity], identity: FileIdentity) {
+        let opened = try openDeepestDirectory(relativePath: relativePath)
+        guard opened.missing.isEmpty else { _ = close(opened.descriptor); throw MCPOwnedRegistrationError.unsafeConfiguration(URL(fileURLWithPath: rootPath).appendingPathComponent(relativePath)) }
+        if let expected, opened.identities != expected {
+            _ = close(opened.descriptor)
+            throw MCPOwnedRegistrationError.unsafeConfiguration(URL(fileURLWithPath: rootPath).appendingPathComponent(relativePath))
+        }
+        let identity = try descriptorIdentity(opened.descriptor)
+        if closeResult { _ = close(opened.descriptor); return (-1, opened.identities, identity) }
+        return (opened.descriptor, opened.identities, identity)
+    }
+}
+
+private struct ConfigurationImage {
+    var afterData: Data
+    var beforeOwned: Data?
+    var afterOwned: Data
+    static func make(
+        format: ConfigurationFormat,
+        before: Data?,
+        executableURL: URL,
+        sourceURL: URL
+    ) throws -> ConfigurationImage {
+        switch format {
+        case .json:
+            var root: [String: Any] = [:]
+            if let before {
+                guard let decoded = try JSONSerialization.jsonObject(with: before) as? [String: Any] else {
+                    throw MCPRegistrationError.invalidConfiguration(sourceURL)
+                }
+                root = decoded
+            }
+            if root["mcpServers"] != nil, !(root["mcpServers"] is [String: Any]) {
+                throw MCPRegistrationError.invalidConfiguration(sourceURL)
+            }
+            var servers = root["mcpServers"] as? [String: Any] ?? [:]
+            let beforeOwned = try servers["evee"].map(canonicalJSON)
+            let registered: [String: Any] = ["command": executableURL.path, "args": []]
+            servers["evee"] = registered
+            root["mcpServers"] = servers
+            return ConfigurationImage(
+                afterData: try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]),
+                beforeOwned: beforeOwned,
+                afterOwned: try canonicalJSON(registered)
+            )
+        case .toml:
+            let source = before.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            let split = splitTOML(source)
+            let table = "# Managed by Evee local helper access.\n[mcp_servers.evee]\ncommand = \"\(tomlEscaped(executableURL.path))\"\nargs = []\n"
+            let separator = split.base.isEmpty || split.base.hasSuffix("\n") ? "" : "\n"
+            return ConfigurationImage(
+                afterData: Data((split.base + separator + table).utf8),
+                beforeOwned: split.owned.isEmpty ? nil : Data(normalizedTOMLOwned(split.owned).utf8),
+                afterOwned: Data(normalizedTOMLOwned(table).utf8)
+            )
+        }
+    }
+
+    static func ownedRepresentation(format: ConfigurationFormat, data: Data, sourceURL: URL) throws -> Data? {
+        switch format {
+        case .json:
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let servers = root["mcpServers"] as? [String: Any] else {
+                throw MCPRegistrationError.invalidConfiguration(sourceURL)
+            }
+            return try servers["evee"].map(canonicalJSON)
+        case .toml:
+            let split = splitTOML(String(decoding: data, as: UTF8.self))
+            return split.owned.isEmpty ? nil : Data(normalizedTOMLOwned(split.owned).utf8)
+        }
+    }
+
+    static func reversingOwned(
+        format: ConfigurationFormat,
+        currentData: Data,
+        beforeOwned: Data?,
+        sourceURL: URL
+    ) throws -> Data {
+        switch format {
+        case .json:
+            guard var root = try JSONSerialization.jsonObject(with: currentData) as? [String: Any],
+                  var servers = root["mcpServers"] as? [String: Any] else {
+                throw MCPRegistrationError.invalidConfiguration(sourceURL)
+            }
+            if let beforeOwned {
+                servers["evee"] = try JSONSerialization.jsonObject(with: beforeOwned)
+            } else {
+                servers.removeValue(forKey: "evee")
+            }
+            root["mcpServers"] = servers
+            return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        case .toml:
+            let split = splitTOML(String(decoding: currentData, as: UTF8.self))
+            guard let beforeOwned else { return Data(split.base.utf8) }
+            let before = String(decoding: beforeOwned, as: UTF8.self)
+            let separator = split.base.isEmpty || split.base.hasSuffix("\n") ? "" : "\n"
+            return Data((split.base + separator + before).utf8)
         }
     }
 }
 
-private extension MCPRegistrationResult {
-    func withConfigurationURL(_ url: URL) -> MCPRegistrationResult {
-        MCPRegistrationResult(
-            configurationURL: url,
-            executableURL: executableURL,
-            replacedExistingRegistration: replacedExistingRegistration
-        )
+private struct FileMetadata {
+    var permissions: UInt16?
+    var ownerID: UInt32?
+    var groupID: UInt32?
+    var accessTimeSeconds: Int64?
+    var accessTimeNanoseconds: Int64?
+    var modificationTimeSeconds: Int64?
+    var modificationTimeNanoseconds: Int64?
+    var accessControlList: String?
+    var extendedAttributes: [String: Data]
+
+    static let empty = FileMetadata(
+        permissions: nil, ownerID: nil, groupID: nil,
+        accessTimeSeconds: nil, accessTimeNanoseconds: nil,
+        modificationTimeSeconds: nil, modificationTimeNanoseconds: nil,
+        accessControlList: nil, extendedAttributes: [:]
+    )
+
+    init(descriptor: Int32, info: stat) throws {
+        permissions = UInt16(info.st_mode & 0o7777)
+        ownerID = info.st_uid
+        groupID = info.st_gid
+        accessTimeSeconds = Int64(info.st_atimespec.tv_sec)
+        accessTimeNanoseconds = Int64(info.st_atimespec.tv_nsec)
+        modificationTimeSeconds = Int64(info.st_mtimespec.tv_sec)
+        modificationTimeNanoseconds = Int64(info.st_mtimespec.tv_nsec)
+        accessControlList = try readACL(descriptor)
+        extendedAttributes = try readExtendedAttributes(descriptor)
     }
+
+    private init(
+        permissions: UInt16?, ownerID: UInt32?, groupID: UInt32?,
+        accessTimeSeconds: Int64?, accessTimeNanoseconds: Int64?,
+        modificationTimeSeconds: Int64?, modificationTimeNanoseconds: Int64?,
+        accessControlList: String?, extendedAttributes: [String: Data]
+    ) {
+        self.permissions = permissions
+        self.ownerID = ownerID
+        self.groupID = groupID
+        self.accessTimeSeconds = accessTimeSeconds
+        self.accessTimeNanoseconds = accessTimeNanoseconds
+        self.modificationTimeSeconds = modificationTimeSeconds
+        self.modificationTimeNanoseconds = modificationTimeNanoseconds
+        self.accessControlList = accessControlList
+        self.extendedAttributes = extendedAttributes
+    }
+}
+
+private func restoreMetadata(snapshot: ManagedTargetSnapshot, descriptor: Int32) throws {
+    guard let permissions = snapshot.permissions,
+          let ownerID = snapshot.ownerID,
+          let groupID = snapshot.groupID,
+          let accessSeconds = snapshot.accessTimeSeconds,
+          let accessNanos = snapshot.accessTimeNanoseconds,
+          let modificationSeconds = snapshot.modificationTimeSeconds,
+          let modificationNanos = snapshot.modificationTimeNanoseconds else { return }
+    guard fchown(descriptor, uid_t(ownerID), gid_t(groupID)) == 0,
+          fchmod(descriptor, mode_t(permissions)) == 0 else { throw posixError() }
+    try restoreACL(snapshot.accessControlList, descriptor: descriptor)
+    try restoreExtendedAttributes(snapshot.extendedAttributes, descriptor: descriptor)
+    var times = [
+        timespec(tv_sec: time_t(accessSeconds), tv_nsec: Int(accessNanos)),
+        timespec(tv_sec: time_t(modificationSeconds), tv_nsec: Int(modificationNanos)),
+    ]
+    guard futimens(descriptor, &times) == 0 else { throw posixError() }
+}
+
+private func readExtendedAttributes(_ descriptor: Int32) throws -> [String: Data] {
+    let size = flistxattr(descriptor, nil, 0, 0)
+    guard size >= 0 else { throw posixError() }
+    guard size > 0 else { return [:] }
+    var buffer = [CChar](repeating: 0, count: size)
+    let read = buffer.withUnsafeMutableBufferPointer { flistxattr(descriptor, $0.baseAddress, size, 0) }
+    guard read >= 0 else { throw posixError() }
+    let names = Data(bytes: buffer, count: read).split(separator: 0).compactMap { String(data: $0, encoding: .utf8) }
+    var result: [String: Data] = [:]
+    for name in names {
+        let valueSize = fgetxattr(descriptor, name, nil, 0, 0, 0)
+        guard valueSize >= 0 else { throw posixError() }
+        var value = Data(count: valueSize)
+        let valueRead = value.withUnsafeMutableBytes { fgetxattr(descriptor, name, $0.baseAddress, valueSize, 0, 0) }
+        guard valueRead >= 0 else { throw posixError() }
+        result[name] = value
+    }
+    return result
+}
+
+private func restoreExtendedAttributes(_ attributes: [String: Data], descriptor: Int32) throws {
+    let current = try readExtendedAttributes(descriptor)
+    for name in current.keys where attributes[name] == nil {
+        guard fremovexattr(descriptor, name, 0) == 0 else { throw posixError() }
+    }
+    for (name, value) in attributes {
+        let result = value.withUnsafeBytes { fsetxattr(descriptor, name, $0.baseAddress, value.count, 0, 0) }
+        guard result == 0 else { throw posixError() }
+    }
+}
+
+private func readACL(_ descriptor: Int32) throws -> String? {
+    errno = 0
+    guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+        if errno == 0 || errno == ENOENT { return nil }
+        throw posixError()
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var length: ssize_t = 0
+    guard let text = acl_to_text(acl, &length) else { throw posixError() }
+    defer { acl_free(text) }
+    return String(bytes: UnsafeRawBufferPointer(start: text, count: length), encoding: .utf8)
+}
+
+private func restoreACL(_ text: String?, descriptor: Int32) throws {
+    let acl = text?.withCString { acl_from_text($0) } ?? acl_init(0)
+    guard let acl else { throw posixError() }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    guard acl_set_fd_np(descriptor, acl, ACL_TYPE_EXTENDED) == 0 else { throw posixError() }
+}
+
+private func writeDurable<T: Encodable>(_ value: T, to url: URL) throws {
+    try FileManager.default.createDirectory(
+        at: url.deletingLastPathComponent(),
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    guard directory >= 0 else { throw posixError() }
+    defer { _ = close(directory) }
+    let name = url.lastPathComponent
+    let temporary = ".\(name).\(UUID().uuidString).tmp"
+    let descriptor = openat(directory, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    guard descriptor >= 0 else { throw posixError() }
+    do {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try writeAll(encoder.encode(value), descriptor: descriptor)
+        guard fchmod(descriptor, 0o600) == 0, fsync(descriptor) == 0 else { throw posixError() }
+        _ = close(descriptor)
+        guard renameat(directory, temporary, directory, name) == 0, fsync(directory) == 0 else { throw posixError() }
+    } catch {
+        _ = close(descriptor)
+        _ = unlinkat(directory, temporary, 0)
+        throw error
+    }
+}
+
+private func loadDurableIfPresent<T: Decodable>(_ type: T.Type, from url: URL) throws -> T? {
+    let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+    guard descriptor >= 0 else {
+        if errno == ENOENT { return nil }
+        throw posixError()
+    }
+    defer { _ = close(descriptor) }
+    var info = stat()
+    guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+        throw MCPOwnedRegistrationError.invalidManifest(url)
+    }
+    do { return try JSONDecoder().decode(T.self, from: readAll(descriptor)) }
+    catch { throw MCPOwnedRegistrationError.invalidManifest(url) }
+}
+
+private func removeDurable(_ url: URL) throws {
+    let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    guard directory >= 0 else { throw posixError() }
+    defer { _ = close(directory) }
+    guard unlinkat(directory, url.lastPathComponent, 0) == 0, fsync(directory) == 0 else {
+        if errno == ENOENT { return }
+        throw posixError()
+    }
+}
+
+private func readAll(_ descriptor: Int32) throws -> Data {
+    guard lseek(descriptor, 0, SEEK_SET) >= 0 else { throw posixError() }
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 16_384)
+    while true {
+        let count = Darwin.read(descriptor, &buffer, buffer.count)
+        guard count >= 0 else { throw posixError() }
+        if count == 0 { break }
+        result.append(buffer, count: count)
+    }
+    return result
+}
+
+private func writeAll(_ data: Data, descriptor: Int32) throws {
+    guard ftruncate(descriptor, 0) == 0, lseek(descriptor, 0, SEEK_SET) >= 0 else { throw posixError() }
+    try data.withUnsafeBytes { rawBuffer in
+        guard var pointer = rawBuffer.baseAddress else { return }
+        var remaining = rawBuffer.count
+        while remaining > 0 {
+            let count = Darwin.write(descriptor, pointer, remaining)
+            guard count >= 0 else { throw posixError() }
+            remaining -= count
+            pointer = pointer.advanced(by: count)
+        }
+    }
+}
+
+private func descriptorIdentity(_ descriptor: Int32) throws -> FileIdentity {
+    var info = stat()
+    guard fstat(descriptor, &info) == 0 else { throw posixError() }
+    return FileIdentity(info)
+}
+
+private func readLink(at descriptor: Int32, name: String) throws -> String {
+    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+    let count = readlinkat(descriptor, name, &buffer, buffer.count - 1)
+    guard count >= 0 else { throw posixError() }
+    return String(decoding: buffer.prefix(count).map(UInt8.init(bitPattern:)), as: UTF8.self)
+}
+
+private func canonicalJSON(_ value: Any) throws -> Data {
+    try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed])
+}
+
+private func splitTOML(_ source: String) -> (base: String, owned: String) {
+    let pattern = #"(?m)^[ \t]*\[([^\]\r\n]+)\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)"#
+    guard let expression = try? NSRegularExpression(pattern: pattern) else { return (source, "") }
+    let full = NSRange(source.startIndex..<source.endIndex, in: source)
+    let headers = expression.matches(in: source, range: full)
+    var ranges: [NSRange] = []
+    let nsSource = source as NSString
+    for (index, header) in headers.enumerated() {
+        guard let nameRange = Range(header.range(at: 1), in: source) else { continue }
+        let name = source[nameRange].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name == "mcp_servers.evee" || name.hasPrefix("mcp_servers.evee.")
+                || name == "mcp_servers.\"evee\"" || name.hasPrefix("mcp_servers.\"evee\".") else { continue }
+        let end = index + 1 < headers.count ? headers[index + 1].range.location : full.length
+        var start = header.range.location
+        let marker = "# Managed by Evee local helper access.\n" as NSString
+        if start >= marker.length,
+           nsSource.substring(with: NSRange(location: start - marker.length, length: marker.length)) == marker as String {
+            start -= marker.length
+        }
+        ranges.append(NSRange(location: start, length: end - start))
+    }
+    guard !ranges.isEmpty else { return (source, "") }
+    let owned = ranges.map { nsSource.substring(with: $0) }.joined()
+    let mutable = NSMutableString(string: source)
+    for range in ranges.reversed() { mutable.deleteCharacters(in: range) }
+    return (mutable as String, owned)
+}
+
+private func tomlEscaped(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "\t", with: "\\t")
+}
+
+private func normalizedTOMLOwned(_ value: String) -> String {
+    value.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
+}
+
+private func pathComponents(_ path: String) -> [String] {
+    path.split(separator: "/").map(String.init)
+}
+
+private func safeRelativePath(_ path: String) -> Bool {
+    !path.hasPrefix("/") && pathComponents(path).allSatisfy { $0 != "." && $0 != ".." && !$0.isEmpty }
+}
+
+private func contains(path: String, root: String) -> Bool {
+    path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+}
+
+private func relativePath(_ path: String, root: String) -> String {
+    guard path != root else { return "" }
+    return String(path.dropFirst((root.hasSuffix("/") ? root : root + "/").count))
+}
+
+private func posixError(_ context: String? = nil) -> Error {
+    let code = errno
+    guard let context else { return POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+    return NSError(
+        domain: "Evee.MCPRegistration.\(context)",
+        code: Int(code),
+        userInfo: [NSLocalizedDescriptionKey: "\(context): \(String(cString: strerror(code)))"]
+    )
 }

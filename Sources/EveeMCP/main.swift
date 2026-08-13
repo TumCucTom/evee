@@ -277,7 +277,10 @@ enum EveeMCP {
     }
 
     static func requireEnabledAccess() async throws {
-        guard try await LibraryStore.shared.loadSettings().mcpEnabled else {
+        let storageRootURL = await LibraryStore.shared.rootURL
+        guard !FileManager.default.fileExists(
+            atPath: MCPOwnedRegistration.journalURL(storageRootURL: storageRootURL).path
+        ), try await LibraryStore.shared.loadSettings().mcpEnabled else {
             throw MCPFailure(code: -32001, message: disabledAccessMessage)
         }
     }
