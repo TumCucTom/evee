@@ -3,6 +3,23 @@ import XCTest
 
 @MainActor
 final class TerminationCheckpointTests: XCTestCase {
+    func testMeetingAcceptsEitherValidTrackButMemoAndDictationRequireMicrophone() throws {
+        XCTAssertNoThrow(try CaptureCheckpointTrackPolicy.validate(kind: .meeting, validRoles: [.system]))
+        XCTAssertNoThrow(try CaptureCheckpointTrackPolicy.validate(kind: .meeting, validRoles: [.microphone]))
+        XCTAssertThrowsError(try CaptureCheckpointTrackPolicy.validate(kind: .memo, validRoles: [.system]))
+        XCTAssertThrowsError(try CaptureCheckpointTrackPolicy.validate(kind: .dictation, validRoles: [.system]))
+    }
+
+    func testFailedTerminationCheckpointCanReopenAdmissionForRecovery() {
+        var gate = TerminationWorkGate()
+        _ = gate.prepareCheckpoint()
+        XCTAssertFalse(gate.beginWork())
+
+        gate.resumeAfterCheckpointFailure()
+
+        XCTAssertTrue(gate.beginWork())
+    }
+
     func testConcurrentCheckpointsJoinOneDurabilityOperation() async throws {
         let checkpointer = DelayedCaptureCheckpointer()
         let coordinator = TerminationCheckpointCoordinator(checkpointer: checkpointer)

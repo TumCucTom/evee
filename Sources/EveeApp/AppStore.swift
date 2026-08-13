@@ -15,6 +15,7 @@ extension KeyboardShortcuts.Name {
 private enum CaptureTerminationCheckpointError: LocalizedError {
     case invalidAudio(URL)
     case missingTrack(AudioTrackRole)
+    case requiredTracksUnavailable(WorkspaceRecordKind, String)
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +23,8 @@ private enum CaptureTerminationCheckpointError: LocalizedError {
             "The captured audio at \(url.lastPathComponent) is not playable. Evee kept the source file and stayed open."
         case .missingTrack(let role):
             "The \(role.rawValue) capture was written but could not be added to its recovery manifest."
+        case .requiredTracksUnavailable(let kind, let detail):
+            "The \(kind.rawValue) recovery checkpoint does not contain its required playable audio. \(detail)"
         }
     }
 }
@@ -32,7 +35,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     typealias WakeListenerFactory = @Sendable () -> any WakePhraseListening
     typealias MicrophonePermissionProvider = @MainActor @Sendable () -> Bool
     typealias MicrophoneStarter = @MainActor @Sendable (URL, String?, Bool) async throws -> Void
-    typealias MicrophoneStopper = @MainActor @Sendable () throws -> URL
+    typealias MicrophoneStopper = @MainActor @Sendable () async throws -> URL
     typealias MicrophoneRecordingProbe = @MainActor @Sendable () -> Bool
     typealias SystemAudioStarter = @MainActor @Sendable (URL) async throws -> Void
     typealias SystemAudioStopper = @MainActor @Sendable () async throws -> Void
@@ -60,6 +63,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published var selectedRecordID: UUID?
     @Published private(set) var modelDownloadState: ModelDownloadState = .idle
     @Published private(set) var modelDownloadNeedsRetry = false
+    @Published private(set) var modelAvailabilityWarning: String?
     @Published var statusMessage: String?
     @Published var meetingTitle = ""
     @Published var meetingNotes = ""
@@ -96,6 +100,14 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         return false
     }
 
+    func isSpeechModelSupported(_ model: SpeechModel) -> Bool {
+        speechModelAvailability.isSupported(model)
+    }
+
+    func speechModelUnavailableReason(_ model: SpeechModel) -> String? {
+        speechModelAvailability.unavailableReason(for: model)
+    }
+
     var hotMicActive: Bool {
         hotMicState == .active
     }
@@ -121,6 +133,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let wakeListenerFactory: WakeListenerFactory
     private let microphonePermissionProvider: MicrophonePermissionProvider
     private let modelDownloadDefaults: UserDefaults?
+    private let speechModelAvailability: SpeechModelAvailability
     private let microphoneStarter: MicrophoneStarter?
     private let microphoneStopper: MicrophoneStopper?
     private let microphoneRecordingProbe: MicrophoneRecordingProbe?
@@ -132,6 +145,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var modelDownloadStateMachine = ModelDownloadStateMachine()
     private var modelDownloadOperation: LifecycleOperation?
     private var modelDownloadTask: Task<Void, Never>?
+    private var modelsRequiringRepair: Set<SpeechModel> = []
     private var activeAudioURL: URL?
     private var activeSystemAudioURL: URL?
     private var activeRecoveryID: UUID?
@@ -267,12 +281,14 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 expectedSelectedText: expectedSelectedText
             )
         },
-        recoveryTranscriberFactory: @escaping RecoveryTranscriberFactory = { try TranscriberFactory.make($0) }
+        recoveryTranscriberFactory: @escaping RecoveryTranscriberFactory = { try TranscriberFactory.make($0) },
+        speechModelAvailability: SpeechModelAvailability = .current
     ) {
         self.modelDownloaderFactory = modelDownloaderFactory
         self.wakeListenerFactory = wakeListenerFactory
         self.microphonePermissionProvider = microphonePermissionProvider
         self.modelDownloadDefaults = modelDownloadDefaults
+        self.speechModelAvailability = speechModelAvailability
         self.library = library
         self.microphoneStarter = microphoneStarter
         self.microphoneStopper = microphoneStopper
@@ -449,6 +465,16 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     }
                 }
             }
+            let persistedModel = settings.model
+            let safeModel = speechModelAvailability.safeSelection(for: persistedModel)
+            if safeModel != persistedModel {
+                settings.model = safeModel
+                try await library.save(settings)
+                let warning = speechModelAvailability.unavailableReason(for: persistedModel)
+                    ?? "The saved speech model is unavailable on this Mac. Evee selected \(safeModel.title)."
+                modelAvailabilityWarning = warning
+                statusMessage = [warning, statusMessage].compactMap { $0 }.joined(separator: " ")
+            }
             configuredWebhookDestination = normalizedWebhookDestination(settings.webhookURL)
             try await loadAndMigrateSecrets()
             let recordsLoad = try await library.loadRecordsRecoveringCorruption()
@@ -489,9 +515,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                     ?? "Evee preserved unreadable local data and continued with safe defaults."
                 libraryRecoveryWarning = "\(recoverySummary)\(protection) Review this private location before deleting anything:\n\(paths.joined(separator: "\n"))"
             }
-            let selectedTranscriber = try TranscriberFactory.make(settings.model)
-            transcriber = selectedTranscriber
-            reconcileModelDownloadCache(selectedTranscriber, model: settings.model)
+            let selectedProvider = try modelDownloaderFactory(settings.model)
+            transcriber = selectedProvider as? any LocalTranscriber
+            reconcileModelDownloadCache(selectedProvider, model: settings.model)
             refreshPermissionState()
             if settings.localAPIEnabled { localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort) }
             if settings.webhookURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -507,6 +533,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func saveSettings() async {
+        if let reason = speechModelAvailability.unavailableReason(for: settings.model) {
+            modelAvailabilityWarning = reason
+            statusMessage = reason
+            return
+        }
         do {
             let destinationValue = normalizedWebhookDestination(settings.webhookURL)
             if let destinationValue {
@@ -535,9 +566,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
             cancelModelDownload()
             transcriber?.unload()
-            let selectedTranscriber = try TranscriberFactory.make(settings.model)
-            transcriber = selectedTranscriber
-            reconcileModelDownloadCache(selectedTranscriber, model: settings.model)
+            let selectedProvider = try modelDownloaderFactory(settings.model)
+            transcriber = selectedProvider as? any LocalTranscriber
+            reconcileModelDownloadCache(selectedProvider, model: settings.model)
             if settings.localAPIEnabled {
                 localAPICredentials = try await api.startWithCredentials(port: settings.localAPIPort)
             } else {
@@ -634,6 +665,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     func startModelDownload() {
         let model = settings.model
+        if let reason = speechModelAvailability.unavailableReason(for: model) {
+            modelAvailabilityWarning = reason
+            statusMessage = reason
+            return
+        }
         guard let operation = modelDownloadStateMachine.begin(model: model) else { return }
 
         modelDownloadOperation = operation
@@ -642,21 +678,20 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         publishModelDownloadState()
 
         let factory = modelDownloaderFactory
+        let forceRepair = modelsRequiringRepair.contains(model)
         modelDownloadTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 let downloader = try factory(model)
                 guard self.modelDownloadOperation == operation else { return }
-                if !downloader.isDownloaded {
-                    try await downloader.download { [weak self] progress in
+                let mode: LocalModelPreparationMode = forceRepair || !downloader.isDownloaded
+                    ? .downloadOrRepair
+                    : .validateExisting
+                try await LocalModelReadiness.prepare(downloader, mode: mode) { [weak self] progress in
                         Task { @MainActor in
                             self?.receiveModelDownloadProgress(progress, operation: operation)
                         }
-                    }
                 }
-                try Task.checkCancellation()
-                try await downloader.load()
-                try Task.checkCancellation()
                 self.completeModelDownload(downloader, model: model, operation: operation)
             } catch {
                 self.failModelDownload(error, model: model, operation: operation)
@@ -695,6 +730,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloadOperation = nil
         modelDownloadTask = nil
         modelDownloadNeedsRetry = false
+        modelsRequiringRepair.remove(model)
         modelDownloadDefaults?.set(false, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
     }
@@ -704,6 +740,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloadOperation = nil
         modelDownloadTask = nil
         modelDownloadNeedsRetry = true
+        modelsRequiringRepair.insert(model)
         modelDownloadDefaults?.set(true, forKey: modelDownloadAttemptKey(for: model))
         publishModelDownloadState()
         statusMessage = error.localizedDescription
@@ -717,14 +754,30 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
         if let operation = modelDownloadStateMachine.begin(model: model) {
             if downloader.isDownloaded {
-                _ = modelDownloadStateMachine.complete(operation)
+                modelDownloadOperation = operation
                 modelDownloadNeedsRetry = false
+                publishModelDownloadState()
+                modelDownloadTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await LocalModelReadiness.prepare(
+                            downloader,
+                            mode: .validateExisting,
+                            progress: { _ in }
+                        )
+                        self.completeModelDownload(downloader, model: model, operation: operation)
+                    } catch {
+                        self.failModelDownload(error, model: model, operation: operation)
+                    }
+                }
+                return
             } else if modelDownloadDefaults?.bool(forKey: modelDownloadAttemptKey(for: model)) == true {
                 _ = modelDownloadStateMachine.fail(
                     operation,
                     message: "The previous model download did not finish."
                 )
                 modelDownloadNeedsRetry = true
+                modelsRequiringRepair.insert(model)
             } else {
                 modelDownloadStateMachine.cancel(operation)
                 modelDownloadNeedsRetry = false
@@ -1003,7 +1056,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
 
         do {
-            let stoppedMicrophoneURL = try stopMicrophone()
+            let stoppedMicrophoneURL = try await stopMicrophone()
             activeAudioURL = stoppedMicrophoneURL
             if isSystemAudioActive {
                 do {
@@ -1128,7 +1181,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         captureLifecycle = .cancelling(sessionID)
         stopRequestedDuringStart = nil
 
-        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
+        if isMicrophoneRecording, let stoppedURL = try? await stopMicrophone() {
             activeAudioURL = stoppedURL
         }
         if isSystemAudioActive {
@@ -1319,9 +1372,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         microphoneRecordingProbe?() ?? recorder.isRecording
     }
 
-    private func stopMicrophone() throws -> URL {
-        if let microphoneStopper { return try microphoneStopper() }
-        return try recorder.stop()
+    private func stopMicrophone() async throws -> URL {
+        if let microphoneStopper { return try await microphoneStopper() }
+        return try await recorder.stop()
     }
 
     private func stopSystemAudio() async throws {
@@ -1352,7 +1405,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     private func cleanUpCancelledStart(sessionID: UUID) async {
         let preservesRecovery = terminationCheckpointRecoveryID == sessionID
-        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
+        if isMicrophoneRecording, let stoppedURL = try? await stopMicrophone() {
             activeAudioURL = stoppedURL
         }
         try? await stopSystemAudio()
@@ -1368,7 +1421,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     private func failSession(sessionID: UUID, error: Error, preserveRecoveryAudio: Bool) async {
-        if isMicrophoneRecording, let stoppedURL = try? stopMicrophone() {
+        if isMicrophoneRecording, let stoppedURL = try? await stopMicrophone() {
             activeAudioURL = stoppedURL
         }
         try? await stopSystemAudio()
@@ -2398,20 +2451,19 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             api.stop()
             localAPICredentials = nil
 
+            var writerWarnings: [AudioTrackRole: String] = [:]
             if isMicrophoneRecording {
                 do {
-                    activeAudioURL = try stopMicrophone()
+                    activeAudioURL = try await stopMicrophone()
                 } catch {
-                    guard activeAudioURL.map({ FileManager.default.fileExists(atPath: $0.path) }) == true else {
-                        throw error
-                    }
+                    writerWarnings[.microphone] = error.localizedDescription
                 }
             }
             if isSystemAudioActive {
                 do {
                     try await stopSystemAudio()
                 } catch {
-                    statusMessage = "System audio could not be finalised cleanly. Evee will checkpoint the microphone track and retain any system-audio prefix for recovery. \(error.localizedDescription)"
+                    writerWarnings[.system] = error.localizedDescription
                 }
                 isSystemAudioActive = false
             }
@@ -2422,13 +2474,25 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             switch plan {
             case .cancelStartAndCheckpoint:
                 if let captureID = terminationCheckpointRecoveryID ?? activeRecoveryID {
-                    try await persistCaptureTerminationCheckpoint(captureID: captureID, kind: activeKind)
+                    try await persistCaptureTerminationCheckpoint(
+                        captureID: captureID,
+                        kind: activeKind,
+                        writerWarnings: writerWarnings
+                    )
                 }
             case .stopWritersAndCheckpoint(let kind, let recoveryID):
-                try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: kind)
+                try await persistCaptureTerminationCheckpoint(
+                    captureID: recoveryID,
+                    kind: kind,
+                    writerWarnings: writerWarnings
+                )
             case .awaitDurableCommitOrCheckpoint(let recoveryID):
                 if !durableCommitWon {
-                    try await persistCaptureTerminationCheckpoint(captureID: recoveryID, kind: activeKind)
+                    try await persistCaptureTerminationCheckpoint(
+                        captureID: recoveryID,
+                        kind: activeKind,
+                        writerWarnings: writerWarnings
+                    )
                 }
             case .awaitCancellationCleanup:
                 removeActiveRecoveryFiles()
@@ -2462,6 +2526,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
             captureState = .checkpointed("Recovery checkpoint needs attention: \(error.localizedDescription)")
             statusMessage = "Quit was cancelled because Evee could not finish the recovery checkpoint. The app stayed open and retained any completed audio. Check available disk space and permissions, then quit again. \(error.localizedDescription)"
+            captureLifecycle = .idle
+            terminationCheckpointRecoveryID = nil
+            terminationWorkGate.resumeAfterCheckpointFailure()
             await refreshRecoverableCaptures()
             throw error
         }
@@ -2508,7 +2575,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     private func persistCaptureTerminationCheckpoint(
         captureID: UUID,
-        kind: WorkspaceRecordKind
+        kind: WorkspaceRecordKind,
+        writerWarnings: [AudioTrackRole: String] = [:]
     ) async throws {
         activeRecoveryID = captureID
         activeRecoveryDirectory = await library.recoveryURL.appendingPathComponent(captureID.uuidString, isDirectory: true)
@@ -2523,25 +2591,45 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             ))
         }
 
-        manifest = try await checkpointTrack(
-            role: .microphone,
-            sourceURL: activeAudioURL,
-            startedAt: microphoneTrackStartedAt,
-            captureID: captureID,
-            kind: kind,
-            manifest: manifest
-        )
+        var trackFailures = writerWarnings
+        var validRoles: Set<AudioTrackRole> = []
+        let inputs: [(AudioTrackRole, URL?, Date?)] = [
+            (.microphone, activeAudioURL, microphoneTrackStartedAt),
+            (.system, activeSystemAudioURL, systemTrackStartedAt),
+        ]
+        for (role, sourceURL, startedAt) in inputs {
+            do {
+                manifest = try await checkpointTrack(
+                    role: role,
+                    sourceURL: sourceURL,
+                    startedAt: startedAt,
+                    captureID: captureID,
+                    kind: kind,
+                    manifest: manifest
+                )
+                if manifest.tracks.contains(where: { $0.role == role }) {
+                    validRoles.insert(role)
+                }
+            } catch {
+                trackFailures[role] = error.localizedDescription
+            }
+        }
         do {
-            manifest = try await checkpointTrack(
-                role: .system,
-                sourceURL: activeSystemAudioURL,
-                startedAt: systemTrackStartedAt,
-                captureID: captureID,
-                kind: kind,
-                manifest: manifest
-            )
+            try CaptureCheckpointTrackPolicy.validate(kind: kind, validRoles: validRoles)
         } catch {
-            statusMessage = "Evee checkpointed the microphone track, but the system-audio track is not playable. The original file was retained for recovery. \(error.localizedDescription)"
+            let detail = trackFailures
+                .sorted { $0.key.rawValue < $1.key.rawValue }
+                .map { "\($0.key.rawValue): \($0.value)" }
+                .joined(separator: " ")
+            throw CaptureTerminationCheckpointError.requiredTracksUnavailable(
+                kind,
+                detail.isEmpty ? error.localizedDescription : detail
+            )
+        }
+        if !trackFailures.isEmpty {
+            let missing = trackFailures.keys.sorted { $0.rawValue < $1.rawValue }.map(\.rawValue).joined(separator: " and ")
+            let retained = validRoles.sorted { $0.rawValue < $1.rawValue }.map(\.rawValue).joined(separator: " and ")
+            statusMessage = "Evee checkpointed the \(retained) track, but the \(missing) channel was degraded. Its original file was left in recovery for review."
         }
         try await library.updateRecoveryCapture(id: captureID, status: .captured)
     }

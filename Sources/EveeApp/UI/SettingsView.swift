@@ -24,7 +24,14 @@ struct SettingsView: View {
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Transform selection:", name: .transformSelection)
                 Picker("Local model", selection: $store.settings.model) {
-                    ForEach(SpeechModel.allCases, id: \.self) { model in Text(model.title).tag(model) }
+                    ForEach(SpeechModel.allCases, id: \.self) { model in
+                        Text(model.title)
+                            .tag(model)
+                            .disabled(!store.isSpeechModelSupported(model))
+                    }
+                }
+                if let reason = store.speechModelUnavailableReason(.qwen3) {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
                 }
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
@@ -37,7 +44,11 @@ struct SettingsView: View {
                     Button(selectedModelReady ? "Downloaded" : "Download") {
                         Task { await store.downloadSelectedModel() }
                     }
-                    .disabled(selectedModelReady || store.modelProgress != nil)
+                    .disabled(
+                        selectedModelReady ||
+                        store.modelProgress != nil ||
+                        !store.isSpeechModelSupported(store.settings.model)
+                    )
                 }
                 Picker("Language", selection: $store.settings.languageCode) {
                     ForEach(SupportedLanguage.all) { language in
@@ -391,7 +402,7 @@ struct SettingsView: View {
     }
 
     private func refreshModelState() {
-        selectedModelReady = (try? TranscriberFactory.make(store.settings.model).isDownloaded) == true
+        selectedModelReady = store.modelDownloadState == .ready(model: store.settings.model)
     }
 
     private func refreshMCPClients() async {

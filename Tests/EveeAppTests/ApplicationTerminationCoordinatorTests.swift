@@ -4,6 +4,39 @@ import XCTest
 
 @MainActor
 final class ApplicationTerminationCoordinatorTests: XCTestCase {
+    func testQuitCheckpointsValidSystemTrackWhenMicrophoneIsInvalid() async throws {
+        let harness = try await CaptureCheckpointHarness(kind: .meeting, microphoneValid: false, systemValid: true)
+        defer { harness.cleanUp() }
+
+        try await harness.store.checkpointForTermination()
+
+        let captures = try await harness.library.recoverableCaptures()
+        XCTAssertEqual(captures.first?.tracks.map(\.role), [.system])
+        XCTAssertTrue(harness.store.statusMessage?.localizedCaseInsensitiveContains("microphone") == true)
+    }
+
+    func testQuitCheckpointsValidMicrophoneTrackWhenSystemIsInvalid() async throws {
+        let harness = try await CaptureCheckpointHarness(kind: .meeting, microphoneValid: true, systemValid: false)
+        defer { harness.cleanUp() }
+
+        try await harness.store.checkpointForTermination()
+
+        let captures = try await harness.library.recoverableCaptures()
+        XCTAssertEqual(captures.first?.tracks.map(\.role), [.microphone])
+        XCTAssertTrue(harness.store.statusMessage?.localizedCaseInsensitiveContains("system") == true)
+    }
+
+    func testQuitFailsMemoWhenMicrophoneTrackIsInvalidAndRecoveryRemainsUsable() async throws {
+        let harness = try await CaptureCheckpointHarness(kind: .memo, microphoneValid: false, systemValid: false)
+        defer { harness.cleanUp() }
+
+        await XCTAssertThrowsErrorAsync { try await harness.store.checkpointForTermination() }
+
+        XCTAssertFalse(harness.store.isTerminationCheckpointActive)
+        XCTAssertTrue(harness.store.captureState.isCheckpointedForTests)
+        XCTAssertFalse(try await harness.library.recoverableCaptures().isEmpty)
+    }
+
     func testDeadlineFailureReplacesLivePresentationWithProtectedRecovery() {
         let store = AppStore(modelDownloadDefaults: nil)
         store.captureState = .recording(startedAt: .now, level: 0.5)
@@ -290,6 +323,68 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         while !condition(), clock.now < deadline {
             await Task.yield()
         }
+    }
+}
+
+@MainActor
+private final class CaptureCheckpointHarness {
+    let root: URL
+    let library: LibraryStore
+    let store: AppStore
+
+    init(kind: WorkspaceRecordKind, microphoneValid: Bool, systemValid: Bool) async throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-independent-checkpoint-\(UUID().uuidString)")
+        library = LibraryStore(rootURL: root)
+        let microphoneURL = root.appendingPathComponent("microphone.wav")
+        let systemURL = root.appendingPathComponent("system.wav")
+        store = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            microphoneStarter: { url, _, _ in
+                let data = microphoneValid ? syntheticSilentWAV() : Data()
+                try data.write(to: url)
+                try data.write(to: microphoneURL)
+            },
+            microphoneStopper: { microphoneURL },
+            microphoneRecordingProbe: { true },
+            systemAudioStarter: { url in
+                try (systemValid ? syntheticSilentWAV() : Data()).write(to: url)
+            },
+            systemAudioStopper: {}
+        )
+        if kind == .meeting {
+            store.settings.meetingCaptureEnabled = true
+            store.settings.liveMeetingTranscriptionEnabled = false
+            await store.beginMeeting()
+        } else {
+            await store.beginMemo()
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while store.captureShutdownPlan == .cancelStartAndCheckpoint, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        _ = systemURL
+    }
+
+    func cleanUp() { try? FileManager.default.removeItem(at: root) }
+}
+
+private func XCTAssertThrowsErrorAsync(
+    _ expression: () async throws -> Void,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        try await expression()
+        XCTFail("Expected expression to throw", file: file, line: line)
+    } catch {}
+}
+
+private extension CaptureState {
+    var isCheckpointedForTests: Bool {
+        if case .checkpointed = self { return true }
+        return false
     }
 }
 

@@ -61,6 +61,7 @@ public enum TranscriptionError: LocalizedError {
 
 public enum TranscriberFactory {
     public static func make(_ model: SpeechModel) throws -> any LocalTranscriber {
+        try SpeechModelAvailability.current.validate(model)
         switch model {
         case .parakeet:
             return ParakeetTranscriber()

@@ -25,6 +25,27 @@ private enum SyntheticMCPPersistenceError: Error {
     case restoreRejected
 }
 
+private enum SyntheticModelReadinessError: Error {
+    case invalidCache
+}
+
+private actor SyntheticRepairableModelProvider: LocalModelDownloading {
+    nonisolated var isDownloaded: Bool { true }
+    private var repaired = false
+    private(set) var downloadCount = 0
+    private(set) var loadCount = 0
+
+    func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {
+        downloadCount += 1
+        repaired = true
+    }
+
+    func load() async throws {
+        loadCount += 1
+        if !repaired { throw SyntheticModelReadinessError.invalidCache }
+    }
+}
+
 @MainActor
 private final class SyntheticTerminationCheckpoint: CaptureCheckpointing {
     private let operation: @MainActor () async throws -> Void
@@ -919,6 +940,65 @@ private func checkModelDownloadLifecycle() throws {
     try require(modelSwitch.complete(selectedB), "model B did not become ready")
 
     print("model-download: passed")
+}
+
+private func checkModelReadiness() async throws {
+    let provider = SyntheticRepairableModelProvider()
+    do {
+        try await LocalModelReadiness.prepare(provider, mode: .validateExisting) { _ in }
+        throw CoreCheckError.assertionFailed("shallow invalid cache was published ready")
+    } catch is SyntheticModelReadinessError {}
+    try await LocalModelReadiness.prepare(provider, mode: .downloadOrRepair) { _ in }
+    let downloads = await provider.downloadCount
+    let loads = await provider.loadCount
+    try require(downloads == 1, "invalid cache repair downloaded \(downloads) times")
+    try require(loads == 2, "invalid cache did not validate before and after repair")
+    print("model-readiness: passed")
+}
+
+@MainActor
+private func checkMicrophoneMeter() async throws {
+    var received: [Float] = []
+    let meter = MicrophoneLevelMeter(updateInterval: .milliseconds(1)) { received.append($0) }
+    meter.start()
+    for value in 0..<10_000 { meter.offer(Float(value) / 10_000) }
+    try require(meter.metrics.depth <= 1, "microphone meter exceeded capacity one")
+    try require(meter.metrics.peakDepth == 1, "microphone meter did not report bounded peak depth")
+    try require(meter.metrics.droppedCount > 0, "microphone meter did not coalesce high-rate updates")
+    try require(meter.consumerStartCount == 1, "microphone meter created more than one consumer")
+    await meter.finish()
+    try require(!meter.isConsumerActive, "microphone meter consumer survived stop")
+    try require(received.last == 0, "microphone meter did not publish final stopped level")
+    print("microphone-meter: passed")
+}
+
+private func checkQuitTrackIndependence() throws {
+    try CaptureCheckpointTrackPolicy.validate(kind: .meeting, validRoles: [.system])
+    try CaptureCheckpointTrackPolicy.validate(kind: .meeting, validRoles: [.microphone])
+    do {
+        try CaptureCheckpointTrackPolicy.validate(kind: .memo, validRoles: [.system])
+        throw CoreCheckError.assertionFailed("memo accepted a system-only checkpoint")
+    } catch is CaptureCheckpointTrackPolicyError {}
+    var gate = TerminationWorkGate()
+    _ = gate.prepareCheckpoint()
+    gate.resumeAfterCheckpointFailure()
+    try require(gate.beginWork(), "failed quit checkpoint left recovery admission closed")
+    print("quit-track-independence: passed")
+}
+
+private func checkModelAvailability() throws {
+    let macOS14 = SpeechModelAvailability(
+        operatingSystemVersion: OperatingSystemVersion(majorVersion: 14, minorVersion: 7, patchVersion: 0)
+    )
+    try require(macOS14.isSupported(.parakeet), "macOS 14 rejected Parakeet")
+    try require(!macOS14.isSupported(.qwen3), "macOS 14 accepted Qwen3")
+    try require(macOS14.safeSelection(for: .qwen3) == .parakeet, "macOS 14 did not choose safe fallback")
+    try require(macOS14.unavailableReason(for: .qwen3) != nil, "unsupported model had no explanation")
+    let macOS15 = SpeechModelAvailability(
+        operatingSystemVersion: OperatingSystemVersion(majorVersion: 15, minorVersion: 0, patchVersion: 0)
+    )
+    try require(macOS15.isSupported(.qwen3), "macOS 15 rejected Qwen3")
+    print("model-availability: passed")
 }
 
 private func checkHotMicRace() throws {
@@ -3640,6 +3720,14 @@ if arguments == ["--filter", "context-policy"] {
     try checkLifecycleState()
 } else if arguments == ["--filter", "model-download"] {
     try checkModelDownloadLifecycle()
+} else if arguments == ["--filter", "model-readiness"] {
+    try await checkModelReadiness()
+} else if arguments == ["--filter", "microphone-meter"] {
+    try await checkMicrophoneMeter()
+} else if arguments == ["--filter", "quit-track-independence"] {
+    try checkQuitTrackIndependence()
+} else if arguments == ["--filter", "model-availability"] {
+    try checkModelAvailability()
 } else if arguments == ["--filter", "hot-mic-race"] {
     try checkHotMicRace()
 } else if arguments == ["--filter", "bounded-mailbox"] {
@@ -3655,6 +3743,6 @@ if arguments == ["--filter", "context-policy"] {
 } else if arguments == ["--filter", "corrupt-library-recovery"] {
     try await checkCorruptLibraryRecovery()
 } else {
-    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
+    fputs("usage: evee-core-checks --filter <context-policy|public-record|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
     exit(EXIT_FAILURE)
 }

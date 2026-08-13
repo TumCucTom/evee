@@ -148,4 +148,10 @@ public struct TerminationWorkGate: Sendable {
         generation &+= 1
         return true
     }
+
+    /// A failed quit keeps the app open, so recovery actions must become
+    /// available again. A later quit prepares a fresh generation.
+    public mutating func resumeAfterCheckpointFailure() {
+        isCheckpointActive = false
+    }
 }

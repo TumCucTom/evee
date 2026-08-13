@@ -79,6 +79,36 @@ final class ModelDownloadLifecycleTests: XCTestCase {
         XCTAssertEqual(store.modelDownloadState, .ready(model: .qwen3))
     }
 
+    func testBootstrapShallowPresentInvalidCacheBecomesRetryThenRepairsOnceAndBecomesReady() async {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-model-readiness-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fake = InvalidThenRepairableModelDownloader()
+        let store = AppStore(
+            modelDownloaderFactory: { _ in fake },
+            modelDownloadDefaults: nil,
+            library: LibraryStore(rootURL: root)
+        )
+
+        await store.bootstrap()
+        await waitUntil {
+            if case .failed(model: .parakeet, _) = store.modelDownloadState { return true }
+            return false
+        }
+        guard case .failed(model: .parakeet, _) = store.modelDownloadState else {
+            return XCTFail("Shallow cache was published ready without a successful load")
+        }
+
+        store.startModelDownload()
+        store.startModelDownload()
+        await waitUntil { store.modelDownloadState == .ready(model: .parakeet) }
+
+        let counts = await fake.counts
+        XCTAssertEqual(counts.downloads, 1)
+        XCTAssertEqual(counts.loads, 2)
+        XCTAssertEqual(store.modelDownloadState, .ready(model: .parakeet))
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool
@@ -88,6 +118,27 @@ final class ModelDownloadLifecycleTests: XCTestCase {
         while !condition(), clock.now < deadline {
             await Task.yield()
         }
+    }
+}
+
+private enum SyntheticModelValidationError: Error { case invalidCache }
+
+private actor InvalidThenRepairableModelDownloader: LocalModelDownloading {
+    nonisolated var isDownloaded: Bool { true }
+    private var repaired = false
+    private var downloadCount = 0
+    private var loadCount = 0
+
+    var counts: (downloads: Int, loads: Int) { (downloadCount, loadCount) }
+
+    func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {
+        downloadCount += 1
+        repaired = true
+    }
+
+    func load() async throws {
+        loadCount += 1
+        if !repaired { throw SyntheticModelValidationError.invalidCache }
     }
 }
 
