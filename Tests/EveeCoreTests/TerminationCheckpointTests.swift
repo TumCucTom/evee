@@ -170,6 +170,11 @@ final class TerminationCheckpointTests: XCTestCase {
         let priorGeneration = availableGate.generation
         XCTAssertTrue(availableGate.beginWork())
         XCTAssertGreaterThan(availableGate.generation, priorGeneration)
+        let recoveryID = UUID()
+        XCTAssertEqual(
+            CaptureShutdownPlan.make(for: .finishing(recoveryID: recoveryID)),
+            .awaitDurableCommitOrCheckpoint(recoveryID: recoveryID)
+        )
     }
 }
 

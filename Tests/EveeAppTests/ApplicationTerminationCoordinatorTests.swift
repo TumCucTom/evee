@@ -22,8 +22,8 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let library = LibraryStore(rootURL: root)
         let capture = try! await library.beginRecoveryCapture(kind: .memo)
-        let source = root.appendingPathComponent("synthetic.caf")
-        try! Data("synthetic".utf8).write(to: source)
+        let source = root.appendingPathComponent("synthetic.wav")
+        try! syntheticSilentWAV().write(to: source)
         let manifest = try! await library.addRecoveryTrack(
             captureID: capture.id,
             kind: .memo,
@@ -47,6 +47,45 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         let initialGeneration = recoveryStore.terminationWorkGeneration
         await recoveryStore.recover(manifest)
         XCTAssertGreaterThan(recoveryStore.terminationWorkGeneration, initialGeneration)
+    }
+
+    func testAdmittedRecoveryPublishesActiveShutdownPlanBeforeTranscriptionSuspends() async {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-recovery-shutdown-plan-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let capture = try! await library.beginRecoveryCapture(kind: .memo)
+        let source = root.appendingPathComponent("synthetic.caf")
+        try! Data("synthetic".utf8).write(to: source)
+        let manifest = try! await library.addRecoveryTrack(
+            captureID: capture.id,
+            kind: .memo,
+            role: .microphone,
+            sourceURL: source
+        )
+        let transcriber = SuspendedRecoveryTranscriber()
+        let store = AppStore(
+            modelDownloadDefaults: nil,
+            library: library,
+            recoveryTranscriberFactory: { _ in transcriber }
+        )
+
+        let recovery = Task { @MainActor in await store.recover(manifest) }
+        await transcriber.waitUntilCalled()
+
+        XCTAssertEqual(store.captureState, .transcribing)
+        XCTAssertEqual(
+            store.captureShutdownPlan,
+            .awaitDurableCommitOrCheckpoint(recoveryID: manifest.id)
+        )
+        let checkpoint = Task { @MainActor in try await store.checkpointForTermination() }
+        await waitUntil { store.isTerminationCheckpointActive }
+        transcriber.fail()
+        try! await checkpoint.value
+        XCTAssertEqual(store.captureState, .checkpointed("Capture checkpointed for recovery. Quit again to close Evee, or open Recovery to review it."))
+        XCTAssertTrue(try! await library.recoverableCaptures().contains(where: { $0.id == manifest.id }))
+        await recovery.value
+        XCTAssertTrue(store.isTerminationCheckpointActive)
     }
 
     func testDeadlineCancelsTerminationAndLateCheckpointCannotReplyAgain() async {
@@ -244,6 +283,46 @@ private final class GenerationCaptureCheckpointer: CaptureCheckpointing {
 
 private enum SyntheticApplicationTerminationError: Error {
     case persistenceFailed
+}
+
+private func syntheticSilentWAV() -> Data {
+    let sampleRate: UInt32 = 8_000
+    let sampleCount: UInt32 = 800
+    let dataSize = sampleCount * 2
+    var data = Data()
+    func append(_ text: String) { data.append(contentsOf: text.utf8) }
+    func append<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    append("RIFF"); append(UInt32(36) + dataSize); append("WAVE")
+    append("fmt "); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+    append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
+    append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
+    return data
+}
+
+private final class SuspendedRecoveryTranscriber: LocalTranscriber, @unchecked Sendable {
+    let model = SpeechModel.parakeet
+    var isDownloaded: Bool { true }
+    private var continuation: CheckedContinuation<LocalTranscript, Error>?
+    private var waiter: CheckedContinuation<Void, Never>?
+    func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {}
+    func load() async throws {}
+    func unload() {}
+    func transcribe(fileURL: URL, languageCode: String?) async throws -> String { "" }
+    func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
+        await MainActor.run { waiter?.resume(); waiter = nil }
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+    @MainActor func waitUntilCalled() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    @MainActor func fail() {
+        continuation?.resume(throwing: SyntheticApplicationTerminationError.persistenceFailed)
+        continuation = nil
+    }
 }
 
 @MainActor

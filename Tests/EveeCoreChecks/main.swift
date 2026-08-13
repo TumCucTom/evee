@@ -630,6 +630,12 @@ private func checkTerminationCheckpoint() async throws {
     let recoveryGeneration = availableRecoveryGate.generation
     try require(availableRecoveryGate.beginWork(), "recovery was rejected without a checkpoint")
     try require(availableRecoveryGate.generation > recoveryGeneration, "accepted recovery did not advance termination generation")
+    let admittedRecoveryID = UUID()
+    let admittedRecoveryPlan = CaptureShutdownPlan.make(for: .finishing(recoveryID: admittedRecoveryID))
+    try require(
+        admittedRecoveryPlan == .awaitDurableCommitOrCheckpoint(recoveryID: admittedRecoveryID),
+        "admitted recovery appeared idle before transcription suspended"
+    )
 
     let protectedPresentation = CaptureState.recording(startedAt: .now, level: 0.5)
         .protectedForTerminationFailure("Synthetic protected recovery")

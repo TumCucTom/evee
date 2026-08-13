@@ -1412,16 +1412,16 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         }
 
         let sessionID = capture.id
+        activeKind = capture.kind
+        activeOperation = .capture
+        activeSelectedText = nil
+        captureKind = capture.kind
+        activeRecoveryID = sessionID
+        captureStartedAt = capture.startedAt
+        captureLifecycle = .finishing(sessionID)
+        captureState = .transcribing
         do {
-            activeKind = capture.kind
-            activeOperation = .capture
-            activeSelectedText = nil
-            captureKind = capture.kind
-            activeRecoveryID = sessionID
             activeRecoveryDirectory = await library.recoveryURL.appendingPathComponent(sessionID.uuidString, isDirectory: true)
-            captureStartedAt = capture.startedAt
-            captureLifecycle = .finishing(sessionID)
-            captureState = .transcribing
             try? await library.updateRecoveryCapture(id: sessionID, status: .processing)
 
             let microphoneURL = try await library.safeURL(forRelativePath: microphoneTrack.relativePath)
@@ -1430,7 +1430,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 activeSystemAudioURL = try await library.safeURL(forRelativePath: systemTrack.relativePath)
             }
 
-            let engine = try transcriber ?? TranscriberFactory.make(settings.model)
+            let engine = try transcriber ?? recoveryTranscriberFactory(settings.model)
             transcriber = engine
             let microphoneTranscript = try await engine.transcribeDetailed(fileURL: microphoneURL, languageCode: settings.languageCode)
             guard captureLifecycle == .finishing(sessionID) else { return }

@@ -189,3 +189,30 @@ Fix-round 2 verification:
   blocked before app-test compilation by KeyboardShortcuts' unavailable
   `PreviewsMacros` plugin under Command Line Tools. No full-Xcode, package,
   physical capture, or packaged-app result is claimed.
+
+## Fix round 3
+
+Closed the recovery-admission ordering window. After validation and synchronous
+generation admission, `recover(_:)` now publishes the recovery identifier,
+finishing lifecycle, capture kind, start time, and transcribing presentation in
+the same MainActor turn, before its first library or transcription await. An
+immediate quit therefore maps to `awaitDurableCommitOrCheckpoint`, not
+`terminateImmediately`, and the existing checkpoint path protects the admitted
+recovery. Subsequent setup/transcription failure continues through the existing
+session-failure unwind; a lifecycle already moved to cancellation by termination
+is left for the checkpoint owner.
+
+Fix-round 3 verification:
+
+- A deterministic app-target test admits recovery with a suspended synthetic
+  transcriber, observes the active shutdown plan, begins checkpointing, then
+  releases the suspension. Core executable coverage also asserts the admitted
+  finishing snapshot maps to the durable-commit/checkpoint plan.
+- Rebuilt `evee-core-checks`; `--filter termination-checkpoint` passed ten
+  consecutive runs.
+- `swift build --target EveeCore --jobs 2`: passed.
+- Direct `swiftc -typecheck` of every EveeApp source against built modules:
+  passed.
+- App XCTest execution remains blocked before compilation by KeyboardShortcuts'
+  unavailable `PreviewsMacros` plugin under Command Line Tools. No full-Xcode,
+  package, physical capture, or packaged-app result is claimed.
