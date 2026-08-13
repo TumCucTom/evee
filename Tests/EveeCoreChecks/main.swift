@@ -3279,8 +3279,28 @@ private func checkRecoveryTracks() async throws {
     for track in withBoth.tracks {
         originalURLs.append(try await seedStore.safeURL(forRelativePath: track.relativePath))
     }
-    let failingStore = LibraryStore(rootURL: atomicRoot, failNextWritesAt: [.recordMetadata])
     let replacement = WorkspaceRecord(id: recordID, kind: .meeting, title: "Recovered", text: "New")
+    let directorySyncFailingStore = LibraryStore(rootURL: atomicRoot, failNextWritesAt: [.recordAudioDirectorySync])
+    do {
+        _ = try await directorySyncFailingStore.commitRecoveredRecord(
+            replacement,
+            recoveryID: atomicCapture.id,
+            trackSelection: .allValid,
+            keepAudio: true
+        )
+        throw CoreCheckError.assertionFailed("record audio directory sync failure unexpectedly committed recovery")
+    } catch CoreCheckError.assertionFailed(let message) {
+        throw CoreCheckError.assertionFailed(message)
+    } catch {
+        // Expected synthetic pre-metadata durability failure.
+    }
+    let afterDirectoryFailure = try await directorySyncFailingStore.record(id: recordID)
+    let filesAfterDirectoryFailure = try FileManager.default.contentsOfDirectory(at: oldDirectory, includingPropertiesForKeys: nil)
+    try require(afterDirectoryFailure == persistedExisting, "directory sync failure changed canonical metadata")
+    try require(filesAfterDirectoryFailure.map(\.lastPathComponent) == ["existing.wav"], "directory sync failure left copied audio")
+    try require(originalURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "directory sync failure removed recovery originals")
+
+    let failingStore = LibraryStore(rootURL: atomicRoot, failNextWritesAt: [.recordMetadataBeforeReplacement])
     do {
         _ = try await failingStore.commitRecoveredRecord(
             replacement,
@@ -3310,6 +3330,47 @@ private func checkRecoveryTracks() async throws {
     try require(retried.audioTracks.count == 2 && filesAfterRetry.count == 2, "retry left duplicate or missing canonical audio")
     try require(recordsAfterRetry.filter { $0.id == recordID }.count == 1, "retry duplicated canonical metadata")
     try require(!FileManager.default.fileExists(atPath: oldAudio.path), "retry retained superseded canonical audio")
+
+    let installedRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-installed-durability-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: installedRoot) }
+    let installedSeedStore = LibraryStore(rootURL: installedRoot)
+    try FileManager.default.createDirectory(at: installedRoot, withIntermediateDirectories: true)
+    let installedInput = installedRoot.appendingPathComponent("input.wav")
+    try coreCheckSilentWAV().write(to: installedInput)
+    let installedCapture = try await installedSeedStore.beginRecoveryCapture(kind: .memo)
+    let installedManifest = try await installedSeedStore.addRecoveryTrack(
+        captureID: installedCapture.id,
+        kind: .memo,
+        role: .microphone,
+        sourceURL: installedInput
+    )
+    var installedOriginalURLs: [URL] = []
+    for track in installedManifest.tracks {
+        installedOriginalURLs.append(try await installedSeedStore.safeURL(forRelativePath: track.relativePath))
+    }
+    let installedRecord = WorkspaceRecord(kind: .memo, title: "Installed", text: "Durability uncertain")
+    let postReplacementStore = LibraryStore(rootURL: installedRoot, failNextWritesAt: [.recordMetadataAfterReplacement])
+    do {
+        _ = try await postReplacementStore.commitRecoveredRecord(
+            installedRecord,
+            recoveryID: installedCapture.id,
+            trackSelection: .allValid,
+            keepAudio: true
+        )
+        throw CoreCheckError.assertionFailed("post-replacement failure was not surfaced")
+    } catch LibraryStoreError.metadataInstalledButDurabilityUncertain {
+        // Expected: metadata is installed, so copied audio must remain.
+    }
+    guard let installed = try await postReplacementStore.record(id: installedRecord.id) else {
+        throw CoreCheckError.assertionFailed("post-replacement failure lost installed metadata")
+    }
+    try require(installed.audioTracks.count == 1, "post-replacement failure installed incomplete track metadata")
+    for track in installed.audioTracks {
+        let url = try await postReplacementStore.safeURL(forRelativePath: track.relativePath)
+        try require(FileManager.default.fileExists(atPath: url.path), "post-replacement failure deleted metadata-owned audio")
+    }
+    try require(installedOriginalURLs.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }, "post-replacement failure removed recovery originals")
 
     let discardRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("evee-discard-recovery-check-\(UUID().uuidString)", isDirectory: true)
@@ -3380,22 +3441,76 @@ private func checkCorruptLibraryRecovery() async throws {
     let remainingFailureBytes = try Data(contentsOf: failureSource)
     try require(remainingFailureBytes == failureBytes, "preservation failure changed the canonical source")
 
-    let futureRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("evee-future-schema-check-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: futureRoot) }
-    let futureStore = LibraryStore(rootURL: futureRoot)
-    try await futureStore.prepare()
-    let futureSource = futureRoot.appendingPathComponent("records.json")
-    let futureBytes = Data("{\"schemaVersion\":999,\"updatedAt\":\"2026-08-13T12:00:00Z\",\"records\":[]}".utf8)
-    try futureBytes.write(to: futureSource)
-    do {
-        _ = try await futureStore.loadRecordsRecoveringCorruption()
-        throw CoreCheckError.assertionFailed("future schema was treated as corruption")
-    } catch LibraryStoreError.unsupportedSchema(found: 999, supported: LibraryStore.currentSchemaVersion) {
-        // Expected hard error.
+    for filename in ["records.json", "settings.json"] {
+        let futureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-future-schema-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: futureRoot) }
+        let futureStore = LibraryStore(rootURL: futureRoot)
+        try await futureStore.prepare()
+        let futureSource = futureRoot.appendingPathComponent(filename)
+        let futureBytes = Data("{\"schemaVersion\":999,\"payload\":{\"changed\":true},\"records\":\"not-an-array\",\"settings\":false}".utf8)
+        try futureBytes.write(to: futureSource)
+        do {
+            if filename == "records.json" {
+                _ = try await futureStore.loadRecordsRecoveringCorruption()
+            } else {
+                _ = try await futureStore.loadSettingsRecoveringCorruption()
+            }
+            throw CoreCheckError.assertionFailed("future \(filename) schema was treated as corruption")
+        } catch LibraryStoreError.unsupportedSchema(found: 999, supported: LibraryStore.currentSchemaVersion) {
+            // Expected hard error independent of the future payload shape.
+        }
+        let remainingFutureBytes = try Data(contentsOf: futureSource)
+        try require(remainingFutureBytes == futureBytes, "future \(filename) source was moved or changed")
+        try require(!FileManager.default.fileExists(atPath: futureRoot.appendingPathComponent("Corrupt").path), "future \(filename) created a corrupt copy")
     }
-    let remainingFutureBytes = try Data(contentsOf: futureSource)
-    try require(remainingFutureBytes == futureBytes, "future schema source was moved or changed")
+
+    let quarantineRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("evee-records-quarantine-check-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: quarantineRoot) }
+    let firstStore = LibraryStore(rootURL: quarantineRoot)
+    try await firstStore.prepare()
+    let orphanID = UUID()
+    let orphanDirectory = quarantineRoot.appendingPathComponent("Audio/Records/\(orphanID.uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: orphanDirectory, withIntermediateDirectories: true)
+    let orphanAudio = orphanDirectory.appendingPathComponent("unknown.wav")
+    try coreCheckSilentWAV().write(to: orphanAudio)
+    try Data("{".utf8).write(to: quarantineRoot.appendingPathComponent("records.json"))
+    let firstLoad = try await firstStore.loadRecordsRecoveringCorruption()
+    guard let firstPreserved = firstLoad.preservedCorruptURL else {
+        throw CoreCheckError.assertionFailed("corrupt records did not create a durable quarantine")
+    }
+    guard let marker = try await firstStore.recordsQuarantine() else {
+        throw CoreCheckError.assertionFailed("corrupt records did not persist a quarantine marker")
+    }
+    try require(marker.preservedCorruptRelativePath == "Corrupt/\(firstPreserved.lastPathComponent)", "quarantine marker did not reference the preserved copy")
+    let markerPermissions = try FileManager.default.attributesOfItem(
+        atPath: quarantineRoot.appendingPathComponent("records-quarantine.json").path
+    )[.posixPermissions] as? NSNumber
+    try require((markerPermissions?.intValue ?? 0) & 0o777 == 0o600, "quarantine marker was not private")
+
+    let relaunchedStore = LibraryStore(rootURL: quarantineRoot)
+    let relaunchedLoad = try await relaunchedStore.loadRecordsRecoveringCorruption()
+    try require(relaunchedLoad.preservedCorruptURL == firstPreserved, "quarantine warning did not survive relaunch")
+    try await relaunchedStore.save([WorkspaceRecord(kind: .memo, title: "Later", text: "Saved")])
+    try await relaunchedStore.reconcileAudioStorage()
+    try require(FileManager.default.fileExists(atPath: orphanAudio.path), "ordinary save/reconciliation deleted quarantined record audio")
+
+    let recoveryInput = quarantineRoot.appendingPathComponent("recovery-input.wav")
+    try coreCheckSilentWAV().write(to: recoveryInput)
+    let recovery = try await relaunchedStore.beginRecoveryCapture(kind: .memo)
+    _ = try await relaunchedStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: recoveryInput)
+    _ = try await relaunchedStore.commitRecoveredRecord(
+        WorkspaceRecord(kind: .memo, title: "Recovered", text: "Retained"),
+        recoveryID: recovery.id,
+        trackSelection: .allValid,
+        keepAudio: true
+    )
+    try require(FileManager.default.fileExists(atPath: orphanAudio.path), "new retained recovery reconciled quarantined audio")
+    try await relaunchedStore.resetRecordsQuarantine()
+    let resetMarker = try await relaunchedStore.recordsQuarantine()
+    try require(resetMarker == nil, "explicit reset left the quarantine marker")
+    try require(FileManager.default.fileExists(atPath: orphanAudio.path), "explicit reset deleted audio in the same action")
     print("corrupt-library-recovery: passed")
 }
 

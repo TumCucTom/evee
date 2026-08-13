@@ -9,6 +9,7 @@ public enum LibraryStoreError: LocalizedError, Sendable {
     case emptyRecoverySelection
     case invalidRecoveryTrack(AudioTrackRole, String)
     case unsupportedSchema(found: Int, supported: Int)
+    case metadataInstalledButDurabilityUncertain(URL, String)
 
     public var errorDescription: String? {
         switch self {
@@ -26,12 +27,20 @@ public enum LibraryStoreError: LocalizedError, Sendable {
             return "The \(role.rawValue) recovery track cannot be saved. \(reason)"
         case .unsupportedSchema(let found, let supported):
             return "This Evee library uses schema \(found), but this version supports up to schema \(supported)."
+        case .metadataInstalledButDurabilityUncertain(let url, let reason):
+            return "Evee installed \(url.lastPathComponent), but could not confirm directory durability: \(reason)"
         }
     }
 }
 
 @_spi(Testing) public enum LibraryStoreWritePoint: Hashable, Sendable {
-    case recordMetadata
+    case recordAudioDirectorySync
+    case recordMetadataBeforeReplacement
+    case recordMetadataAfterReplacement
+}
+
+private struct SchemaVersionProbe: Decodable {
+    var schemaVersion: Int
 }
 
 private struct RecordsEnvelope: Codable {
@@ -58,6 +67,7 @@ public actor LibraryStore {
     private let recordsURL: URL
     private let settingsURL: URL
     private let meetingDraftURL: URL
+    private let recordsQuarantineURL: URL
     private let searchIndexURL: URL
     private var searchIndex: WorkspaceSearchIndex?
     private var failNextWritesAt: Set<LibraryStoreWritePoint>
@@ -70,6 +80,7 @@ public actor LibraryStore {
         self.recordsURL = self.rootURL.appendingPathComponent("records.json")
         self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
         self.meetingDraftURL = self.rootURL.appendingPathComponent("meeting-draft.json")
+        self.recordsQuarantineURL = self.rootURL.appendingPathComponent("records-quarantine.json")
         self.searchIndexURL = self.rootURL.appendingPathComponent("workspace-index.sqlite3")
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
@@ -86,6 +97,7 @@ public actor LibraryStore {
         self.recordsURL = self.rootURL.appendingPathComponent("records.json")
         self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
         self.meetingDraftURL = self.rootURL.appendingPathComponent("meeting-draft.json")
+        self.recordsQuarantineURL = self.rootURL.appendingPathComponent("records-quarantine.json")
         self.searchIndexURL = self.rootURL.appendingPathComponent("workspace-index.sqlite3")
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
@@ -106,17 +118,7 @@ public actor LibraryStore {
         guard FileManager.default.fileExists(atPath: recordsURL.path) else { return [] }
         let data = try Data(contentsOf: recordsURL)
         do {
-            if let envelope = try? decoder.decode(RecordsEnvelope.self, from: data) {
-                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
-                }
-                return envelope.records
-            }
-
-            // Version 1 stored the records array directly. Upgrade it on the first successful read.
-            let legacy = try decoder.decode([WorkspaceRecord].self, from: data)
-            try save(legacy)
-            return legacy
+            return try decodeRecords(data)
         } catch let error as LibraryStoreError {
             throw error
         } catch {
@@ -127,27 +129,39 @@ public actor LibraryStore {
 
     public func loadRecordsRecoveringCorruption() throws -> RecoveredLibraryLoad<[WorkspaceRecord]> {
         try prepare()
+        let quarantine = try recordsQuarantine()
         guard FileManager.default.fileExists(atPath: recordsURL.path) else {
-            return RecoveredLibraryLoad(value: [])
+            return RecoveredLibraryLoad(
+                value: [],
+                preservedCorruptURL: try quarantine.map { try preservedURL(for: $0) }
+            )
         }
         let data = try Data(contentsOf: recordsURL)
         do {
-            return RecoveredLibraryLoad(value: try decodeRecords(data))
+            return RecoveredLibraryLoad(
+                value: try decodeRecords(data),
+                preservedCorruptURL: try quarantine.map { try preservedURL(for: $0) }
+            )
         } catch let error as LibraryStoreError {
             throw error
         } catch {
-            let preserved = try preserveCorruptCanonicalFile(recordsURL, expectedData: data)
+            let preserved = try quarantineCorruptRecords(expectedData: data)
             return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
         }
     }
 
     private func decodeRecords(_ data: Data) throws -> [WorkspaceRecord] {
-        if let envelope = try? decoder.decode(RecordsEnvelope.self, from: data) {
-            guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
+        if let version = try? decoder.decode(SchemaVersionProbe.self, from: data).schemaVersion {
+            guard version <= Self.currentSchemaVersion else {
+                throw LibraryStoreError.unsupportedSchema(found: version, supported: Self.currentSchemaVersion)
             }
+            guard version == Self.currentSchemaVersion else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported records envelope schema."))
+            }
+            let envelope = try decoder.decode(RecordsEnvelope.self, from: data)
             return envelope.records
         }
+        // Version 1 stored the records array directly. Upgrade it on the first successful read.
         let legacy = try decoder.decode([WorkspaceRecord].self, from: data)
         try save(legacy)
         return legacy
@@ -156,7 +170,12 @@ public actor LibraryStore {
     public func save(_ records: [WorkspaceRecord]) throws {
         try prepare()
         let envelope = RecordsEnvelope(schemaVersion: Self.currentSchemaVersion, updatedAt: .now, records: records)
-        try writePrivate(encoder.encode(envelope), to: recordsURL, point: .recordMetadata)
+        try writePrivate(
+            encoder.encode(envelope),
+            to: recordsURL,
+            beforeReplacementPoint: .recordMetadataBeforeReplacement,
+            afterReplacementPoint: .recordMetadataAfterReplacement
+        )
         do {
             try synchronizeSearchIndex(records)
         } catch {
@@ -167,21 +186,27 @@ public actor LibraryStore {
         }
     }
 
+    public func recordsQuarantine() throws -> RecordsQuarantineMarker? {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: recordsQuarantineURL.path) else { return nil }
+        return try decoder.decode(RecordsQuarantineMarker.self, from: Data(contentsOf: recordsQuarantineURL))
+    }
+
+    /// Explicitly removes metadata protection. Audio is intentionally left
+    /// untouched; any later cleanup is a separate operation.
+    public func resetRecordsQuarantine() throws {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: recordsQuarantineURL.path) else { return }
+        try FileManager.default.removeItem(at: recordsQuarantineURL)
+        try synchronizeDirectory(at: rootURL)
+    }
+
     public func loadSettings() throws -> EveeSettings {
         try prepare()
         guard FileManager.default.fileExists(atPath: settingsURL.path) else { return EveeSettings() }
         let data = try Data(contentsOf: settingsURL)
         do {
-            if let envelope = try? decoder.decode(SettingsEnvelope.self, from: data) {
-                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
-                }
-                return envelope.settings
-            }
-
-            let legacy = try decoder.decode(EveeSettings.self, from: data)
-            try save(legacy)
-            return legacy
+            return try decodeSettings(data)
         } catch let error as LibraryStoreError {
             throw error
         } catch {
@@ -207,10 +232,14 @@ public actor LibraryStore {
     }
 
     private func decodeSettings(_ data: Data) throws -> EveeSettings {
-        if let envelope = try? decoder.decode(SettingsEnvelope.self, from: data) {
-            guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
+        if let version = try? decoder.decode(SchemaVersionProbe.self, from: data).schemaVersion {
+            guard version <= Self.currentSchemaVersion else {
+                throw LibraryStoreError.unsupportedSchema(found: version, supported: Self.currentSchemaVersion)
             }
+            guard version == Self.currentSchemaVersion else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported settings envelope schema."))
+            }
+            let envelope = try decoder.decode(SettingsEnvelope.self, from: data)
             return envelope.settings
         }
         let legacy = try decoder.decode(EveeSettings.self, from: data)
@@ -362,7 +391,7 @@ public actor LibraryStore {
                 try? FileManager.default.removeItem(at: url)
             }
         }
-        try? reconcileRecordAudio(using: records)
+        try? reconcileRecordAudioIfPermitted(using: records)
     }
 
     @discardableResult
@@ -381,7 +410,7 @@ public actor LibraryStore {
         for relativePath in Set(paths) {
             if let url = try? safeURL(forRelativePath: relativePath) { try? FileManager.default.removeItem(at: url) }
         }
-        try? reconcileRecordAudio(using: retained)
+        try? reconcileRecordAudioIfPermitted(using: retained)
         return removed.count
     }
 
@@ -633,6 +662,11 @@ public actor LibraryStore {
                     }
                     retained.append(updated)
                 }
+                if failNextWritesAt.remove(.recordAudioDirectorySync) != nil {
+                    throw POSIXError(.EIO)
+                }
+                try synchronizeDirectory(at: destinationDirectory)
+                try synchronizeDirectory(at: destinationDirectory.deletingLastPathComponent())
                 record.audioTracks = retained
                 guard retained.count == selectedTracks.count, !retained.isEmpty else {
                     throw LibraryStoreError.missingRecoveryCapture(recoveryID)
@@ -650,10 +684,12 @@ public actor LibraryStore {
                 for oldPath in previousRecord.map(recordAudioPaths) ?? [] where !referencedPaths.contains(oldPath) {
                     removeOwnedRecordAudioIfPresent(relativePath: oldPath, recordID: record.id)
                 }
-                try? reconcileRecordAudio(using: records)
+                try? reconcileRecordAudioIfPermitted(using: records)
             } catch {
-                for copy in copies.reversed() where FileManager.default.fileExists(atPath: copy.path) {
-                    try? FileManager.default.removeItem(at: copy)
+                if !isInstalledDurabilityError(error) {
+                    for copy in copies.reversed() where FileManager.default.fileExists(atPath: copy.path) {
+                        try? FileManager.default.removeItem(at: copy)
+                    }
                 }
                 throw error
             }
@@ -683,7 +719,7 @@ public actor LibraryStore {
 
     public func reconcileAudioStorage() throws {
         let records = try loadRecords()
-        try reconcileRecordAudio(using: records)
+        try reconcileRecordAudioIfPermitted(using: records)
         try reconcileRecoveryAudio(using: records)
     }
 
@@ -807,6 +843,11 @@ public actor LibraryStore {
         }
     }
 
+    private func reconcileRecordAudioIfPermitted(using records: [WorkspaceRecord]) throws {
+        guard try recordsQuarantine() == nil else { return }
+        try reconcileRecordAudio(using: records)
+    }
+
     private func reconcileRecoveryAudio(using records: [WorkspaceRecord]) throws {
         guard FileManager.default.fileExists(atPath: recoveryURL.path) else { return }
         let directories = try FileManager.default.contentsOfDirectory(
@@ -845,21 +886,37 @@ public actor LibraryStore {
     private func writePrivate(
         _ data: Data,
         to url: URL,
-        point: LibraryStoreWritePoint? = nil
+        beforeReplacementPoint: LibraryStoreWritePoint? = nil,
+        afterReplacementPoint: LibraryStoreWritePoint? = nil
     ) throws {
-        if let point, failNextWritesAt.remove(point) != nil {
+        let directory = url.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        var installed = false
+        defer {
+            if !installed, FileManager.default.fileExists(atPath: temporary.path) {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
+
+        try data.write(to: temporary, options: .withoutOverwriting)
+        try makePrivate(temporary)
+        try synchronizeFile(at: temporary)
+        if let beforeReplacementPoint, failNextWritesAt.remove(beforeReplacementPoint) != nil {
             throw POSIXError(.EIO)
         }
-        try data.write(to: url, options: .atomic)
-        try makePrivate(url)
-        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { _ = close(descriptor) }
-        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        let directory = open(url.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard directory >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        defer { _ = close(directory) }
-        guard fsync(directory) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+
+        guard rename(temporary.path, url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        installed = true
+        do {
+            if let afterReplacementPoint, failNextWritesAt.remove(afterReplacementPoint) != nil {
+                throw POSIXError(.EIO)
+            }
+            try synchronizeDirectory(at: directory)
+        } catch {
+            throw LibraryStoreError.metadataInstalledButDurabilityUncertain(url, error.localizedDescription)
+        }
     }
 
     private func makePrivate(_ url: URL) throws {
@@ -908,6 +965,42 @@ public actor LibraryStore {
             }
             throw error
         }
+    }
+
+    private func quarantineCorruptRecords(expectedData: Data) throws -> URL {
+        let preserved = try preserveCorruptCanonicalFile(recordsURL, expectedData: expectedData)
+        let marker = RecordsQuarantineMarker(
+            preservedCorruptRelativePath: relativePath(for: preserved),
+            reason: "Unreadable records metadata was preserved before safe fallback."
+        )
+        do {
+            try writePrivate(encoder.encode(marker), to: recordsQuarantineURL)
+            return preserved
+        } catch {
+            if FileManager.default.fileExists(atPath: recordsQuarantineURL.path) {
+                try? FileManager.default.removeItem(at: recordsQuarantineURL)
+            }
+            if FileManager.default.fileExists(atPath: preserved.path),
+               !FileManager.default.fileExists(atPath: recordsURL.path) {
+                try? FileManager.default.moveItem(at: preserved, to: recordsURL)
+            }
+            throw error
+        }
+    }
+
+    private func preservedURL(for marker: RecordsQuarantineMarker) throws -> URL {
+        let url = try safeURL(forRelativePath: marker.preservedCorruptRelativePath)
+        guard url.deletingLastPathComponent().standardizedFileURL == rootURL
+            .appendingPathComponent("Corrupt", isDirectory: true)
+            .standardizedFileURL else {
+            throw LibraryStoreError.unsafeRelativePath(marker.preservedCorruptRelativePath)
+        }
+        return url
+    }
+
+    private func isInstalledDurabilityError(_ error: Error) -> Bool {
+        if case LibraryStoreError.metadataInstalledButDurabilityUncertain = error { return true }
+        return false
     }
 
     private func synchronizeDirectory(at url: URL) throws {

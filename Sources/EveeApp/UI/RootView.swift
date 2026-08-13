@@ -3,6 +3,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
+    @State private var showingMetadataResetConfirmation = false
 
     var body: some View {
         ZStack {
@@ -35,14 +36,32 @@ struct RootView: View {
                     Spacer(minLength: 12)
                     Button("Show in Finder") { store.revealPreservedLibraryFiles() }
                         .controlSize(.small)
-                    Button("Dismiss") { store.dismissLibraryRecoveryWarning() }
+                    Button("Keep preserved data") { store.dismissLibraryRecoveryWarning() }
                         .controlSize(.small)
+                    if store.recordsQuarantineActive {
+                        Button("Reset library metadata", role: .destructive) {
+                            showingMetadataResetConfirmation = true
+                        }
+                        .controlSize(.small)
+                    }
                 }
                 .padding(10)
                 .background(AnimaTheme.raisedSurface)
                 .overlay(alignment: .bottom) { Divider() }
                 .accessibilityElement(children: .contain)
             }
+        }
+        .confirmationDialog(
+            "Reset library metadata protection?",
+            isPresented: $showingMetadataResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset metadata protection", role: .destructive) {
+                Task { await store.resetLibraryMetadataProtection() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The preserved corrupt copy will remain, and no audio will be deleted by this action. Future maintenance may then remove audio that current library metadata does not reference.")
         }
         .alert(alertTitle, isPresented: Binding(
             get: { store.statusMessage != nil },

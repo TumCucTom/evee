@@ -70,6 +70,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var recoverableCaptures: [CaptureRecoveryManifest] = []
     @Published private(set) var recoveryTrackAssessments: [UUID: [RecoveryTrackAssessment]] = [:]
     @Published private(set) var libraryRecoveryWarning: String?
+    @Published private(set) var recordsQuarantineActive = false
     private var preservedCorruptURLs: [URL] = []
     @Published private(set) var captureKind: WorkspaceRecordKind?
     @Published private(set) var captureOperation: WorkspaceRecordOperation?
@@ -453,6 +454,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             let recordsLoad = try await library.loadRecordsRecoveringCorruption()
             records = recordsLoad.value.sorted { $0.createdAt > $1.createdAt }
             if let preserved = recordsLoad.preservedCorruptURL { preservedCorruptURLs.append(preserved) }
+            recordsQuarantineActive = try await library.recordsQuarantine() != nil
             let recordsWereRecovered = recordsLoad.preservedCorruptURL != nil
             if !recordsWereRecovered {
                 if settings.historyRetentionDays > 0 {
@@ -476,7 +478,10 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             if !preservedCorruptURLs.isEmpty {
                 let paths = Array(Set(preservedCorruptURLs.map(\.path))).sorted()
                 self.preservedCorruptURLs = paths.map { URL(fileURLWithPath: $0) }
-                libraryRecoveryWarning = "Evee preserved unreadable local data and continued with safe defaults. Review these private copies before deleting them:\n\(paths.joined(separator: "\n"))"
+                let protection = recordsQuarantineActive
+                    ? " Record-audio cleanup remains disabled until you explicitly reset library metadata protection."
+                    : ""
+                libraryRecoveryWarning = "Evee preserved unreadable local data and continued with safe defaults.\(protection) Review these private copies before deleting them:\n\(paths.joined(separator: "\n"))"
             }
             let selectedTranscriber = try TranscriberFactory.make(settings.model)
             transcriber = selectedTranscriber
@@ -1659,6 +1664,17 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
 
     func dismissLibraryRecoveryWarning() {
         libraryRecoveryWarning = nil
+    }
+
+    func resetLibraryMetadataProtection() async {
+        do {
+            try await library.resetRecordsQuarantine()
+            recordsQuarantineActive = false
+            libraryRecoveryWarning = nil
+            statusMessage = "Library metadata protection was reset. Evee did not delete any audio; future maintenance may reconcile unreferenced files."
+        } catch {
+            statusMessage = "Library metadata protection could not be reset: \(error.localizedDescription)"
+        }
     }
 
     func revealPreservedLibraryFiles() {

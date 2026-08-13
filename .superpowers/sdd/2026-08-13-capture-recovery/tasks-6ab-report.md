@@ -120,3 +120,64 @@ data was accessed.
   performs staged artifact/common-secret and neutral metadata inspection before
   committing; no restricted-scan result is fabricated when its inputs are
   unavailable.
+
+## Fix round 1/5 — RED
+
+- Added lifecycle cases before implementation for a records quarantine that
+  must survive two `LibraryStore` instances, an ordinary records save, explicit
+  reconciliation, and a newly retained recovery. A pre-existing UUID record
+  audio directory must survive until explicit marker reset, and reset itself
+  must not delete audio.
+- Expanded future-schema cases to records and settings whose version is newer
+  but whose payload fields/types cannot decode as the current envelope. Both
+  canonical inputs must remain byte-identical and no `Corrupt` copy may appear.
+- Split retained-commit fault coverage into record-directory sync failure,
+  metadata failure before replacement, and failure after replacement. The first
+  two require rollback of copied audio; the last requires installed metadata,
+  its referenced copies, and recovery originals all to remain.
+- `swift test --filter WorkspaceLifecycleTests/testRecordsQuarantineSurvivesRelaunchWritesAndRecoveryUntilExplicitReset`
+  reached the known host gates (`XCTest` unavailable and `PreviewsMacros`
+  missing), so the new XCTest cases could not execute here. Equivalent
+  temp-root/generated-WAV journeys were added to the executable
+  `corrupt-library-recovery` and `recovery-tracks` filters for runnable evidence.
+
+## Fix round 1/5 — GREEN
+
+- Corrupt `records.json` preservation now installs a private, fsync'd
+  `records-quarantine.json` marker containing the preserved relative path,
+  reason, and timestamp. Recovering loads surface the same preserved copy on
+  later launches even after a valid canonical records file is written.
+- Every record-audio reconciliation entry point checks the marker and fails
+  closed while it exists. Ordinary saves do not clear it, and newly retained
+  recovery commits cannot orphan-clean unknown UUID record directories.
+- The existing corruption banner now offers **Keep preserved data** (dismisses
+  the banner but leaves protection durable) and **Reset library metadata**.
+  Reset requires a destructive confirmation, removes only the marker, and
+  explicitly reports that no audio was deleted by that action.
+- Atomic private writes now create/chmod/fsync a same-directory temporary file,
+  then use `rename` as the metadata commit point. Retained files and their
+  record and Records directories are fsync'd before that point. Failures after
+  replacement surface `metadataInstalledButDurabilityUncertain`; commit cleanup
+  recognizes that installed state and preserves every metadata-owned copy.
+- Records/settings decode now probes only the top-level `schemaVersion` before
+  selecting a decoder. A newer integer version is rejected as
+  `unsupportedSchema` without interpreting, moving, or rewriting its payload;
+  only the current envelope is decoded, while an absent version may use the
+  legacy decoder.
+
+## Fix round 1/5 — verification and limits
+
+- `swift run evee-core-checks --filter corrupt-library-recovery`: passed,
+  including marker privacy/reference, two bootstraps, ordinary save,
+  quarantine-gated reconciliation, retained recovery, explicit non-deleting
+  reset, and incompatible future records/settings payloads.
+- `swift run evee-core-checks --filter recovery-tracks`: passed, including
+  record-directory sync rollback, pre-replacement rollback, retry, and
+  post-replacement installed-metadata/audio preservation.
+- `swift run evee-core-checks --filter termination-checkpoint`: passed.
+- `swift build --target EveeCore`: passed.
+- Direct all-source EveeApp `swiftc -typecheck`: passed; `swiftc -parse` and
+  `git diff --check` over the changed sources/tests also passed.
+- The existing full-Xcode, package XCTest, EveeApp package build, physical
+  capture, and controller-owned restricted-scan limitations above remain
+  unchanged and are not claimed as passing.

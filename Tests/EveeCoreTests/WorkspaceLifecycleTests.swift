@@ -136,7 +136,7 @@ final class WorkspaceLifecycleTests: XCTestCase {
             systemData: syntheticSilentWAV()
         )
         let originals = try await resolvedURLs(capture.tracks, in: seedingStore)
-        let failingStore = LibraryStore(rootURL: root, failNextWritesAt: [.recordMetadata])
+        let failingStore = LibraryStore(rootURL: root, failNextWritesAt: [.recordMetadataBeforeReplacement])
         let proposed = WorkspaceRecord(id: recordID, kind: .meeting, title: "Recovered", text: "New")
 
         await XCTAssertThrowsErrorAsync {
@@ -246,24 +246,144 @@ final class WorkspaceLifecycleTests: XCTestCase {
     }
 
     func testFutureSchemaRemainsHardErrorAndIsNotMovedAsCorruption() async throws {
+        let cases: [(String, (LibraryStore) async throws -> Void)] = [
+            ("records.json", { store in _ = try await store.loadRecordsRecoveringCorruption() }),
+            ("settings.json", { store in _ = try await store.loadSettingsRecoveringCorruption() }),
+        ]
+
+        for (filename, load) in cases {
+            let root = temporaryLibraryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = LibraryStore(rootURL: root)
+            try await store.prepare()
+            let source = root.appendingPathComponent(filename)
+            let future = Data("{\"schemaVersion\":999,\"payload\":{\"changed\":true},\"records\":\"not-an-array\",\"settings\":false}".utf8)
+            try future.write(to: source)
+
+            await XCTAssertThrowsErrorAsync {
+                try await load(store)
+            } verify: { error in
+                guard case LibraryStoreError.unsupportedSchema(found: 999, supported: LibraryStore.currentSchemaVersion) = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+
+            XCTAssertEqual(try Data(contentsOf: source), future)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Corrupt").path))
+        }
+    }
+
+    func testRecordsQuarantineSurvivesRelaunchWritesAndRecoveryUntilExplicitReset() async throws {
         let root = temporaryLibraryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        let store = LibraryStore(rootURL: root)
-        try await store.prepare()
-        let source = root.appendingPathComponent("records.json")
-        let future = Data("{\"schemaVersion\":999,\"updatedAt\":\"2026-08-13T12:00:00Z\",\"records\":[]}".utf8)
-        try future.write(to: source)
+        let firstStore = LibraryStore(rootURL: root)
+        try await firstStore.prepare()
+        let orphanID = UUID()
+        let orphanDirectory = root.appendingPathComponent("Audio/Records/\(orphanID.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: orphanDirectory, withIntermediateDirectories: true)
+        let orphanAudio = orphanDirectory.appendingPathComponent("unknown.wav")
+        try syntheticSilentWAV().write(to: orphanAudio)
+        try Data("{".utf8).write(to: root.appendingPathComponent("records.json"))
+
+        let firstLoad = try await firstStore.loadRecordsRecoveringCorruption()
+        let preserved = try XCTUnwrap(firstLoad.preservedCorruptURL)
+        let loadedMarker = try await firstStore.recordsQuarantine()
+        let marker = try XCTUnwrap(loadedMarker)
+        XCTAssertEqual(marker.preservedCorruptRelativePath, "Corrupt/\(preserved.lastPathComponent)")
+        XCTAssertFalse(marker.reason.isEmpty)
+        let markerPermissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("records-quarantine.json").path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(markerPermissions.intValue & 0o777, 0o600)
+
+        let secondStore = LibraryStore(rootURL: root)
+        let secondLoad = try await secondStore.loadRecordsRecoveringCorruption()
+        XCTAssertEqual(secondLoad.preservedCorruptURL, preserved)
+        try await secondStore.save([WorkspaceRecord(kind: .memo, title: "Later", text: "Saved")])
+        try await secondStore.reconcileAudioStorage()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path))
+
+        let input = root.appendingPathComponent("input.wav")
+        try syntheticSilentWAV().write(to: input)
+        let recovery = try await secondStore.beginRecoveryCapture(kind: .memo)
+        _ = try await secondStore.addRecoveryTrack(captureID: recovery.id, kind: .memo, role: .microphone, sourceURL: input)
+        _ = try await secondStore.commitRecoveredRecord(
+            WorkspaceRecord(kind: .memo, title: "Recovered", text: "Retained"),
+            recoveryID: recovery.id,
+            trackSelection: .allValid,
+            keepAudio: true
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path))
+
+        try await secondStore.resetRecordsQuarantine()
+        let resetMarker = try await secondStore.recordsQuarantine()
+        XCTAssertNil(resetMarker)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphanAudio.path), "reset action must not delete audio")
+    }
+
+    func testPostReplacementFailureKeepsInstalledRecordAndReferencedAudio() async throws {
+        let root = temporaryLibraryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seedStore = LibraryStore(rootURL: root)
+        let capture = try await recoveryCapture(
+            in: seedStore,
+            root: root,
+            kind: .meeting,
+            microphoneData: syntheticSilentWAV(),
+            systemData: syntheticSilentWAV()
+        )
+        let recoveryOriginals = try await resolvedURLs(capture.tracks, in: seedStore)
+        let store = LibraryStore(rootURL: root, failNextWritesAt: [.recordMetadataAfterReplacement])
+        let proposed = WorkspaceRecord(kind: .meeting, title: "Installed", text: "Durability uncertain")
 
         await XCTAssertThrowsErrorAsync {
-            _ = try await store.loadRecordsRecoveringCorruption()
+            _ = try await store.commitRecoveredRecord(
+                proposed,
+                recoveryID: capture.id,
+                trackSelection: .allValid,
+                keepAudio: true
+            )
         } verify: { error in
-            guard case LibraryStoreError.unsupportedSchema(found: 999, supported: LibraryStore.currentSchemaVersion) = error else {
+            guard case LibraryStoreError.metadataInstalledButDurabilityUncertain = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
         }
 
-        XCTAssertEqual(try Data(contentsOf: source), future)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Corrupt").path))
+        let installedRecord = try await store.record(id: proposed.id)
+        let installed = try XCTUnwrap(installedRecord)
+        XCTAssertEqual(installed.title, proposed.title)
+        XCTAssertEqual(installed.audioTracks.count, 2)
+        for url in try await resolvedURLs(installed.audioTracks, in: store) {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        }
+        XCTAssertTrue(recoveryOriginals.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testRetainedAudioDirectorySyncFailureRollsBackBeforeMetadataReplacement() async throws {
+        let root = temporaryLibraryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let seedStore = LibraryStore(rootURL: root)
+        let capture = try await recoveryCapture(
+            in: seedStore,
+            root: root,
+            kind: .memo,
+            microphoneData: syntheticSilentWAV(),
+            systemData: nil
+        )
+        let originals = try await resolvedURLs(capture.tracks, in: seedStore)
+        let store = LibraryStore(rootURL: root, failNextWritesAt: [.recordAudioDirectorySync])
+        let proposed = WorkspaceRecord(kind: .memo, title: "Not installed", text: "Rollback")
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.commitRecoveredRecord(proposed, recoveryID: capture.id, keepAudio: true)
+        }
+
+        let persisted = try await store.record(id: proposed.id)
+        XCTAssertNil(persisted)
+        XCTAssertTrue(originals.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+        let ownedDirectory = root.appendingPathComponent("Audio/Records/\(proposed.id.uuidString)")
+        let files = (try? FileManager.default.contentsOfDirectory(at: ownedDirectory, includingPropertiesForKeys: nil)) ?? []
+        XCTAssertTrue(files.isEmpty)
     }
 
     func testRetentionPurgeRemovesExpiredMetadataAndRetainedAudio() async throws {

@@ -166,6 +166,28 @@ public struct RecoveredLibraryLoad<Value: Sendable>: Sendable {
     }
 }
 
+/// Durable evidence that unreadable record metadata was preserved. While this
+/// marker exists, record-audio cleanup is disabled until the user explicitly
+/// resets metadata protection.
+public struct RecordsQuarantineMarker: Codable, Equatable, Sendable {
+    public let markerVersion: Int
+    public let preservedCorruptRelativePath: String
+    public let reason: String
+    public let createdAt: Date
+
+    public init(
+        markerVersion: Int = 1,
+        preservedCorruptRelativePath: String,
+        reason: String,
+        createdAt: Date = .now
+    ) {
+        self.markerVersion = markerVersion
+        self.preservedCorruptRelativePath = preservedCorruptRelativePath
+        self.reason = reason
+        self.createdAt = createdAt
+    }
+}
+
 public enum WebhookDeliveryState: String, Codable, Sendable {
     case pending
     case delivered
