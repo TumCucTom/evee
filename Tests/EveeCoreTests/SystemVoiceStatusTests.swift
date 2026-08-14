@@ -129,7 +129,7 @@ final class SystemVoiceStatusTests: XCTestCase {
         let statuses = [
             SystemVoiceStatus.make(capture: .failed(privateDetail), hotMic: .disabled, warnings: []),
             SystemVoiceStatus.make(capture: .checkpointed(privateDetail), hotMic: .disabled, warnings: []),
-            SystemVoiceStatus.make(capture: .idle, hotMic: .failed(privateDetail), warnings: []),
+            SystemVoiceStatus.make(capture: .idle, hotMic: .failed(message: privateDetail), warnings: []),
             SystemVoiceStatus.make(
                 capture: .recording(startedAt: .now, level: 0),
                 hotMic: .disabled,
