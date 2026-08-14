@@ -335,24 +335,26 @@ public actor LibraryStore {
         return try clearMeetingDraft(matching: recoveryID)
     }
 
-    public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
+    public func searchResults(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceSearchResult] {
         let records = try loadRecords()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedLimit = max(1, min(limit, 500))
         if !needle.isEmpty {
-            let ids: [UUID]
+            let hits: [WorkspaceSearchHit]
             do {
                 let index = try workspaceSearchIndex()
                 if try !index.isCurrent(records: records) { try index.rebuild(records: records) }
-                ids = try index.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+                hits = try index.matchingHits(query: needle, kind: kind, limit: boundedLimit)
             } catch {
                 invalidateSearchIndex()
                 let rebuilt = try workspaceSearchIndex()
                 try rebuilt.rebuild(records: records)
-                ids = try rebuilt.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+                hits = try rebuilt.matchingHits(query: needle, kind: kind, limit: boundedLimit)
             }
             let recordsByID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
-            return ids.compactMap { recordsByID[$0] }
+            return hits.compactMap { hit in
+                recordsByID[hit.id].map { WorkspaceSearchResult(record: $0, snippet: hit.snippet) }
+            }
         }
         return records
             .filter { record in
@@ -363,7 +365,11 @@ public actor LibraryStore {
             }
             .sorted { $0.createdAt > $1.createdAt }
             .prefix(boundedLimit)
-            .map { $0 }
+            .map { WorkspaceSearchResult(record: $0, snippet: "") }
+    }
+
+    public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
+        try searchResults(query, kind: kind, limit: limit).map(\.record)
     }
 
     private func workspaceSearchIndex() throws -> WorkspaceSearchIndex {

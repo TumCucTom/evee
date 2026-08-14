@@ -496,16 +496,15 @@ struct RecordDetailView: View {
                 panel.prompt = "Export"
                 guard panel.runModal() == .OK, let destination = panel.url else { return }
 
+                let exportedTrack = audioTrackTitle(track.role).lowercased()
                 try await Task.detached(priority: .utility) {
-                    let manager = FileManager.default
-                    if manager.fileExists(atPath: destination.path) {
-                        try manager.removeItem(at: destination)
-                    }
-                    try manager.copyItem(at: source, to: destination)
+                    try await AtomicFileExporter().export(source: source, to: destination)
                 }.value
-                audioStatusMessage = "Exported \(audioTrackTitle(track.role).lowercased()) audio."
+                audioStatusMessage = "Exported \(exportedTrack) audio."
+                store.accessibilityAnnouncements.post(.audioExported(exportedTrack))
             } catch {
                 audioStatusMessage = "Export failed: \(error.localizedDescription)"
+                store.accessibilityAnnouncements.post(.audioExportFailed(error.localizedDescription))
             }
         }
     }

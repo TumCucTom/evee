@@ -6,6 +6,17 @@ struct RootView: View {
     @State private var showingMetadataResetConfirmation = false
 
     var body: some View {
+        Group {
+            if store.privacyModeEnabled {
+                PrivacyModeView()
+            } else {
+                workspaceContent
+            }
+        }
+        .tint(AnimaTheme.indigo)
+    }
+
+    private var workspaceContent: some View {
         ZStack {
             AnimaTheme.paper.ignoresSafeArea()
 
@@ -60,6 +71,29 @@ struct RootView: View {
                         .accessibilityLabel("Reset library metadata protection")
                         .accessibilityHint("Shows a confirmation before allowing future cleanup of unreferenced audio.")
                     }
+                }
+                .padding(10)
+                .background(AnimaTheme.raisedSurface)
+                .overlay(alignment: .bottom) { Divider() }
+                .accessibilityElement(children: .contain)
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if let suggestion = store.meetingSuggestion {
+                HStack(spacing: 10) {
+                    Image(systemName: "person.2.wave.2")
+                        .foregroundStyle(AnimaTheme.indigo)
+                        .accessibilityHidden(true)
+                    Text("Meeting app detected: \(suggestion.applicationName). Start a meeting recording?")
+                        .font(.callout)
+                    Spacer(minLength: 12)
+                    Button("Dismiss") { store.dismissMeetingSuggestion() }
+                        .accessibilityLabel("Dismiss meeting suggestion for \(suggestion.applicationName)")
+                        .accessibilityHint("Hides suggestions for this application for one hour.")
+                    Button("Start Meeting") { Task { await store.startSuggestedMeeting() } }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityLabel("Start meeting recording for \(suggestion.applicationName)")
+                        .accessibilityHint("Starts recording only after you activate this button.")
                 }
                 .padding(10)
                 .background(AnimaTheme.raisedSurface)

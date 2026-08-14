@@ -96,5 +96,9 @@ final class ContextTransformTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? SelectionTransformError, .unsupportedInstruction)
         }
+        XCTAssertEqual(
+            SelectionTransformPipeline.supportedCommandSummary,
+            "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and exact replacement"
+        )
     }
 }

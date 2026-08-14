@@ -68,6 +68,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     @Published var route: Route = .library
+    @Published var privacyModeEnabled = false
     @Published var records: [WorkspaceRecord] = []
     @Published var settings = EveeSettings()
     @Published var captureState: CaptureState = .idle {
@@ -87,7 +88,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published var meetingTitle = ""
     @Published var meetingNotes = ""
     @Published var webhookSecret = ""
-    @Published private var indexedSearchResults: [WorkspaceRecord]?
+    @Published private var indexedSearchResults: [WorkspaceSearchResult]?
     @Published private(set) var localAPICredentials: LocalAPICredentials?
     @Published private(set) var pendingDelivery: PendingTextDelivery?
     @Published private(set) var recoverableCaptures: [CaptureRecoveryManifest] = []
@@ -121,6 +122,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         captureMicrophone: .closed,
         warnings: []
     )
+    @Published private(set) var meetingSuggestion: MeetingSuggestion?
 
     var modelProgress: ModelProgress? {
         guard case .downloading(_, let progress) = modelDownloadState else { return nil }
@@ -189,6 +191,16 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 ($0.state != .delivered && $0.state != .cancelled) || $0.requiresExplicitReplacement
             }.count
         }
+    }
+
+    private var meetingSuggestionSettings: MeetingSuggestionSettings {
+        MeetingSuggestionSettings(
+            enabled: settings.meetingSuggestionsEnabled,
+            nativeBundleIdentifiers: Set(settings.meetingSuggestionNativeBundleIdentifiers),
+            browserBundleIdentifiers: Set(settings.meetingSuggestionBrowserBundleIdentifiers),
+            browserTitleTerms: settings.meetingSuggestionBrowserTitleTerms,
+            dismissedUntilByBundleIdentifier: settings.meetingSuggestionDismissedUntilByBundleIdentifier
+        )
     }
 
     let recorder = MicrophoneRecorder()
@@ -489,7 +501,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         guard !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return records.filter(kindMatches)
         }
-        return (indexedSearchResults ?? []).filter(kindMatches)
+        return (indexedSearchResults ?? []).map(\.record).filter(kindMatches)
+    }
+
+    func indexedSnippet(for recordID: UUID) -> String? {
+        indexedSearchResults?.first { $0.record.id == recordID }?.snippet
     }
 
     private func refreshIndexedSearch(query: String, route: Route) async {
@@ -504,7 +520,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         default: nil
         }
         do {
-            let result = try await library.search(trimmed, kind: kind, limit: 200)
+            let result = try await library.searchResults(trimmed, kind: kind, limit: 200)
             guard search.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed, self.route == route else { return }
             indexedSearchResults = result
         } catch {
@@ -675,7 +691,35 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 localAPICredentials = nil
             }
             await updateHotMicState()
+            MeetingSuggestionRuntime.shared.settingsChanged()
         } catch { statusMessage = error.localizedDescription }
+    }
+
+    func observeMeetingApplication(_ snapshot: MeetingApplicationSnapshot?) {
+        guard let snapshot else {
+            meetingSuggestion = nil
+            return
+        }
+        meetingSuggestion = MeetingSuggestionPolicy(settings: meetingSuggestionSettings).evaluate(snapshot)
+    }
+
+    func dismissMeetingSuggestion(cooldown: TimeInterval = 60 * 60) {
+        guard let suggestion = meetingSuggestion else { return }
+        settings.meetingSuggestionDismissedUntilByBundleIdentifier[suggestion.bundleIdentifier] = .now.addingTimeInterval(cooldown)
+        meetingSuggestion = nil
+        Task {
+            do {
+                try await library.save(settings)
+            } catch {
+                statusMessage = "The meeting suggestion was dismissed for this session, but its cooldown could not be saved: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func startSuggestedMeeting() async {
+        guard meetingSuggestion != nil else { return }
+        meetingSuggestion = nil
+        await beginMeeting()
     }
 
     func rotateLocalAPIToken() {

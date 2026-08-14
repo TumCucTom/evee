@@ -28,22 +28,35 @@ struct EveeApp: App {
             RootView()
                 .environmentObject(store)
                 .frame(minWidth: 920, minHeight: 620)
+                .background(WindowSharingProtectionInstaller())
                 .background(CaptureOverlayInstaller().environmentObject(store))
                 .onAppear { applicationDelegate.install(checkpoint: store) }
                 .task {
                     WorkspaceIntelligenceRuntime.shared.start()
                     await store.bootstrap()
+                    MeetingSuggestionRuntime.shared.start(store: store)
                 }
         }
         .windowStyle(.hiddenTitleBar)
 
         MenuBarExtra("Evee", systemImage: menuIcon) {
-            MenuBarView().environmentObject(store)
+            MenuBarView()
+                .environmentObject(store)
+                .background(WindowSharingProtectionInstaller())
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView().environmentObject(store).frame(width: 680, height: 560)
+            Group {
+                if store.privacyModeEnabled {
+                    PrivacyModeView()
+                } else {
+                    SettingsView()
+                }
+            }
+            .environmentObject(store)
+            .frame(width: 680, height: 560)
+            .background(WindowSharingProtectionInstaller())
         }
     }
 

@@ -16,6 +16,14 @@ struct MenuBarView: View {
                     .foregroundStyle(statusColour)
             }
             Divider()
+            Toggle("Privacy mode", isOn: $store.privacyModeEnabled)
+                .accessibilityLabel(
+                    PrivacyPresentation(enabled: store.privacyModeEnabled).accessibilityLabel
+                )
+                .accessibilityHint("Hides sensitive content in Evee windows for this session.")
+            Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             ForEach(Array(store.systemVoiceStatus.warnings.enumerated()), id: \.offset) { _, warning in
                 Label(warning.message, systemImage: "exclamationmark.triangle.fill")

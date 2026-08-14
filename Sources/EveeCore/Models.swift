@@ -443,6 +443,16 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
+public struct WorkspaceSearchResult: Sendable {
+    public let record: WorkspaceRecord
+    public let snippet: String
+
+    public init(record: WorkspaceRecord, snippet: String) {
+        self.record = record
+        self.snippet = snippet
+    }
+}
+
 public struct DictionaryTerm: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
     public var spoken: String
@@ -600,6 +610,11 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var historyRetentionDays = 0
     public var dictionary: [DictionaryTerm] = []
     public var appStyles: [AppWritingStyle] = []
+    public var meetingSuggestionsEnabled = false
+    public var meetingSuggestionNativeBundleIdentifiers: [String] = []
+    public var meetingSuggestionBrowserBundleIdentifiers: [String] = []
+    public var meetingSuggestionBrowserTitleTerms: [String] = []
+    public var meetingSuggestionDismissedUntilByBundleIdentifier: [String: Date] = [:]
 
     public init() {}
 
@@ -608,6 +623,8 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         case localAPIEnabled, mcpEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
         case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled, hotMicEnabled, wakePhrase
         case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks, historyRetentionDays
+        case meetingSuggestionsEnabled, meetingSuggestionNativeBundleIdentifiers, meetingSuggestionBrowserBundleIdentifiers
+        case meetingSuggestionBrowserTitleTerms, meetingSuggestionDismissedUntilByBundleIdentifier
     }
 
     public init(from decoder: Decoder) throws {
@@ -642,6 +659,11 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         historyRetentionDays = try values.decodeIfPresent(Int.self, forKey: .historyRetentionDays) ?? 0
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
+        meetingSuggestionsEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingSuggestionsEnabled) ?? false
+        meetingSuggestionNativeBundleIdentifiers = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionNativeBundleIdentifiers) ?? []
+        meetingSuggestionBrowserBundleIdentifiers = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionBrowserBundleIdentifiers) ?? []
+        meetingSuggestionBrowserTitleTerms = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionBrowserTitleTerms) ?? []
+        meetingSuggestionDismissedUntilByBundleIdentifier = try values.decodeIfPresent([String: Date].self, forKey: .meetingSuggestionDismissedUntilByBundleIdentifier) ?? [:]
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -675,6 +697,11 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(historyRetentionDays, forKey: .historyRetentionDays)
         try values.encode(dictionary, forKey: .dictionary)
         try values.encode(appStyles, forKey: .appStyles)
+        try values.encode(meetingSuggestionsEnabled, forKey: .meetingSuggestionsEnabled)
+        try values.encode(meetingSuggestionNativeBundleIdentifiers, forKey: .meetingSuggestionNativeBundleIdentifiers)
+        try values.encode(meetingSuggestionBrowserBundleIdentifiers, forKey: .meetingSuggestionBrowserBundleIdentifiers)
+        try values.encode(meetingSuggestionBrowserTitleTerms, forKey: .meetingSuggestionBrowserTitleTerms)
+        try values.encode(meetingSuggestionDismissedUntilByBundleIdentifier, forKey: .meetingSuggestionDismissedUntilByBundleIdentifier)
         // webhookSecret is deliberately omitted. It exists in CodingKeys only so
         // a one-time migration can read settings produced by older versions.
     }

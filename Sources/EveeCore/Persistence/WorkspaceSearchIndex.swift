@@ -16,16 +16,30 @@ enum WorkspaceSearchIndexError: LocalizedError {
     }
 }
 
+public struct WorkspaceSearchHit: Equatable, Sendable {
+    public let id: UUID
+    public let snippet: String
+
+    public init(id: UUID, snippet: String) {
+        self.id = id
+        self.snippet = snippet
+    }
+}
+
 /// A rebuildable FTS5 projection of the canonical JSON record store. The index
 /// contains no secrets or audio and can be deleted at any time; `LibraryStore`
 /// will recreate it from durable records on the next successful load.
 final class WorkspaceSearchIndex {
+    typealias SQLiteStep = (OpaquePointer?) -> Int32
+
     private var database: OpaquePointer?
     private let url: URL
+    private let sqliteStep: SQLiteStep
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    init(url: URL) throws {
+    init(url: URL, sqliteStep: @escaping SQLiteStep = sqlite3_step) throws {
         self.url = url
+        self.sqliteStep = sqliteStep
         let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(url.path, &database, flags, nil) == SQLITE_OK else {
             let message = database.map { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
@@ -38,7 +52,7 @@ final class WorkspaceSearchIndex {
             try execute("PRAGMA synchronous=FULL;")
             try execute("PRAGMA foreign_keys=ON;")
             try execute("CREATE TABLE IF NOT EXISTS workspace_index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
-            try execute("CREATE VIRTUAL TABLE IF NOT EXISTS workspace_fts USING fts5(id UNINDEXED, kind UNINDEXED, created_at UNINDEXED, title, body, notes, tags, source_application, tokenize='unicode61 remove_diacritics 2');")
+            try prepareSchema()
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         } catch {
             sqlite3_close(database)
@@ -66,11 +80,22 @@ final class WorkspaceSearchIndex {
     func isCurrent(records: [WorkspaceRecord]) throws -> Bool {
         guard let statement = try prepare("SELECT value FROM workspace_index_meta WHERE key = 'fingerprint' LIMIT 1;") else { return false }
         defer { sqlite3_finalize(statement) }
-        guard sqlite3_step(statement) == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else { return false }
-        return String(cString: value) == fingerprint(records)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            guard let value = sqlite3_column_text(statement, 0) else { return false }
+            return String(cString: value) == fingerprint(records)
+        case SQLITE_DONE:
+            return false
+        default:
+            throw lastError()
+        }
     }
 
     func matchingIDs(query: String, kind: WorkspaceRecordKind?, limit: Int) throws -> [UUID] {
+        try matchingHits(query: query, kind: kind, limit: limit).map(\.id)
+    }
+
+    func matchingHits(query: String, kind: WorkspaceRecordKind?, limit: Int) throws -> [WorkspaceSearchHit] {
         let terms = query
             .split(whereSeparator: { $0.isWhitespace })
             .map { "\"" + $0.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
@@ -79,9 +104,9 @@ final class WorkspaceSearchIndex {
 
         let sql: String
         if kind == nil {
-            sql = "SELECT id FROM workspace_fts WHERE workspace_fts MATCH ? ORDER BY bm25(workspace_fts, 0, 0, 0, 10, 1, 0.8, 0.6, 0.5), CAST(created_at AS REAL) DESC LIMIT ?;"
+            sql = "SELECT id, snippet(workspace_fts, -1, '', '', '…', 24) FROM workspace_fts WHERE workspace_fts MATCH ? ORDER BY bm25(workspace_fts, 0, 0, 0, 10, 3, 2, 2, 2, 2, 1, 2, 2), CAST(created_at AS REAL) DESC LIMIT ?;"
         } else {
-            sql = "SELECT id FROM workspace_fts WHERE workspace_fts MATCH ? AND kind = ? ORDER BY bm25(workspace_fts, 0, 0, 0, 10, 1, 0.8, 0.6, 0.5), CAST(created_at AS REAL) DESC LIMIT ?;"
+            sql = "SELECT id, snippet(workspace_fts, -1, '', '', '…', 24) FROM workspace_fts WHERE workspace_fts MATCH ? AND kind = ? ORDER BY bm25(workspace_fts, 0, 0, 0, 10, 3, 2, 2, 2, 2, 1, 2, 2), CAST(created_at AS REAL) DESC LIMIT ?;"
         }
         guard let statement = try prepare(sql) else { return [] }
         defer { sqlite3_finalize(statement) }
@@ -93,17 +118,25 @@ final class WorkspaceSearchIndex {
             sqlite3_bind_int(statement, 2, Int32(limit))
         }
 
-        var result: [UUID] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if let value = sqlite3_column_text(statement, 0), let id = UUID(uuidString: String(cString: value)) {
-                result.append(id)
+        var result: [WorkspaceSearchHit] = []
+        while true {
+            switch sqliteStep(statement) {
+            case SQLITE_ROW:
+                if let value = sqlite3_column_text(statement, 0),
+                   let id = UUID(uuidString: String(cString: value)) {
+                    let snippet = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
+                    result.append(WorkspaceSearchHit(id: id, snippet: snippet))
+                }
+            case SQLITE_DONE:
+                return result
+            default:
+                throw lastError()
             }
         }
-        return result
     }
 
     private func insert(_ record: WorkspaceRecord) throws {
-        let sql = "INSERT INTO workspace_fts(id, kind, created_at, title, body, notes, tags, source_application) VALUES (?, ?, ?, ?, ?, ?, ?, ?);"
+        let sql = "INSERT INTO workspace_fts(id, kind, created_at, title, finished_text, raw_text, notes, tags, source_application, context, segments, insights) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
         guard let statement = try prepare(sql) else { return }
         defer { sqlite3_finalize(statement) }
         let values = [
@@ -112,14 +145,67 @@ final class WorkspaceSearchIndex {
             String(record.createdAt.timeIntervalSince1970),
             record.title,
             record.text,
+            record.rawText ?? "",
             record.notes,
             record.tags.joined(separator: " "),
             record.sourceApplication ?? "",
+            contextText(record.context),
+            record.segments.flatMap { [$0.speaker, $0.text].compactMap { $0 } }.joined(separator: " "),
+            insightText(record),
         ]
         for (offset, value) in values.enumerated() {
             sqlite3_bind_text(statement, Int32(offset + 1), value, -1, transient)
         }
         guard sqlite3_step(statement) == SQLITE_DONE else { throw lastError() }
+    }
+
+    private func prepareSchema() throws {
+        let schemaVersion = try metadataValue(key: "schema_version")
+        if schemaVersion != "2" {
+            try execute("DROP TABLE IF EXISTS workspace_fts;")
+            try execute("DELETE FROM workspace_index_meta WHERE key IN ('record_count', 'fingerprint');")
+        }
+        try execute("CREATE VIRTUAL TABLE IF NOT EXISTS workspace_fts USING fts5(id UNINDEXED, kind UNINDEXED, created_at UNINDEXED, title, finished_text, raw_text, notes, tags, source_application, context, segments, insights, tokenize='unicode61 remove_diacritics 2');")
+        try setMetadata(key: "schema_version", value: "2")
+    }
+
+    private func metadataValue(key: String) throws -> String? {
+        guard let statement = try prepare("SELECT value FROM workspace_index_meta WHERE key = ? LIMIT 1;") else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, transient)
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return sqlite3_column_text(statement, 0).map { String(cString: $0) }
+        case SQLITE_DONE:
+            return nil
+        default:
+            throw lastError()
+        }
+    }
+
+    private func contextText(_ context: WorkspaceContext?) -> String {
+        guard let context else { return "" }
+        return [
+            context.bundleIdentifier, context.applicationName, context.windowTitle,
+            context.document, context.focusedRole, context.selectedText, context.url,
+            context.codeFile, context.recipient, context.visibleText,
+        ].compactMap { $0 }.joined(separator: " ")
+    }
+
+    private func insightText(_ record: WorkspaceRecord) -> String {
+        var values: [String] = []
+        if let meeting = record.meetingIntelligence {
+            values += meeting.summary
+            values += meeting.decisions.flatMap { [$0.text, $0.assignee, $0.dueText].compactMap { $0 } }
+            values += meeting.actionItems.flatMap { [$0.text, $0.assignee, $0.dueText].compactMap { $0 } }
+            values += (meeting.topics ?? []).map(\.title)
+        }
+        if let memo = record.memoIntelligence {
+            values += [memo.title]
+            values += memo.highlights
+            values += memo.actionItems
+        }
+        return values.joined(separator: " ")
     }
 
     private func setMetadata(key: String, value: String) throws {

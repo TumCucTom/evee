@@ -19,6 +19,8 @@ public enum AccessibilityStatusEvent: Equatable, Sendable {
     case modelReady
     case webhookRevoked
     case helperRevoked
+    case audioExported(String)
+    case audioExportFailed(String)
 }
 
 public struct AccessibilityAnnouncementReducer: Sendable {
@@ -91,6 +93,10 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Meeting webhook access revoked."
         case .helperRevoked:
             return "Local helper access revoked."
+        case .audioExported(let track):
+            return "Exported \(track) audio."
+        case .audioExportFailed(let message):
+            return "Audio export failed. \(message)"
         case .modelDownloadProgress:
             return nil
         }

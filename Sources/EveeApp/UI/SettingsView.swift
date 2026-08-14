@@ -64,7 +64,7 @@ struct SettingsView: View {
                 Text(store.settings.textDeliveryMode.detail)
                     .font(.caption)
                     .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? .orange : .secondary)
-                Text("Selection transform is local and deterministic in this build: concise, clean up, case changes, lists, and ‘replace … with …’. Unsupported generative rewrites leave the selection unchanged.")
+                Text("Selection transform is local and deterministic. Supported commands: \(SelectionTransformPipeline.supportedCommandSummary). Unsupported rewrites leave the selection unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("Microphone", selection: $store.settings.inputDeviceUID) {
@@ -331,6 +331,13 @@ struct SettingsView: View {
 
             Section("Application") {
                 LaunchAtLogin.Toggle()
+                Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)
+                    .accessibilityLabel(
+                        PrivacyPresentation(enabled: store.privacyModeEnabled).accessibilityLabel
+                    )
+                Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
                 Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
                     .disabled(store.settings.model != .parakeet)
@@ -354,6 +361,16 @@ struct SettingsView: View {
                         .accessibilityLabel("Export private Evee diagnostics")
                         .accessibilityHint("Creates a local diagnostic export without workspace content or secrets.")
                 }
+            }
+
+            Section("Meeting suggestions") {
+                Toggle("Suggest meeting recording", isOn: $store.settings.meetingSuggestionsEnabled)
+                Text("Off by default. Evee only suggests; it never starts recording automatically. Native apps are matched by bundle identifier. Browsers also require an allowed title term and Evee’s existing Accessibility permission. Page content is never read.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Native bundle identifiers, comma-separated", text: nativeMeetingApps)
+                TextField("Browser bundle identifiers, comma-separated", text: browserMeetingApps)
+                TextField("Browser title terms, comma-separated", text: browserMeetingTitleTerms)
             }
 
             HStack {
@@ -425,6 +442,30 @@ struct SettingsView: View {
     private var isModelCancellationPending: Bool {
         if case .cancelling = store.modelDownloadState { return true }
         return false
+    }
+
+    private var nativeMeetingApps: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionNativeBundleIdentifiers)
+    }
+
+    private var browserMeetingApps: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionBrowserBundleIdentifiers)
+    }
+
+    private var browserMeetingTitleTerms: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionBrowserTitleTerms)
+    }
+
+    private func commaSeparatedBinding(_ keyPath: WritableKeyPath<EveeSettings, [String]>) -> Binding<String> {
+        Binding(
+            get: { store.settings[keyPath: keyPath].joined(separator: ", ") },
+            set: { value in
+                store.settings[keyPath: keyPath] = value
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+        )
     }
 
     @ViewBuilder

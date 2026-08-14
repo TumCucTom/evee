@@ -29,6 +29,34 @@ private enum SyntheticModelReadinessError: Error {
     case invalidCache
 }
 
+private enum SyntheticExportFailure: Error {
+    case verification
+}
+
+private struct SyntheticFailingExportOperations: FileExportOperations {
+    func copy(_ source: URL, _ destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+
+    func verifySameBytes(_ source: URL, _ destination: URL) throws {
+        throw SyntheticExportFailure.verification
+    }
+
+    func replaceAtomically(_ destination: URL, with replacement: URL) throws {
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: replacement)
+        } else {
+            try FileManager.default.moveItem(at: replacement, to: destination)
+        }
+    }
+
+    func removeIfPresent(_ url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+}
+
 private actor SyntheticRepairableModelProvider: LocalModelDownloading {
     nonisolated var isDownloaded: Bool { true }
     private var repaired = false
@@ -4076,6 +4104,141 @@ private func checkSystemVoiceStatus() throws {
     print("system-voice-status: passed")
 }
 
+private func checkPrivacyPresentation() throws {
+    let protected = PrivacyPresentation(enabled: true)
+    try require(!protected.constructsWorkspaceContent, "privacy mode constructed workspace content")
+    try require(!protected.constructsSettingsContent, "privacy mode constructed settings content")
+    try require(protected.constructsMenuContent, "privacy mode removed its menu escape hatch")
+    try require(
+        protected.accessibilityLabel == "Privacy mode is on. Sensitive Evee content is hidden.",
+        "privacy mode accessibility state was inaccurate"
+    )
+    try require(protected.windowProtectionCopy.contains("best-effort"), "window protection copy overstated its guarantee")
+
+    let ordinary = PrivacyPresentation(enabled: false)
+    try require(ordinary.constructsWorkspaceContent, "ordinary mode hid workspace content")
+    try require(ordinary.constructsSettingsContent, "ordinary mode hid settings content")
+    try require(ordinary.constructsMenuContent, "ordinary mode hid menu content")
+
+    print("privacy-presentation: passed")
+}
+
+private func checkSearchProjection() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("evee-search-projection-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = LibraryStore(rootURL: root)
+    let record = WorkspaceRecord(
+        kind: .meeting,
+        title: "Search projection",
+        text: "ordinary finished text",
+        rawText: "RetainedQuasar",
+        segments: [.init(start: 0, end: 1, speaker: "Facilitator", text: "SegmentNebula")],
+        context: .init(windowTitle: "Project Atlas")
+    )
+    try await store.upsert(record)
+
+    for term in ["RetainedQuasar", "Facilitator", "SegmentNebula", "Project Atlas"] {
+        let results = try await store.searchResults(term, kind: .meeting)
+        try require(results.first?.record.id == record.id, "search projection omitted \(term)")
+        try require(results.first?.snippet.localizedCaseInsensitiveContains(term) == true, "search snippet omitted \(term)")
+    }
+
+    let recoveryRoot = FileManager.default.temporaryDirectory.appendingPathComponent("evee-search-recovery-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: recoveryRoot) }
+    let durable = WorkspaceRecord(kind: .memo, title: "Durable", text: "RecoverableNebula")
+    do {
+        let initialStore = LibraryStore(rootURL: recoveryRoot)
+        try await initialStore.upsert(durable)
+        _ = try await initialStore.searchResults("RecoverableNebula")
+    }
+    let indexURL = recoveryRoot.appendingPathComponent("workspace-index.sqlite3")
+    try Data("not a sqlite database".utf8).write(to: indexURL, options: .atomic)
+    for suffix in ["-wal", "-shm"] {
+        try? FileManager.default.removeItem(atPath: indexURL.path + suffix)
+    }
+    let recovered = try await LibraryStore(rootURL: recoveryRoot).searchResults("RecoverableNebula")
+    try require(recovered.first?.record.id == durable.id, "SQLite failure did not rebuild search from canonical records")
+
+    print("search-projection: passed")
+}
+
+private func checkAtomicExport() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("evee-atomic-export-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let source = root.appendingPathComponent("source.m4a")
+    let destination = root.appendingPathComponent("destination.m4a")
+    let bytes = Data((0..<8192).map { UInt8($0 % 251) })
+    try bytes.write(to: source)
+    try Data("existing destination".utf8).write(to: destination)
+
+    try await AtomicFileExporter().export(source: source, to: destination)
+
+    let exportedBytes = try Data(contentsOf: destination)
+    try require(exportedBytes == bytes, "atomic export did not install identical source bytes")
+    let leftovers = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        .filter { $0.lastPathComponent.hasPrefix(".evee-export-") }
+    try require(leftovers.isEmpty, "atomic export left a sibling staging file")
+
+    try Data("existing destination".utf8).write(to: destination, options: .atomic)
+    do {
+        try await AtomicFileExporter(operations: SyntheticFailingExportOperations()).export(source: source, to: destination)
+        throw CoreCheckError.assertionFailed("injected export verification failure was accepted")
+    } catch SyntheticExportFailure.verification {}
+    let preservedBytes = try Data(contentsOf: destination)
+    try require(preservedBytes == Data("existing destination".utf8), "failed export destroyed the existing destination")
+    let failureLeftovers = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        .filter { $0.lastPathComponent.hasPrefix(".evee-export-") }
+    try require(failureLeftovers.isEmpty, "failed export left a sibling staging file")
+    print("atomic-export: passed")
+}
+
+private func checkMeetingSuggestion() throws {
+    let now = Date(timeIntervalSince1970: 10_000)
+    let native = MeetingApplicationSnapshot(
+        bundleIdentifier: "test.meeting",
+        applicationName: "Synthetic Meeting App",
+        isBrowser: false,
+        permittedWindowTitle: nil,
+        observedAt: now
+    )
+    try require(!EveeSettings().meetingSuggestionsEnabled, "meeting suggestions were not off by default")
+    try require(MeetingSuggestionPolicy(settings: .suggestionsDisabled).evaluate(native) == nil, "disabled suggestions observed a meeting")
+
+    let nativeSettings = MeetingSuggestionSettings(
+        enabled: true,
+        nativeBundleIdentifiers: ["test.meeting"],
+        browserBundleIdentifiers: [],
+        browserTitleTerms: [],
+        dismissedUntilByBundleIdentifier: [:]
+    )
+    try require(MeetingSuggestionPolicy(settings: nativeSettings).evaluate(native)?.applicationName == "Synthetic Meeting App", "native allowlist did not suggest a meeting")
+
+    let browserSettings = MeetingSuggestionSettings(
+        enabled: true,
+        nativeBundleIdentifiers: [],
+        browserBundleIdentifiers: ["test.browser"],
+        browserTitleTerms: ["meeting"],
+        dismissedUntilByBundleIdentifier: ["test.browser": now.addingTimeInterval(60)]
+    )
+    let browserWithoutPermission = MeetingApplicationSnapshot(bundleIdentifier: "test.browser", applicationName: "Browser", isBrowser: true, permittedWindowTitle: nil, observedAt: now)
+    try require(MeetingSuggestionPolicy(settings: browserSettings).evaluate(browserWithoutPermission) == nil, "browser suggestion read an unpermitted title")
+    let dismissed = MeetingApplicationSnapshot(bundleIdentifier: "test.browser", applicationName: "Browser", isBrowser: true, permittedWindowTitle: "Project meeting", observedAt: now)
+    try require(MeetingSuggestionPolicy(settings: browserSettings).evaluate(dismissed) == nil, "dismissal cooldown was ignored")
+    let expired = MeetingApplicationSnapshot(bundleIdentifier: "test.browser", applicationName: "Browser", isBrowser: true, permittedWindowTitle: "Project meeting", observedAt: now.addingTimeInterval(61))
+    try require(MeetingSuggestionPolicy(settings: browserSettings).evaluate(expired) != nil, "expired cooldown suppressed a permitted browser suggestion")
+
+    do {
+        _ = try SelectionTransformPipeline().transform(selectedText: "Original", instruction: "Rewrite this persuasively")
+        throw CoreCheckError.assertionFailed("unrestricted transform was accepted")
+    } catch SelectionTransformError.unsupportedInstruction {}
+    try require(
+        SelectionTransformPipeline.supportedCommandSummary == "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and exact replacement",
+        "transform scope copy drifted from supported deterministic commands"
+    )
+    print("meeting-suggestion: passed")
+}
+
 let arguments = CommandLine.arguments.dropFirst()
 if arguments == ["--filter", "accessibility-events"] {
     try checkAccessibilityEvents()
@@ -4147,7 +4310,15 @@ if arguments == ["--filter", "accessibility-events"] {
     try await checkRecoveryTracks()
 } else if arguments == ["--filter", "corrupt-library-recovery"] {
     try await checkCorruptLibraryRecovery()
+} else if arguments == ["--filter", "privacy-presentation"] {
+    try checkPrivacyPresentation()
+} else if arguments == ["--filter", "search-projection"] {
+    try await checkSearchProjection()
+} else if arguments == ["--filter", "atomic-export"] {
+    try await checkAtomicExport()
+} else if arguments == ["--filter", "meeting-suggestion"] {
+    try checkMeetingSuggestion()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion>\n", stderr)
     exit(EXIT_FAILURE)
 }

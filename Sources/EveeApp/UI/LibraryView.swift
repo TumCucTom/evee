@@ -200,22 +200,10 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func recordRow(_ record: WorkspaceRecord) -> some View {
-        RecordRow(record: record, snippet: searchSnippet(record))
+        RecordRow(record: record, snippet: store.indexedSnippet(for: record.id))
             .tag(record.id)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
-    }
-
-    private func searchSnippet(_ record: WorkspaceRecord) -> String? {
-        let query = store.search.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return nil }
-        let source = [record.text, record.notes, record.tags.joined(separator: " ")].joined(separator: "\n")
-        guard let match = source.range(of: query, options: .caseInsensitive) else { return String(source.prefix(180)) }
-        let start = source.index(match.lowerBound, offsetBy: -70, limitedBy: source.startIndex) ?? source.startIndex
-        let end = source.index(match.upperBound, offsetBy: 110, limitedBy: source.endIndex) ?? source.endIndex
-        let prefix = start == source.startIndex ? "" : "…"
-        let suffix = end == source.endIndex ? "" : "…"
-        return prefix + source[start..<end].trimmingCharacters(in: .whitespacesAndNewlines) + suffix
     }
 
     private var isRecordingMemo: Bool {
