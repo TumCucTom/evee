@@ -411,6 +411,42 @@ private func checkOnboardingPresentation() throws {
     print("onboarding-presentation: passed")
 }
 
+private func checkOnboardingActionAccessibility() throws {
+    let states: [(OnboardingModelState, ModelOnboardingAction, String, String)] = [
+        (.idle, .download, "Download local model", "Not downloaded"),
+        (.downloading(fraction: 0.42, status: "Downloading"), .cancel, "Cancel local model download", "42 percent, Downloading"),
+        (.cancelling, .none, "Cancelling local model download", "Cancelling"),
+        (.failed("Interrupted"), .retry, "Retry local model download", "Interrupted"),
+    ]
+
+    for (modelState, expectedAction, expectedLabel, expectedValue) in states {
+        let presentation = OnboardingPresentation(
+            microphone: .granted,
+            accessibility: .granted,
+            model: modelState
+        )
+        try require(presentation.modelAction == expectedAction, "model state exposed the wrong action")
+        try require(presentation.modelAccessibilityLabel == expectedLabel, "model action lacked an accessible name")
+        try require(presentation.modelAccessibilityValue == expectedValue, "model action exposed the wrong accessible value")
+    }
+
+    let viewURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Sources/EveeApp/UI/OnboardingView.swift")
+    let source = try String(contentsOf: viewURL, encoding: .utf8)
+    guard let actionStart = source.range(of: "    private var modelActionButton: some View {")?.lowerBound,
+          let actionEnd = source.range(of: "    private var onboardingModelState: OnboardingModelState {")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("could not inspect the onboarding model action")
+    }
+
+    let actionSource = String(source[actionStart..<actionEnd])
+    guard let visibleLabel = actionSource.range(of: "Text(presentation.modelActionTitle ?? \"Download\")"),
+          let accessibleName = actionSource.range(of: ".accessibilityLabel(presentation.modelAccessibilityLabel)"),
+          visibleLabel.lowerBound < accessibleName.lowerBound else {
+        throw CoreCheckError.assertionFailed("model action button does not apply its accessible name to the visible label")
+    }
+    print("onboarding-action-accessibility: passed")
+}
+
 private func checkAccessibilityCopy() throws {
     let syntheticMeeting = WorkspaceRecord(
         kind: .meeting,
@@ -4339,6 +4375,8 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkActionContrast()
 } else if arguments == ["--filter", "onboarding-presentation"] {
     try checkOnboardingPresentation()
+} else if arguments == ["--filter", "onboarding-action-accessibility"] {
+    try checkOnboardingActionAccessibility()
 } else if arguments == ["--filter", "accessibility-copy"] {
     try checkAccessibilityCopy()
 } else if arguments == ["--filter", "context-policy"] {

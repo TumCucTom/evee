@@ -147,7 +147,7 @@ struct OnboardingView: View {
     }
 
     private var modelActionButton: some View {
-        Button(presentation.modelActionTitle ?? "Download") {
+        Button {
             switch presentation.modelAction {
             case .download, .retry:
                 store.startModelDownload()
@@ -156,6 +156,9 @@ struct OnboardingView: View {
             case .none:
                 break
             }
+        } label: {
+            Text(presentation.modelActionTitle ?? "Download")
+                .accessibilityLabel(presentation.modelAccessibilityLabel)
         }
         .buttonStyle(AlphaButtonStyle())
         .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
