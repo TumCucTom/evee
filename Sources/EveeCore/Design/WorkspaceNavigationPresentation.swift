@@ -1,4 +1,9 @@
 public enum WorkspaceNavigationPresentation {
+    public enum MoveDirection: Equatable, Sendable {
+        case previous
+        case next
+    }
+
     public struct Item: Identifiable, Equatable, Sendable {
         public let route: WorkspaceRouteKind
         public let title: String
@@ -19,7 +24,9 @@ public enum WorkspaceNavigationPresentation {
         public let detail: String
         public let symbolName: String
         public let isMicrophoneOpen: Bool
-        public let hasWarning: Bool
+        public let warningTitle: String?
+
+        public var hasWarning: Bool { warningTitle != nil }
 
         public init(
             phase: SystemVoicePhase,
@@ -27,14 +34,14 @@ public enum WorkspaceNavigationPresentation {
             detail: String,
             symbolName: String,
             isMicrophoneOpen: Bool,
-            hasWarning: Bool
+            warningTitle: String?
         ) {
             self.phase = phase
             self.title = title
             self.detail = detail
             self.symbolName = symbolName
             self.isMicrophoneOpen = isMicrophoneOpen
-            self.hasWarning = hasWarning
+            self.warningTitle = warningTitle
         }
     }
 
@@ -45,6 +52,13 @@ public enum WorkspaceNavigationPresentation {
         Item(route: .dictionary, title: "Dictionary", symbolName: "text.book.closed"),
         Item(route: .settings, title: "Settings", symbolName: "slider.horizontal.3")
     ]
+
+    public static func move(from route: WorkspaceRouteKind, direction: MoveDirection) -> WorkspaceRouteKind {
+        guard let currentIndex = items.firstIndex(where: { $0.route == route }) else { return route }
+        let offset = direction == .previous ? -1 : 1
+        let destinationIndex = min(items.count - 1, max(0, currentIndex + offset))
+        return items[destinationIndex].route
+    }
 
     public static func status(for status: SystemVoiceStatus) -> Status {
         let presentation = switch status.phase {
@@ -76,7 +90,7 @@ public enum WorkspaceNavigationPresentation {
             detail: presentation.2,
             symbolName: presentation.1,
             isMicrophoneOpen: status.isMicrophoneOpen,
-            hasWarning: !status.warnings.isEmpty
+            warningTitle: status.warnings.isEmpty ? nil : "Audio warning"
         )
     }
 }

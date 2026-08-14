@@ -5,6 +5,8 @@ struct EveeSidebar: View {
     @Binding var selection: AppStore.Route
     let status: WorkspaceNavigationPresentation.Status
 
+    @FocusState private var focusedRoute: AppStore.Route?
+
     var body: some View {
         VStack(spacing: 0) {
             brand
@@ -41,7 +43,8 @@ struct EveeSidebar: View {
                 EveeNavigationButton(
                     item: item,
                     route: route(for: item.route),
-                    selection: $selection
+                    selection: $selection,
+                    focusedRoute: $focusedRoute
                 )
                 if item.route == .memos {
                     Divider()
@@ -50,6 +53,7 @@ struct EveeSidebar: View {
                 }
             }
         }
+        .onMoveCommand(perform: moveSelection)
     }
 
     private var statusModule: some View {
@@ -74,6 +78,14 @@ struct EveeSidebar: View {
                 .font(EveeTypography.metadata)
                 .foregroundStyle(EveeVisual.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let warningTitle = status.warningTitle {
+                Label(warningTitle, systemImage: "exclamationmark.triangle.fill")
+                    .font(EveeTypography.metadata.weight(.semibold))
+                    .foregroundStyle(EveeVisual.warning)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(warningTitle)
+            }
 
             if status.phase == .ready {
                 DisclosureGroup("Keyboard shortcuts") {
@@ -115,18 +127,50 @@ struct EveeSidebar: View {
         case .settings: .settings
         }
     }
+
+    private func navigationRoute(for route: AppStore.Route) -> WorkspaceRouteKind {
+        switch route {
+        case .library: .library
+        case .meetings: .meetings
+        case .memos: .memos
+        case .dictionary: .dictionary
+        case .settings: .settings
+        }
+    }
+
+    private func moveSelection(_ direction: MoveCommandDirection) {
+        let moveDirection: WorkspaceNavigationPresentation.MoveDirection?
+        switch direction {
+        case .up:
+            moveDirection = .previous
+        case .down:
+            moveDirection = .next
+        default:
+            moveDirection = nil
+        }
+
+        guard let moveDirection else { return }
+        let destination = WorkspaceNavigationPresentation.move(
+            from: navigationRoute(for: focusedRoute ?? selection),
+            direction: moveDirection
+        )
+        let route = route(for: destination)
+        selection = route
+        focusedRoute = route
+    }
 }
 
 private struct EveeNavigationButton: View {
     let item: WorkspaceNavigationPresentation.Item
     let route: AppStore.Route
     @Binding var selection: AppStore.Route
+    let focusedRoute: FocusState<AppStore.Route?>.Binding
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @FocusState private var isFocused: Bool
     @State private var isHovering = false
 
     private var isSelected: Bool { selection == route }
+    private var isFocused: Bool { focusedRoute.wrappedValue == route }
 
     var body: some View {
         Button {
@@ -154,7 +198,7 @@ private struct EveeNavigationButton: View {
             }
         }
         .buttonStyle(.plain)
-        .focused($isFocused)
+        .focused(focusedRoute, equals: route)
         .onHover { isHovering = $0 }
         .animation(EveeVisual.animation(.selection, reduceMotion: reduceMotion), value: isHovering)
         .animation(EveeVisual.animation(.selection, reduceMotion: reduceMotion), value: isSelected)
