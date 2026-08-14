@@ -17,7 +17,7 @@ struct EveeSidebar: View {
         }
         .padding(.horizontal, EveeSpacing.medium)
         .padding(.bottom, EveeSpacing.medium)
-        .background(EveeVisual.sidebar)
+        .eveeMaterial(.rail)
         .onAppear {
             applyPendingFocusRequest(focusRequest)
         }

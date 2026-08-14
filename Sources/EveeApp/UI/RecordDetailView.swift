@@ -424,6 +424,10 @@ struct RecordDetailView: View {
                     .accessibilityLabel(audioPlayer.isPlaying ? "Pause retained \(selectedAudioTrackName) audio" : "Play retained \(selectedAudioTrackName) audio")
                     .accessibilityHint(audioPlayer.isPlaying ? "Pauses retained audio" : "Plays retained audio")
 
+                    Spacer(minLength: 0)
+                }
+
+                HStack(spacing: 12) {
                     Text(timestamp(audioPlayer.currentTime))
                         .font(.caption.monospacedDigit())
                         .frame(minWidth: 42, alignment: .trailing)

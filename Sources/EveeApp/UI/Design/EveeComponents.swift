@@ -1,43 +1,6 @@
 import EveeCore
 import SwiftUI
 
-struct EveeMark: View {
-    var size: CGFloat = 32
-
-    var body: some View {
-        Canvas { context, canvasSize in
-            let inset = size * 0.2
-            let glyphSize = CGSize(
-                width: max(0, canvasSize.width - inset * 2),
-                height: max(0, canvasSize.height - inset * 2)
-            )
-            let path = VoiceThreadPath.path(
-                samples: VoiceThreadGeometry.points(mode: .listening, level: 0.72),
-                size: glyphSize,
-                lineWidth: 1.8
-            )
-            context.translateBy(x: inset, y: inset)
-            context.stroke(
-                path,
-                with: .linearGradient(
-                    Gradient(colors: EveeVisual.spectralColors),
-                    startPoint: CGPoint(x: 0, y: glyphSize.height / 2),
-                    endPoint: CGPoint(x: glyphSize.width, y: glyphSize.height / 2)
-                ),
-                lineWidth: 1.8
-            )
-        }
-        .frame(width: size, height: size)
-        .background(EveeVisual.surface)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
-                .stroke(EveeVisual.hairline, lineWidth: 1)
-        }
-        .accessibilityHidden(true)
-    }
-}
-
 struct EveePageHeader<Status: View, Actions: View>: View {
     let title: String
     let subtitle: String?
@@ -138,7 +101,7 @@ struct EveeSettingsSection<Content: View>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(EveeSpacing.large)
-        .background(EveeVisual.surface)
+        .eveeMaterial(.panel)
         .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
@@ -160,7 +123,7 @@ struct EveePanel<Content: View>: View {
     var body: some View {
         content
             .padding(EveeSpacing.large)
-            .background(isElevated ? EveeVisual.elevatedSurface : EveeVisual.surface)
+            .eveeMaterial(.panel)
             .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
@@ -211,11 +174,14 @@ struct EveeStatusChip: View {
         Label(label, systemImage: systemImage)
             .font(EveeTypography.metadata)
             .foregroundStyle(tone.color)
+            .lineLimit(1)
+            .truncationMode(.tail)
             .padding(.horizontal, EveeSpacing.small)
             .frame(minHeight: 24)
             .background(tone.color.opacity(0.1), in: Capsule())
             .overlay(Capsule().stroke(tone.color.opacity(0.22), lineWidth: 1))
             .accessibilityElement(children: .combine)
+            .help(label)
     }
 }
 

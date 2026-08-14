@@ -17,25 +17,16 @@ enum EveeColors {
     static let warning = adaptive(.warning)
     static let destructive = adaptive(.destructive)
 
-    static let spectralColors = zip(
-        AccessibleActionPalette.gradientStops(for: .light),
-        AccessibleActionPalette.gradientStops(for: .dark)
-    ).map { light, dark in
-        adaptive(light: nsColor(light), dark: nsColor(dark))
+    static let spectralColors = AccessibleActionPalette.gradientStops(for: .light).indices.map { index in
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let resolved = EveeAppearanceRuntime.resolve(appearance)
+            return nsColor(AccessibleActionPalette.gradientStops(for: resolved)[index])
+        })
     }
 
     private static func adaptive(_ role: EveeColorRole) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
-            let interfaceAppearance: InterfaceAppearance = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? .dark
-                : .light
-            return nsColor(EveeVisualPalette.rgb(role, appearance: interfaceAppearance))
-        })
-    }
-
-    private static func adaptive(light: NSColor, dark: NSColor) -> Color {
-        Color(nsColor: NSColor(name: nil) { appearance in
-            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+            nsColor(EveeVisualPalette.rgb(role, appearance: EveeAppearanceRuntime.resolve(appearance)))
         })
     }
 

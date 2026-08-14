@@ -1,6 +1,33 @@
 import AppKit
 import SwiftUI
 
+/// The presentation mode is intentionally independent from operational settings.
+/// Dynamic colours can be resolved from AppKit as well as SwiftUI, including the
+/// menu window and capture HUD.
+public enum EveeAppearanceRuntime {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var storedMode = EveeAppearanceMode.automatic
+
+    public static var mode: EveeAppearanceMode {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedMode
+    }
+
+    public static func update(_ mode: EveeAppearanceMode) {
+        lock.lock()
+        storedMode = mode
+        lock.unlock()
+    }
+
+    public static func resolve(_ appearance: NSAppearance) -> InterfaceAppearance {
+        let system: InterfaceAppearance = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? .dark
+            : .light
+        return mode.resolve(systemAppearance: system)
+    }
+}
+
 public enum AnimaTheme {
     public static let electric = spectralColor(at: 0)
     public static let indigo = semantic(.accent)
@@ -27,24 +54,23 @@ public enum AnimaTheme {
 
     private static func adaptive(light: NSColor, dark: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
-            let match = appearance.bestMatch(from: [.darkAqua, .aqua])
-            return match == .darkAqua ? dark : light
+            switch EveeAppearanceRuntime.resolve(appearance) {
+            case .dark: dark
+            case .light, .anima: light
+            }
         })
     }
 
     private static func spectralColor(at index: Int) -> Color {
-        adaptive(
-            light: nsColor(AccessibleActionPalette.gradientStops(for: .light)[index]),
-            dark: nsColor(AccessibleActionPalette.gradientStops(for: .dark)[index])
-        )
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let resolved = EveeAppearanceRuntime.resolve(appearance)
+            return nsColor(AccessibleActionPalette.gradientStops(for: resolved)[index])
+        })
     }
 
     private static func semantic(_ role: EveeColorRole) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
-            let interfaceAppearance: InterfaceAppearance = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? .dark
-                : .light
-            return nsColor(EveeVisualPalette.rgb(role, appearance: interfaceAppearance))
+            nsColor(EveeVisualPalette.rgb(role, appearance: EveeAppearanceRuntime.resolve(appearance)))
         })
     }
 
@@ -57,20 +83,30 @@ public enum AnimaTheme {
     }
 }
 
-/// Evee's product glyph. This deliberately uses an SF Symbol rather than
-/// approximating an Anima brand mark that is not bundled with the app.
+private struct EveeMarkShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        Path(EveeMarkGeometry.path(in: rect))
+    }
+}
+
+/// Evee's continuous-line product glyph.
 public struct EveeMark: View {
     public var size: CGFloat
 
     public init(size: CGFloat = 32) { self.size = size }
 
     public var body: some View {
-        Image(systemName: "waveform")
-            .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
-            .foregroundStyle(.white)
+        EveeMarkShape()
+            .stroke(
+                AnimaTheme.indigo,
+                style: StrokeStyle(
+                    lineWidth: max(1.8, size * 0.09),
+                    lineCap: .round,
+                    lineJoin: .round
+                )
+            )
+            .padding(size * 0.08)
             .frame(width: size, height: size)
-            .background(AnimaTheme.alphaGradient)
-            .clipShape(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
             .accessibilityHidden(true)
     }
 }

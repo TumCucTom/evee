@@ -4,6 +4,7 @@ set -euo pipefail
 configuration="${1:-release}"
 version="${EVEE_VERSION:-0.2.0}"
 build_number="${EVEE_BUILD_NUMBER:-2}"
+build_jobs="${SWIFT_BUILD_JOBS:-2}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 cd "$repo_root"
@@ -17,8 +18,8 @@ if [[ ! "$build_number" =~ ^[1-9][0-9]*$ ]]; then
   exit 64
 fi
 
-swift build -c "$configuration"
-bin_dir="$(swift build -c "$configuration" --show-bin-path)"
+swift build -c "$configuration" --jobs "$build_jobs"
+bin_dir="$(swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
 binary_path="$bin_dir/Evee"
 mcp_binary_path="$bin_dir/evee-mcp"
 app_dir="$repo_root/dist/Evee.app"
@@ -35,13 +36,13 @@ install -m 755 "$mcp_binary_path" "$contents/Helpers/evee-mcp"
 
 icon_work="$(mktemp -d)"
 trap 'rm -rf "$icon_work"' EXIT
-swift scripts/generate_app_icon.swift "$icon_work/icon_1024x1024.png"
+swiftc Sources/EveeCore/Design/EveeMarkGeometry.swift scripts/generate_app_icon.swift -o "$icon_work/evee-icon-generator"
 mkdir -p "$icon_work/Evee.iconset"
 for points in 16 32 128 256 512; do
   pixels="$points"
   retina="$((points * 2))"
-  sips -z "$pixels" "$pixels" "$icon_work/icon_1024x1024.png" --out "$icon_work/Evee.iconset/icon_${points}x${points}.png" >/dev/null
-  sips -z "$retina" "$retina" "$icon_work/icon_1024x1024.png" --out "$icon_work/Evee.iconset/icon_${points}x${points}@2x.png" >/dev/null
+  "$icon_work/evee-icon-generator" "$icon_work/Evee.iconset/icon_${points}x${points}.png" "$pixels"
+  "$icon_work/evee-icon-generator" "$icon_work/Evee.iconset/icon_${points}x${points}@2x.png" "$retina"
 done
 iconutil -c icns "$icon_work/Evee.iconset" -o "$contents/Resources/Evee.icns"
 

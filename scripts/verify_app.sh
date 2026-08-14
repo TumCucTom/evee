@@ -70,8 +70,8 @@ HOME="$foundation_home" CFFIXED_USER_HOME="$foundation_home" EVEE_SELF_TEST_RESU
 test "$(cat "$result_path")" = '{"status":"passed"}'
 test ! -e "$foundation_home/Library/Application Support/Evee"
 
-swift build --product evee-verification-fixture >/dev/null
-bin_dir="$(swift build --show-bin-path)"
+swift build --product evee-verification-fixture --jobs "${SWIFT_BUILD_JOBS:-2}" >/dev/null
+bin_dir="$(swift build --jobs "${SWIFT_BUILD_JOBS:-2}" --show-bin-path)"
 fixture_seeder="$bin_dir/evee-verification-fixture"
 test -x "$fixture_seeder"
 "$fixture_seeder" --home "$foundation_home" >>"$captured_stdout" 2>>"$captured_stderr"

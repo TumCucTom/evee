@@ -27,11 +27,6 @@ public struct RGBColor: Equatable, Sendable {
     }
 }
 
-public enum InterfaceAppearance: CaseIterable, Sendable {
-    case light
-    case dark
-}
-
 public enum AccessibleActionPalette {
     private static let lightStops = [
         RGBColor(red: 0.098, green: 0.220, blue: 0.953),
@@ -43,11 +38,17 @@ public enum AccessibleActionPalette {
         RGBColor(red: 0.68, green: 0.48, blue: 1),
         RGBColor(red: 0.86, green: 0.39, blue: 0.96),
     ]
+    private static let animaStops = [
+        RGBColor(red: 0.32, green: 0.25, blue: 0.82),
+        RGBColor(red: 0.46, green: 0.31, blue: 0.88),
+        RGBColor(red: 0.54, green: 0.32, blue: 0.78),
+    ]
 
     public static func gradientStops(for appearance: InterfaceAppearance) -> [RGBColor] {
         switch appearance {
         case .light: lightStops
         case .dark: darkStops
+        case .anima: animaStops
         }
     }
 

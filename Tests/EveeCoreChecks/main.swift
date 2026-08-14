@@ -631,6 +631,10 @@ private func checkFinalVisualReview() throws {
     let menu = try source("Sources/EveeApp/UI/MenuBarView.swift")
     let onboarding = try source("Sources/EveeApp/UI/OnboardingView.swift")
     let sidebar = try source("Sources/EveeApp/UI/Design/EveeSidebar.swift")
+    let theme = try source("Sources/EveeCore/Design/AnimaTheme.swift")
+    let markGeometry = try source("Sources/EveeCore/Design/EveeMarkGeometry.swift")
+    let iconGenerator = try source("scripts/generate_app_icon.swift")
+    let appearanceSource = try source("Sources/EveeApp/UI/Design/EveeAppearance.swift")
 
     try require(
         voiceThread.contains("VoiceThreadSampleVector: VectorArithmetic") &&
@@ -661,7 +665,7 @@ private func checkFinalVisualReview() throws {
     let healthyMeetingSections = String(meeting[recordingStart..<anchorStart])
     try require(!healthyMeetingSections.contains("EveePanel") && healthyMeetingSections.components(separatedBy: "Divider()").count - 1 >= 2, "healthy meeting sections retained card soup")
     try require(!meeting.contains("compactRecordingStatus") && meeting.contains("EveePanel(isElevated: true)"), "meeting capture anchor was duplicated or lost")
-    try require(app.components(separatedBy: "NSHostingView(rootView:").count - 1 == 1 && app.components(separatedBy: "panel.contentView =").count - 1 == 1, "HUD host was recreated")
+    try require(app.components(separatedBy: "NSHostingView(").count - 1 == 1 && app.components(separatedBy: "panel.contentView =").count - 1 == 1, "HUD host was recreated")
     try require(app.contains("CaptureOverlayUpdateDriver(renderer: self)") && app.contains("styleMask: [.borderless, .nonactivatingPanel]") && app.contains("panel.sharingType = .none") && app.contains("override var canBecomeKey: Bool { false }"), "HUD panel ownership or nonactivation regressed")
     guard let applyStart = app.range(of: "func apply(_ presentation:")?.lowerBound,
           let presentStart = app.range(of: "func presentOverlay")?.lowerBound else {
@@ -675,16 +679,20 @@ private func checkFinalVisualReview() throws {
     let dynamicTimerValue = "accessibilityValue(Text(startedAt, style: .timer))"
     try require(meeting.components(separatedBy: dynamicTimerValue).count - 1 == 1 && library.components(separatedBy: dynamicTimerValue).count - 1 == 1, "recording timers did not expose native dynamic accessibility values")
     try require(sidebar.contains(".onChange(of: selection)") && rootView.contains("hasTransferredOnboardingFocus"), "sidebar focus origin or one-time onboarding transfer was missing")
-    guard let markStart = components.range(of: "struct EveeMark")?.lowerBound,
-          let headerStart = components.range(of: "struct EveePageHeader")?.lowerBound else {
-        throw CoreCheckError.assertionFailed("mark component boundaries were missing")
-    }
-    let markSource = String(components[markStart..<headerStart])
     try require(
-        markSource.contains(".linearGradient(") &&
-            markSource.contains(".background(EveeVisual.surface)") &&
-            !markSource.contains(".background(EveeVisual.spectralGradient)"),
-        "brand mark retained a saturated tile instead of a quiet spectral signal"
+        theme.contains("EveeMarkGeometry.path") &&
+            theme.contains("public struct EveeMark") &&
+            !components.contains("struct EveeMark") &&
+            markGeometry.contains("path.addLine") &&
+            markGeometry.components(separatedBy: "path.addCurve").count - 1 == 4,
+        "brand mark was not backed by the single continuous-line geometry"
+    )
+    try require(
+        iconGenerator.contains("EveeMarkGeometry.path") &&
+            !iconGenerator.contains("CGGradient") &&
+            !iconGenerator.contains("drawLinearGradient") &&
+            !iconGenerator.contains("let heights"),
+        "packaged icon retained a generated-gradient or bar identity"
     )
     try require(
         !onboarding.contains("LinearGradient(") &&
@@ -696,6 +704,20 @@ private func checkFinalVisualReview() throws {
         !sidebar.contains("by Anima") &&
             !sidebar.contains(".background(EveeVisual.surface)"),
         "sidebar retained decorative attribution or a boxed idle status"
+    )
+    try require(
+        app.components(separatedBy: "EveeAppearanceBoundary(appearance: appearance)").count - 1 == 4 &&
+            settings.contains("EveeAppearanceMode.allCases") &&
+            appearanceSource.contains("accessibilityReduceTransparency") &&
+            appearanceSource.contains("EveeAppearancePreference.save"),
+        "appearance did not cover every scene with independent persistence and transparency fallback"
+    )
+    try require(
+        onboarding.components(separatedBy: "ScrollView {").count - 1 >= 2 &&
+            menu.contains(".frame(maxWidth: .infinity, alignment: .leading)") &&
+            meeting.contains("meetingHealthNotice(horizontal: false)") &&
+            settings.contains(".truncationMode(.middle)"),
+        "known narrow-window layouts lacked adaptive fallbacks"
     )
     try require(!onboarding.contains("contentTintColor = .white") && !onboarding.contains("gradientStops(for: .light)"), "native onboarding actions did not resolve effective appearance")
 
@@ -899,8 +921,9 @@ private func checkCaptureOverlayPublication() throws {
         controllerSource.contains("store.$captureOverlaySnapshot") &&
             controllerSource.contains(".removeDuplicates()") &&
             controllerSource.contains("updateDriver.receive(snapshot") &&
-            controllerSource.contains("NSHostingView(rootView: RecordingPill(model: model))") &&
-            controllerSource.components(separatedBy: "NSHostingView(rootView:").count - 1 == 1 &&
+            controllerSource.contains("rootView: EveeAppearanceBoundary(appearance: appearance)") &&
+            controllerSource.contains("RecordingPill(model: model)") &&
+            controllerSource.components(separatedBy: "NSHostingView(").count - 1 == 1 &&
             controllerSource.components(separatedBy: "panel.contentView =").count - 1 == 1 &&
             controllerSource.contains("model.update(presentation)") &&
             !controllerSource.contains("Publishers.CombineLatest") &&
