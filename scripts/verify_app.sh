@@ -77,7 +77,8 @@ test -x "$fixture_seeder"
 "$fixture_seeder" --home "$foundation_home" >>"$captured_stdout" 2>>"$captured_stderr"
 python3 "$repo_root/scripts/verify_mcp_tools.py" --helper "$mcp_executable" --home "$foundation_home" >>"$captured_stdout" 2>>"$captured_stderr"
 
-for private_value in "$HOME" "$CFFIXED_USER_HOME" "$repo_root" "$verification_root" '/.build/'; do
+caller_fixed_home="${CFFIXED_USER_HOME:-}"
+for private_value in "$HOME" "$caller_fixed_home" "$repo_root" "$verification_root" '/.build/'; do
   if [[ -n "$private_value" ]] && grep -F -q -- "$private_value" "$captured_stdout" "$captured_stderr"; then
     echo "Verification output contained a private path" >&2
     exit 1

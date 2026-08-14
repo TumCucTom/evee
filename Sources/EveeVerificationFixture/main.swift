@@ -34,12 +34,15 @@ enum EveeVerificationFixture {
         guard workspaceRoot.standardizedFileURL != realSupport else { throw FixtureError.realDataRoot }
         guard !FileManager.default.fileExists(atPath: workspaceRoot.path) else { throw FixtureError.workspaceAlreadyExists }
 
-        let now = Date()
+        // Midday UTC keeps every fixture record safely within one local day.
+        let now = Date(timeIntervalSince1970: 1_779_969_600)
         let dictationID = UUID(uuidString: "10000000-0000-0000-0000-000000000001")!
         let meetingID = UUID(uuidString: "20000000-0000-0000-0000-000000000002")!
         let memoID = UUID(uuidString: "30000000-0000-0000-0000-000000000003")!
         let decisionSegmentID = UUID(uuidString: "20000000-0000-0000-0000-000000000011")!
         let actionSegmentID = UUID(uuidString: "20000000-0000-0000-0000-000000000012")!
+        let decisionInsightID = UUID(uuidString: "20000000-0000-0000-0000-000000000021")!
+        let actionInsightID = UUID(uuidString: "20000000-0000-0000-0000-000000000022")!
 
         let dictation = WorkspaceRecord(
             id: dictationID,
@@ -85,8 +88,8 @@ enum EveeVerificationFixture {
             segments: segments,
             meetingIntelligence: MeetingIntelligence(
                 summary: ["Decision evidence: ship the isolated verifier"],
-                decisions: [MeetingInsight(kind: .decision, text: "ship the isolated verifier", sourceSegmentID: decisionSegmentID, sourceTime: 0)],
-                actionItems: [MeetingInsight(kind: .actionItem, text: "inspect the packaged helper", sourceSegmentID: actionSegmentID, sourceTime: 4)],
+                decisions: [MeetingInsight(id: decisionInsightID, kind: .decision, text: "ship the isolated verifier", sourceSegmentID: decisionSegmentID, sourceTime: 0)],
+                actionItems: [MeetingInsight(id: actionInsightID, kind: .actionItem, text: "inspect the packaged helper", sourceSegmentID: actionSegmentID, sourceTime: 4)],
                 method: .localExtractive,
                 generatedAt: now
             ),
@@ -117,9 +120,9 @@ enum EveeVerificationFixture {
         settings.localAPIEnabled = false
         settings.webhookURL = ""
         settings.dictionary = [
-            DictionaryTerm(spoken: "alpha", replacement: "Alpha"),
-            DictionaryTerm(spoken: "beta", replacement: "Beta"),
-            DictionaryTerm(spoken: "gamma", replacement: "Gamma"),
+            DictionaryTerm(id: UUID(uuidString: "40000000-0000-0000-0000-000000000001")!, spoken: "alpha", replacement: "Alpha"),
+            DictionaryTerm(id: UUID(uuidString: "40000000-0000-0000-0000-000000000002")!, spoken: "beta", replacement: "Beta"),
+            DictionaryTerm(id: UUID(uuidString: "40000000-0000-0000-0000-000000000003")!, spoken: "gamma", replacement: "Gamma"),
         ]
         settings.appStyles = [
             AppWritingStyle(bundleIdentifier: "fixture.editor", displayName: "Fixture Editor", tone: .concise),
@@ -154,6 +157,25 @@ enum EveeVerificationFixture {
             applicationName: "Browser",
             windowTitle: "Fixture page"
         ), at: now)
+        try secureContents(at: workspaceRoot)
+    }
+
+    private static func secureContents(at rootURL: URL) throws {
+        let fileManager = FileManager.default
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
+        let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: Array(keys),
+            options: []
+        )
+        while let url = enumerator?.nextObject() as? URL {
+            let values = try url.resourceValues(forKeys: keys)
+            if values.isDirectory == true {
+                try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            } else if values.isRegularFile == true {
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            }
+        }
     }
 
     private enum FixtureError: LocalizedError {

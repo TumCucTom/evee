@@ -7,10 +7,12 @@ cd "$repo_root"
 real_home="$(mktemp -d /tmp/evee-real-sentinel.XXXXXX)"
 output="$(mktemp)"
 errors="$(mktemp)"
+unset_home_output="$(mktemp)"
+unset_home_errors="$(mktemp)"
 malformed_root=""
 cleanup() {
   chmod 600 "$real_home/Library/Application Support/Evee/records.json" 2>/dev/null || true
-  rm -rf "$real_home" "$output" "$errors" "$malformed_root"
+  rm -rf "$real_home" "$output" "$errors" "$unset_home_output" "$unset_home_errors" "$malformed_root"
 }
 trap cleanup EXIT
 
@@ -21,6 +23,9 @@ before="$(shasum -a 256 "$sentinel" | awk '{print $1}')"
 chmod 000 "$sentinel"
 
 HOME="$real_home" CFFIXED_USER_HOME="$real_home" scripts/verify_app.sh dist/Evee.app >"$output" 2>"$errors"
+
+env -u CFFIXED_USER_HOME HOME="$real_home" scripts/verify_app.sh dist/Evee.app >"$unset_home_output" 2>"$unset_home_errors"
+grep -q 'Verified isolated relocated bundle' "$unset_home_output"
 
 chmod 600 "$sentinel"
 after="$(shasum -a 256 "$sentinel" | awk '{print $1}')"
