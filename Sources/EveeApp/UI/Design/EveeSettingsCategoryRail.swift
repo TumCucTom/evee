@@ -24,7 +24,7 @@ struct EveeSettingsCategoryRail: View {
             Spacer(minLength: EveeSpacing.medium)
         }
         .padding(.horizontal, EveeSpacing.small)
-        .background(EveeVisual.sidebar)
+        .eveeMaterial(.rail)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Settings categories")
     }
@@ -45,11 +45,12 @@ struct EveeSettingsCategoryRail: View {
                 Text(category.title)
                     .font(EveeTypography.body.weight(isSelected ? .semibold : .regular))
                     .foregroundStyle(EveeVisual.primaryText)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, EveeSpacing.small)
-            .frame(minHeight: 36)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
             .background(isSelected ? EveeVisual.surface : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))

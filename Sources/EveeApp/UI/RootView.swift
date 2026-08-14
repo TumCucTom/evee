@@ -54,22 +54,18 @@ struct RootView: View {
         .tint(AnimaTheme.indigo)
         .safeAreaInset(edge: .top, spacing: 0) {
             if let suggestion = store.meetingSuggestion {
-                HStack(spacing: 10) {
-                    Image(systemName: "person.2.wave.2")
-                        .foregroundStyle(AnimaTheme.indigo)
-                        .accessibilityHidden(true)
-                    Text("Meeting app detected: \(suggestion.applicationName). Start a meeting recording?")
-                        .font(.callout)
-                    Spacer(minLength: 12)
-                    Button("Dismiss") { store.dismissMeetingSuggestion() }
-                        .accessibilityLabel("Dismiss meeting suggestion for \(suggestion.applicationName)")
-                        .accessibilityHint("Hides suggestions for this application for one hour.")
-                    Button("Start Meeting") { Task { await store.startSuggestedMeeting() } }
-                        .buttonStyle(EveeCaptureButtonStyle())
-                        .accessibilityLabel("Start meeting recording for \(suggestion.applicationName)")
-                        .accessibilityHint("Starts recording only after you activate this button.")
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: EveeSpacing.medium) {
+                        meetingSuggestionHeading(suggestion)
+                        Spacer(minLength: EveeSpacing.medium)
+                        meetingSuggestionActions(suggestion)
+                    }
+                    VStack(alignment: .leading, spacing: EveeSpacing.small) {
+                        meetingSuggestionHeading(suggestion)
+                        meetingSuggestionActions(suggestion)
+                    }
                 }
-                .padding(10)
+                .padding(EveeSpacing.medium)
                 .background(AnimaTheme.raisedSurface)
                 .overlay(alignment: .bottom) { Divider() }
                 .accessibilityElement(children: .contain)
@@ -161,6 +157,28 @@ struct RootView: View {
         if case .failed = store.captureState { return "Capture stopped" }
         if case .checkpointed = store.captureState { return "Capture protected" }
         return "Evee needs attention"
+    }
+
+    private func meetingSuggestionHeading(_ suggestion: MeetingSuggestion) -> some View {
+        Label(
+            "Meeting app detected: \(suggestion.applicationName). Start a meeting recording?",
+            systemImage: "person.2.wave.2"
+        )
+        .font(.callout)
+        .foregroundStyle(EveeVisual.primaryText)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func meetingSuggestionActions(_ suggestion: MeetingSuggestion) -> some View {
+        HStack(spacing: EveeSpacing.small) {
+            Button("Dismiss") { store.dismissMeetingSuggestion() }
+                .accessibilityLabel("Dismiss meeting suggestion for \(suggestion.applicationName)")
+                .accessibilityHint("Hides suggestions for this application for one hour.")
+            Button("Start Meeting") { Task { await store.startSuggestedMeeting() } }
+                .buttonStyle(EveeCaptureButtonStyle())
+                .accessibilityLabel("Start meeting recording for \(suggestion.applicationName)")
+                .accessibilityHint("Starts recording only after you activate this button.")
+        }
     }
 
     private func clearFailedCaptureIfNeeded() {

@@ -6,28 +6,37 @@ import SwiftUI
 
 struct EveeApplication: App {
     @StateObject private var store = AppStore()
+    @StateObject private var appearance = AppearanceController.shared
     @NSApplicationDelegateAdaptor(EveeApplicationDelegate.self) private var applicationDelegate
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environmentObject(store)
-                .frame(minWidth: 920, minHeight: 620)
-                .background(WindowSharingProtectionInstaller())
-                .background(CaptureOverlayInstaller().environmentObject(store))
-                .onAppear { applicationDelegate.install(checkpoint: store) }
-                .task {
-                    WorkspaceIntelligenceRuntime.shared.start()
-                    await store.bootstrap()
-                    MeetingSuggestionRuntime.shared.start(store: store)
-                }
+            EveeAppearanceBoundary(appearance: appearance) {
+                RootView()
+                    .environmentObject(store)
+                    .frame(minWidth: 920, minHeight: 620)
+                    .background(WindowSharingProtectionInstaller())
+                    .background(
+                        CaptureOverlayInstaller()
+                            .environmentObject(store)
+                            .environmentObject(appearance)
+                    )
+                    .onAppear { applicationDelegate.install(checkpoint: store) }
+                    .task {
+                        WorkspaceIntelligenceRuntime.shared.start()
+                        await store.bootstrap()
+                        MeetingSuggestionRuntime.shared.start(store: store)
+                    }
+            }
         }
         .windowStyle(.hiddenTitleBar)
 
         MenuBarExtra {
-            MenuBarView()
-                .environmentObject(store)
-                .background(WindowSharingProtectionInstaller())
+            EveeAppearanceBoundary(appearance: appearance) {
+                MenuBarView()
+                    .environmentObject(store)
+                    .background(WindowSharingProtectionInstaller())
+            }
         } label: {
             Image(systemName: menuIcon)
                 .accessibilityLabel(menuBarPresentation.closedAccessibilityLabel)
@@ -35,17 +44,21 @@ struct EveeApplication: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            Group {
-                if store.privacyModeEnabled {
-                    PrivacyModeView()
-                } else {
-                    SettingsView()
+            EveeAppearanceBoundary(appearance: appearance) {
+                Group {
+                    if store.privacyModeEnabled {
+                        PrivacyModeView()
+                    } else {
+                        SettingsView()
+                    }
                 }
+                .environmentObject(store)
+                .frame(minWidth: 720, minHeight: 580)
+                .background(WindowSharingProtectionInstaller())
             }
-            .environmentObject(store)
-            .frame(width: 680, height: 560)
-            .background(WindowSharingProtectionInstaller())
         }
+        .defaultSize(width: 780, height: 640)
+        .windowResizability(.contentMinSize)
     }
 
     private var menuIcon: String {
@@ -114,12 +127,13 @@ private final class EveeApplicationDelegate: NSObject, NSApplicationDelegate {
 
 private struct CaptureOverlayInstaller: View {
     @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var appearance: AppearanceController
 
     var body: some View {
         Color.clear
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
-            .onAppear { CaptureOverlayController.shared.install(store: store) }
+            .onAppear { CaptureOverlayController.shared.install(store: store, appearance: appearance) }
     }
 }
 
@@ -132,13 +146,14 @@ private final class CaptureOverlayController: CaptureOverlayRendering {
     private weak var store: AppStore?
     private var observation: AnyCancellable?
     private var panel: CaptureHUDPanel?
-    private var hostingView: NSHostingView<RecordingPill>?
+    private var hostingView: NSView?
     private var presentationModel: CaptureOverlayPresentationModel?
     private lazy var updateDriver = CaptureOverlayUpdateDriver(renderer: self)
 
-    func install(store: AppStore) {
+    func install(store: AppStore, appearance: AppearanceController) {
         guard self.store !== store else { return }
         self.store = store
+        createOverlay(appearance: appearance)
         observation = store.$captureOverlaySnapshot
             .removeDuplicates()
             .receive(on: RunLoop.main)
@@ -148,13 +163,21 @@ private final class CaptureOverlayController: CaptureOverlayRendering {
     }
 
     func createOverlay() {
+        createOverlay(appearance: .shared)
+    }
+
+    private func createOverlay(appearance: AppearanceController) {
         guard panel == nil else { return }
         let initialStatus = SystemVoiceStatus.make(capture: .idle, hotMic: .disabled, warnings: [])
         let initialSnapshot = CaptureOverlaySnapshot.make(status: initialStatus, capture: .idle)
         let model = CaptureOverlayPresentationModel(
             presentation: CaptureOverlayPresentation.make(snapshot: initialSnapshot)
         )
-        let hostingView = NSHostingView(rootView: RecordingPill(model: model))
+        let hostingView = NSHostingView(
+            rootView: EveeAppearanceBoundary(appearance: appearance) {
+                RecordingPill(model: model)
+            }
+        )
         let panel = makePanel()
         panel.contentView = hostingView
         panel.setContentSize(NSSize(width: 376, height: 52))

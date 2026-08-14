@@ -6,6 +6,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var appearance: AppearanceController
     @State private var newAppName = ""
     @State private var newBundleIdentifier = ""
     @State private var newAppTone: WritingTone = .natural
@@ -130,11 +131,21 @@ struct SettingsView: View {
 
                 if !store.settings.smartLinks.isEmpty {
                     ForEach(store.settings.smartLinks) { link in
-                        HStack {
-                            Text(link.phrase).font(.callout.weight(.medium))
-                            Image(systemName: "arrow.right")
-                            Text(link.destination).font(.caption.monospaced()).foregroundStyle(.secondary)
-                            Spacer()
+                        HStack(alignment: .top, spacing: EveeSpacing.small) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(link.phrase)
+                                    .font(.callout.weight(.medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(link.phrase)
+                                Text(link.destination)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(link.destination)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             Button(role: .destructive) {
                                 store.settings.smartLinks.removeAll { $0.id == link.id }
                             } label: { Image(systemName: "trash") }
@@ -163,7 +174,12 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             TextField("App name", text: $style.displayName)
-                            Text(style.bundleIdentifier).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            Text(style.bundleIdentifier)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(style.bundleIdentifier)
                             Spacer()
                             Button(role: .destructive) { removeStyle(id: style.id) } label: {
                                 Image(systemName: "trash")
@@ -381,6 +397,21 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .application {
+            EveeSettingsSection("Appearance") {
+                Picker("Appearance", selection: Binding(
+                    get: { appearance.mode },
+                    set: { appearance.select($0) }
+                )) {
+                    ForEach(EveeAppearanceMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("\(appearance.mode.detail). Changes apply immediately across Evee.")
+                    .font(.caption)
+                    .foregroundStyle(EveeVisual.secondaryText)
+            }
+
             EveeSettingsSection("Application") {
                 LaunchAtLogin.Toggle()
                 Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)

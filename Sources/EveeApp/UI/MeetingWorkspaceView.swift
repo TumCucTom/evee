@@ -74,29 +74,9 @@ struct MeetingWorkspaceView: View {
                 activeSessionAnchor
 
                 VStack(alignment: .leading, spacing: EveeSpacing.large) {
-                    HStack(alignment: .top, spacing: EveeSpacing.medium) {
-                        Image(systemName: store.isSystemAudioActive ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .foregroundStyle(store.isSystemAudioActive ? EveeVisual.success : EveeVisual.warning)
-                            .font(.system(size: 17, weight: .semibold))
-                            .accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(store.isSystemAudioActive ? "Microphone and system audio are recording" : "Microphone-only recording")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text(store.isSystemAudioActive
-                                 ? "Evee is capturing microphone audio and all Mac system audio locally. Pause unrelated media and notifications; no participant or bot joins your call."
-                                 : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
-                                .font(EveeTypography.metadata)
-                                .foregroundStyle(EveeVisual.secondaryText)
-                        }
-                        .accessibilityElement(children: .combine)
-                        Spacer()
-                        if !store.isSystemAudioActive {
-                            Button("Open Privacy Settings", action: openScreenRecordingSettings)
-                                .buttonStyle(EveeSecondaryButtonStyle())
-                                .controlSize(.small)
-                                .accessibilityLabel("Open Screen and System Audio Recording settings")
-                                .accessibilityHint("Opens System Settings so Evee can include other meeting participants in local capture.")
-                        }
+                    ViewThatFits(in: .horizontal) {
+                        meetingHealthNotice(horizontal: true)
+                        meetingHealthNotice(horizontal: false)
                     }
 
                     if let liveMeetingStatus = store.liveMeetingStatus {
@@ -236,17 +216,16 @@ struct MeetingWorkspaceView: View {
 
     private var restoredDraftCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label(recoveredNotesLabel, systemImage: "doc.badge.clock")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AnimaTheme.indigo)
-                Spacer()
-                Button("Discard notes", role: .destructive) {
-                    Task { await store.discardMeetingDraft() }
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    recoveredNotesHeading
+                    Spacer()
+                    discardRecoveredNotesButton
                 }
-                .controlSize(.small)
-                .accessibilityLabel("Discard recovered meeting notes")
-                .accessibilityHint("Permanently removes the restored title and notes.")
+                VStack(alignment: .leading, spacing: EveeSpacing.small) {
+                    recoveredNotesHeading
+                    discardRecoveredNotesButton
+                }
             }
             Text("These notes were restored from your last interrupted meeting and continue to save automatically.")
                 .font(.caption)
@@ -266,6 +245,65 @@ struct MeetingWorkspaceView: View {
         .animaCard()
         .padding(.horizontal, 20)
         .padding(.bottom, 12)
+    }
+
+    @ViewBuilder
+    private func meetingHealthNotice(horizontal: Bool) -> some View {
+        if horizontal {
+            HStack(alignment: .top, spacing: EveeSpacing.medium) {
+                meetingHealthSummary
+                Spacer(minLength: EveeSpacing.medium)
+                if !store.isSystemAudioActive { openPrivacySettingsButton }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+                meetingHealthSummary
+                if !store.isSystemAudioActive { openPrivacySettingsButton }
+            }
+        }
+    }
+
+    private var meetingHealthSummary: some View {
+        HStack(alignment: .top, spacing: EveeSpacing.medium) {
+            Image(systemName: store.isSystemAudioActive ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(store.isSystemAudioActive ? EveeVisual.success : EveeVisual.warning)
+                .font(.system(size: 17, weight: .semibold))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(store.isSystemAudioActive ? "Microphone and system audio are recording" : "Microphone-only recording")
+                    .font(.system(size: 13, weight: .semibold))
+                Text(store.isSystemAudioActive
+                     ? "Evee is capturing microphone audio and all Mac system audio locally. Pause unrelated media and notifications; no participant or bot joins your call."
+                     : "Other speakers may be missing. Enable system-audio capture in Settings and allow Screen & System Audio Recording to include them.")
+                    .font(EveeTypography.metadata)
+                    .foregroundStyle(EveeVisual.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var openPrivacySettingsButton: some View {
+        Button("Open Privacy Settings", action: openScreenRecordingSettings)
+            .buttonStyle(EveeSecondaryButtonStyle())
+            .controlSize(.small)
+            .accessibilityLabel("Open Screen and System Audio Recording settings")
+            .accessibilityHint("Opens System Settings so Evee can include other meeting participants in local capture.")
+    }
+
+    private var recoveredNotesHeading: some View {
+        Label(recoveredNotesLabel, systemImage: "doc.badge.clock")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(AnimaTheme.indigo)
+    }
+
+    private var discardRecoveredNotesButton: some View {
+        Button("Discard notes", role: .destructive) {
+            Task { await store.discardMeetingDraft() }
+        }
+        .controlSize(.small)
+        .accessibilityLabel("Discard recovered meeting notes")
+        .accessibilityHint("Permanently removes the restored title and notes.")
     }
 
     private var processingCard: some View {

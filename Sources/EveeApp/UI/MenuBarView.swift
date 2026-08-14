@@ -11,12 +11,13 @@ struct MenuBarView: View {
                 EveeMark(size: 24)
                 Text("Evee").font(.headline)
                 Spacer()
-                EveeStatusChip(
-                    label: store.systemVoiceStatus.menuTitle,
-                    systemImage: statusIcon,
-                    tone: statusTone
-                )
             }
+            EveeStatusChip(
+                label: store.systemVoiceStatus.menuTitle,
+                systemImage: statusIcon,
+                tone: statusTone
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(menuBarPresentation.openAccessibilityLabel)
             VoiceThread(

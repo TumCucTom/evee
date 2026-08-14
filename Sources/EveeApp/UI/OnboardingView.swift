@@ -20,15 +20,17 @@ struct OnboardingView: View {
                 let density = OnboardingLayoutMode.forViewportHeight(proxy.size.height)
 
                 if sceneLayout == .twoZone {
-                    HStack(alignment: .center, spacing: EveeSpacing.xLarge) {
-                        brandVoiceRegion
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        readinessPanel
-                            .frame(width: 388)
+                    ScrollView {
+                        HStack(alignment: .center, spacing: EveeSpacing.xLarge) {
+                            brandVoiceRegion
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            readinessPanel
+                                .frame(width: 388)
+                        }
+                        .padding(.horizontal, EveeSpacing.xxLarge)
+                        .padding(.vertical, EveeSpacing.xLarge)
+                        .frame(minHeight: proxy.size.height)
                     }
-                    .padding(.horizontal, EveeSpacing.xxLarge)
-                    .padding(.vertical, EveeSpacing.xLarge)
-                    .frame(minHeight: proxy.size.height)
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: density == .spacious ? EveeSpacing.xLarge : EveeSpacing.large) {
@@ -343,7 +345,7 @@ private struct NativeOnboardingActionButton: NSViewRepresentable {
     }
 
     private static func interfaceAppearance(for effectiveAppearance: NSAppearance) -> InterfaceAppearance {
-        effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light
+        EveeAppearanceRuntime.resolve(effectiveAppearance)
     }
 
     private static func nsColor(_ color: EveeCore.RGBColor) -> NSColor {
