@@ -3,6 +3,16 @@ import XCTest
 @testable import EveeCore
 
 final class EveeVisualPresentationTests: XCTestCase {
+    func testDarkCanvasUsesGraphiteRatherThanNearBlack() {
+        let canvas = EveeVisualPalette.rgb(.canvas, appearance: .dark)
+        let surface = EveeVisualPalette.rgb(.surface, appearance: .dark)
+
+        XCTAssertGreaterThanOrEqual(canvas.red, 0.08)
+        XCTAssertEqual(canvas.red, canvas.green, accuracy: 0.015)
+        XCTAssertEqual(canvas.green, canvas.blue, accuracy: 0.015)
+        XCTAssertGreaterThan(surface.red, canvas.red)
+    }
+
     func testEssentialTextPairsMeetAAInBothAppearances() {
         for appearance in InterfaceAppearance.allCases {
             let canvas = EveeVisualPalette.rgb(.canvas, appearance: appearance)

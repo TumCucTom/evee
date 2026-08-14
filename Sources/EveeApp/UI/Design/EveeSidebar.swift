@@ -38,15 +38,10 @@ struct EveeSidebar: View {
 
     private var brand: some View {
         HStack(spacing: EveeSpacing.small) {
-            EveeMark(size: 30)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Evee")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(EveeVisual.primaryText)
-                Text("by Anima")
-                    .font(EveeTypography.metadata)
-                    .foregroundStyle(EveeVisual.tertiaryText)
-            }
+            EveeMark(size: 28)
+            Text("Evee")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(EveeVisual.primaryText)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, EveeSpacing.xSmall)
@@ -80,7 +75,7 @@ struct EveeSidebar: View {
                     .foregroundStyle(statusTone.color)
                     .accessibilityHidden(true)
                 Text(status.title)
-                    .font(EveeTypography.sectionTitle)
+                    .font(EveeTypography.body.weight(.semibold))
                     .foregroundStyle(EveeVisual.primaryText)
                 Spacer(minLength: 0)
                 if status.isMicrophoneOpen {
@@ -115,12 +110,12 @@ struct EveeSidebar: View {
                 .foregroundStyle(EveeVisual.secondaryText)
             }
         }
-        .padding(EveeSpacing.medium)
-        .background(EveeVisual.surface)
-        .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous)
-                .stroke(status.hasWarning ? EveeVisual.warning : EveeVisual.hairline, lineWidth: status.hasWarning ? 2 : 1)
+        .padding(.horizontal, EveeSpacing.xSmall)
+        .padding(.top, EveeSpacing.medium)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(status.hasWarning ? EveeVisual.warning.opacity(0.7) : EveeVisual.hairline)
+                .frame(height: 1)
         }
         .accessibilityElement(children: .contain)
     }

@@ -10,12 +10,7 @@ struct OnboardingView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [AnimaTheme.paper, AnimaTheme.cloud.opacity(0.74)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            EveeVisual.canvas.ignoresSafeArea()
 
             GeometryReader { proxy in
                 let sceneLayout = OnboardingSceneLayout.forViewport(
@@ -25,13 +20,14 @@ struct OnboardingView: View {
                 let density = OnboardingLayoutMode.forViewportHeight(proxy.size.height)
 
                 if sceneLayout == .twoZone {
-                    HStack(alignment: .center, spacing: EveeSpacing.xxLarge) {
+                    HStack(alignment: .center, spacing: EveeSpacing.xLarge) {
                         brandVoiceRegion
                             .frame(maxWidth: .infinity, alignment: .leading)
                         readinessPanel
-                            .frame(width: 420)
+                            .frame(width: 388)
                     }
-                    .padding(EveeSpacing.xxLarge)
+                    .padding(.horizontal, EveeSpacing.xxLarge)
+                    .padding(.vertical, EveeSpacing.xLarge)
                     .frame(minHeight: proxy.size.height)
                 } else {
                     ScrollView {
@@ -62,22 +58,23 @@ struct OnboardingView: View {
     }
 
     private var brandVoiceRegion: some View {
-        VStack(alignment: .leading, spacing: EveeSpacing.xLarge) {
-            HStack(spacing: EveeSpacing.medium) {
-                EveeMark(size: 52)
+        VStack(alignment: .leading, spacing: EveeSpacing.large) {
+            HStack(spacing: EveeSpacing.small) {
+                EveeMark(size: 40)
                 Text("Evee")
-                    .font(EveeTypography.pageTitle)
+                    .font(.system(size: 19, weight: .semibold))
                     .foregroundStyle(EveeVisual.primaryText)
             }
 
             VStack(alignment: .leading, spacing: EveeSpacing.small) {
                 Text("Speak naturally. Stay in flow.")
-                    .font(.system(size: 32, weight: .bold))
-                    .tracking(-0.7)
+                    .font(.system(size: 27, weight: .semibold))
+                    .tracking(-0.4)
                     .foregroundStyle(EveeVisual.primaryText)
                 Text("Private dictation, meetings and voice memory. Everything runs on your Mac.")
                     .font(EveeTypography.body)
                     .foregroundStyle(EveeVisual.secondaryText)
+                    .frame(maxWidth: 350, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -85,10 +82,10 @@ struct OnboardingView: View {
                 presentation: VoiceThreadPresentation.make(phase: .ready, level: nil),
                 lineWidth: 1.5
             )
-            .frame(maxWidth: 360)
-            .frame(height: 32)
+            .frame(maxWidth: 320)
+            .frame(height: 24)
 
-            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+            VStack(alignment: .leading, spacing: EveeSpacing.small) {
                 feature("command", "Dictate anywhere", "Hold ⌥⌘Space, speak, release.")
                 feature("person.2.wave.2", "Capture meetings", "No bots join your call.")
                 feature("lock.shield", "Your voice stays yours", "No analytics or cloud processing.")
@@ -97,9 +94,9 @@ struct OnboardingView: View {
     }
 
     private var readinessPanel: some View {
-        EveePanel(isElevated: true) {
+        EveePanel {
             VStack(spacing: 10) {
-                Text("Ready your voice workspace")
+                Text("Set up your workspace")
                     .font(EveeTypography.sectionTitle)
                     .foregroundStyle(EveeVisual.primaryText)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -231,12 +228,13 @@ struct OnboardingView: View {
     }
 
     private func feature(_ icon: String, _ title: String, _ detail: String) -> some View {
-        HStack(spacing: 12) {
+        HStack(spacing: EveeSpacing.small) {
             Image(systemName: icon)
                 .foregroundStyle(EveeVisual.accent)
-                .frame(width: 28, height: 28)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 24, height: 24)
                 .background(EveeVisual.accent.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .semibold))

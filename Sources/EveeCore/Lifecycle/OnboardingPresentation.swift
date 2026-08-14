@@ -42,7 +42,7 @@ public enum OnboardingSceneLayout: Equatable, Sendable {
     case twoZone
 
     public static func forViewport(width: CGFloat, height: CGFloat) -> Self {
-        width >= 860 && height >= 700 ? .twoZone : .stacked
+        width >= 860 && height >= 620 ? .twoZone : .stacked
     }
 }
 

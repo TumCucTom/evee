@@ -61,10 +61,12 @@ final class OnboardingPresentationTests: XCTestCase {
         XCTAssertEqual(OnboardingLayoutMode.forViewportHeight(900), .spacious)
     }
 
-    func testSceneLayoutUsesTwoZonesOnlyWhenWidthAndHeightPermit() {
+    func testSceneLayoutKeepsTheStandardAppWindowComposedInTwoZones() {
         XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 920, height: 720), .twoZone)
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 920, height: 640), .twoZone)
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 860, height: 620), .twoZone)
         XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 760, height: 720), .stacked)
-        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 920, height: 640), .stacked)
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 860, height: 580), .stacked)
     }
 
     func testActionIdentityChangesRestoreStableModelFocusWhenPermissionsAreReady() {

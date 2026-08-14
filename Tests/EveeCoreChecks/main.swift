@@ -675,7 +675,29 @@ private func checkFinalVisualReview() throws {
     let dynamicTimerValue = "accessibilityValue(Text(startedAt, style: .timer))"
     try require(meeting.components(separatedBy: dynamicTimerValue).count - 1 == 1 && library.components(separatedBy: dynamicTimerValue).count - 1 == 1, "recording timers did not expose native dynamic accessibility values")
     try require(sidebar.contains(".onChange(of: selection)") && rootView.contains("hasTransferredOnboardingFocus"), "sidebar focus origin or one-time onboarding transfer was missing")
-    try require(!onboarding.contains("contentTintColor = .white") && !onboarding.contains("gradientStops(for: .light)") && components.contains(".color(EveeVisual.primaryActionForeground)"), "brand/native actions did not resolve effective appearance")
+    guard let markStart = components.range(of: "struct EveeMark")?.lowerBound,
+          let headerStart = components.range(of: "struct EveePageHeader")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("mark component boundaries were missing")
+    }
+    let markSource = String(components[markStart..<headerStart])
+    try require(
+        markSource.contains(".linearGradient(") &&
+            markSource.contains(".background(EveeVisual.surface)") &&
+            !markSource.contains(".background(EveeVisual.spectralGradient)"),
+        "brand mark retained a saturated tile instead of a quiet spectral signal"
+    )
+    try require(
+        !onboarding.contains("LinearGradient(") &&
+            onboarding.contains("EveeMark(size: 40)") &&
+            onboarding.contains(".frame(width: 388)"),
+        "onboarding retained the oversized gradient composition"
+    )
+    try require(
+        !sidebar.contains("by Anima") &&
+            !sidebar.contains(".background(EveeVisual.surface)"),
+        "sidebar retained decorative attribution or a boxed idle status"
+    )
+    try require(!onboarding.contains("contentTintColor = .white") && !onboarding.contains("gradientStops(for: .light)"), "native onboarding actions did not resolve effective appearance")
 
     print("final-visual-review: passed")
 }

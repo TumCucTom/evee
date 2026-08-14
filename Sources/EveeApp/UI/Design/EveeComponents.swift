@@ -5,9 +5,8 @@ struct EveeMark: View {
     var size: CGFloat = 32
 
     var body: some View {
-        // This fixed sample is a brand glyph, not simulated capture activity.
         Canvas { context, canvasSize in
-            let inset = size * 0.18
+            let inset = size * 0.2
             let glyphSize = CGSize(
                 width: max(0, canvasSize.width - inset * 2),
                 height: max(0, canvasSize.height - inset * 2)
@@ -18,11 +17,23 @@ struct EveeMark: View {
                 lineWidth: 1.8
             )
             context.translateBy(x: inset, y: inset)
-            context.stroke(path, with: .color(EveeVisual.primaryActionForeground), lineWidth: 1.8)
+            context.stroke(
+                path,
+                with: .linearGradient(
+                    Gradient(colors: EveeVisual.spectralColors),
+                    startPoint: CGPoint(x: 0, y: glyphSize.height / 2),
+                    endPoint: CGPoint(x: glyphSize.width, y: glyphSize.height / 2)
+                ),
+                lineWidth: 1.8
+            )
         }
         .frame(width: size, height: size)
-        .background(EveeVisual.spectralGradient)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+        .background(EveeVisual.surface)
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
+                .stroke(EveeVisual.hairline, lineWidth: 1)
+        }
         .accessibilityHidden(true)
     }
 }
