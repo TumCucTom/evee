@@ -4,7 +4,7 @@ Date: 2026-08-14
 
 Tracking: TOM-52
 
-Status: Approved direction; awaiting written-spec review
+Status: Approved for implementation
 
 ## Outcome
 
