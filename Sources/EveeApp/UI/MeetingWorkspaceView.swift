@@ -197,6 +197,7 @@ struct MeetingWorkspaceView: View {
                             .monospacedDigit()
                             .foregroundStyle(EveeVisual.secondaryText)
                             .accessibilityLabel("Elapsed meeting recording time")
+                            .accessibilityValue(AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now))
                     }
                 }
                 VoiceThread(
@@ -229,6 +230,7 @@ struct MeetingWorkspaceView: View {
                     .monospacedDigit()
                     .foregroundStyle(EveeVisual.secondaryText)
                     .accessibilityLabel("Elapsed recording time")
+                    .accessibilityValue(AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now))
             }
         }
         .accessibilityElement(children: .contain)

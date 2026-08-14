@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import EveeCore
 
@@ -39,6 +40,41 @@ final class AccessibilityCopyTests: XCTestCase {
         XCTAssertEqual(AccessibilityCopy.deleteRecord(kind: .memo, title: "Idea"), "Delete memo Idea permanently")
         XCTAssertEqual(AccessibilityCopy.discardRecovery(kind: .meeting, startedAt: startedAt).hasPrefix("Discard interrupted meeting from"), true)
         XCTAssertEqual(AccessibilityCopy.deleteActivityData, "Delete all stored activity and journal data")
+    }
+
+    func testElapsedRecordingTimeStartsAtZero() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt),
+            "0 seconds elapsed"
+        )
+    }
+
+    func testElapsedRecordingTimeSpeaksMinuteAndSecondBoundaries() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(59)),
+            "59 seconds elapsed"
+        )
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(60)),
+            "1 minute elapsed"
+        )
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(61)),
+            "1 minute 1 second elapsed"
+        )
+    }
+
+    func testElapsedRecordingTimeClampsNegativeClockSkew() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(-30)),
+            "0 seconds elapsed"
+        )
     }
 
     func testLayoutUsesTwoColumnsForDenseRoutesAndActiveMeeting() {

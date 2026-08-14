@@ -590,9 +590,37 @@ private func checkAccessibilityCopy() throws {
     try require(AccessibilityCopy.clearSearch == "Clear workspace search", "search clear label lacked context")
     try require(AccessibilityCopy.exportRetainedTrack(named: "Microphone") == "Export retained Microphone audio", "audio export label lacked track context")
     try require(AccessibilityCopy.speakerLabel(start: 125, currentLabel: nil).contains("2 minutes 5 seconds"), "speaker label omitted timestamp")
+    let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+    try require(
+        AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(61)) == "1 minute 1 second elapsed",
+        "elapsed recording time omitted its spoken minute/second value"
+    )
+    try require(
+        AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(-30)) == "0 seconds elapsed",
+        "elapsed recording time did not clamp negative clock skew"
+    )
     try require(AccessibilityCopy.helperRevocation.contains("registered clients"), "helper revocation omitted consequence")
     try require(RootLayoutMode.route(.settings, captureState: .idle) == .sidebarAndDetail, "settings retained a wasted detail column")
     try require(RootLayoutMode.route(.library, captureState: .idle) == .threeColumn, "library lost browse/detail layout")
+
+    let repositoryRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let meetingSource = try String(
+        contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/UI/MeetingWorkspaceView.swift"),
+        encoding: .utf8
+    )
+    let librarySource = try String(
+        contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/UI/LibraryView.swift"),
+        encoding: .utf8
+    )
+    let elapsedValueCall = "AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now)"
+    try require(
+        meetingSource.components(separatedBy: elapsedValueCall).count - 1 == 2,
+        "meeting elapsed timers do not both expose authoritative accessibility values"
+    )
+    try require(
+        librarySource.components(separatedBy: elapsedValueCall).count - 1 == 1,
+        "memo elapsed timer does not expose an authoritative accessibility value"
+    )
     print("accessibility-copy: passed")
 }
 

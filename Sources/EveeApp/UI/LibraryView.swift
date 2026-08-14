@@ -207,6 +207,7 @@ struct LibraryView: View {
                     .monospacedDigit()
                     .foregroundStyle(EveeVisual.secondaryText)
                     .accessibilityLabel("Elapsed memo recording time")
+                    .accessibilityValue(AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now))
             }
         }
         .accessibilityElement(children: .contain)
