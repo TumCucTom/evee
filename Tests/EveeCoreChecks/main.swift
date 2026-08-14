@@ -385,6 +385,44 @@ private func checkActionContrast() throws {
     print("action-contrast: passed (minimum enabled \(formattedMinimum):1)")
 }
 
+private func checkVisualPresentation() throws {
+    for appearance in InterfaceAppearance.allCases {
+        let canvas = EveeVisualPalette.rgb(.canvas, appearance: appearance)
+        let surface = EveeVisualPalette.rgb(.surface, appearance: appearance)
+        try require(
+            EveeVisualPalette.rgb(.primaryText, appearance: appearance).contrastRatio(with: canvas) >= 4.5,
+            "\(appearance) primary text does not meet AA against canvas"
+        )
+        try require(
+            EveeVisualPalette.rgb(.secondaryText, appearance: appearance).contrastRatio(with: surface) >= 4.5,
+            "\(appearance) secondary text does not meet AA against surface"
+        )
+        try require(
+            EveeVisualPalette.rgb(.accent, appearance: appearance).contrastRatio(with: surface) >= 3,
+            "\(appearance) accent does not meet non-text contrast against surface"
+        )
+    }
+
+    try require(VoiceThreadPresentation.make(phase: .recording, level: -1).level == 0, "voice level was not clamped low")
+    try require(VoiceThreadPresentation.make(phase: .recording, level: 2).level == 1, "voice level was not clamped high")
+    try require(VoiceThreadPresentation.make(phase: .recording, level: nil).level == 0.08, "missing listening level was not quiet")
+    try require(VoiceThreadPresentation.make(phase: .processing, level: 1).mode == .processing, "processing phase had the wrong voice mode")
+    try require(VoiceThreadPresentation.make(phase: .protected, level: nil).mode == .resolved, "protected phase had the wrong voice mode")
+
+    let reducedMotion = EveeMotionPolicy(reduceMotion: true)
+    let standardMotion = EveeMotionPolicy(reduceMotion: false)
+    try require(reducedMotion.duration(for: .route) == 0, "reduced motion retained route duration")
+    try require(reducedMotion.duration(for: .voiceSettlement) == 0, "reduced motion retained voice-settlement duration")
+    try require(standardMotion.duration(for: .selection) == 0.2, "selection duration changed")
+    try require(standardMotion.duration(for: .route) == 0.26, "route duration changed")
+
+    try require(
+        EveeSettingsCategory.allCases == [.voice, .writing, .meetings, .privacyAndStorage, .integrations, .application],
+        "settings categories changed"
+    )
+    print("visual-presentation: passed")
+}
+
 private func checkOnboardingPresentation() throws {
     let denied = OnboardingPresentation(
         microphone: .denied,
@@ -4471,6 +4509,8 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkSystemVoiceStatus()
 } else if arguments == ["--filter", "action-contrast"] {
     try checkActionContrast()
+} else if arguments == ["--filter", "visual-presentation"] {
+    try checkVisualPresentation()
 } else if arguments == ["--filter", "onboarding-presentation"] {
     try checkOnboardingPresentation()
 } else if arguments == ["--filter", "onboarding-action-accessibility"] {
@@ -4552,6 +4592,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "resource-seal"] {
     try checkResourceSeal()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|visual-presentation|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
     exit(EXIT_FAILURE)
 }

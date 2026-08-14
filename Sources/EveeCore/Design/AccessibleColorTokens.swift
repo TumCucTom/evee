@@ -36,18 +36,15 @@ public enum AccessibleActionPalette {
     private static let magenta = RGBColor(red: 0.714, green: 0.102, blue: 0.835)
     private static let violet = RGBColor(red: 0.486, green: 0.141, blue: 0.882)
     private static let electric = RGBColor(red: 0.098, green: 0.220, blue: 0.953)
-    private static let lightPaper = RGBColor(red: 0.980, green: 0.980, blue: 1)
-    private static let darkPaper = RGBColor(red: 0.055, green: 0.052, blue: 0.075)
-
     public static func gradientStops(for appearance: InterfaceAppearance) -> [RGBColor] {
         _ = appearance
         return [magenta, violet, electric]
     }
 
     public static func paper(for appearance: InterfaceAppearance) -> RGBColor {
-        appearance == .dark ? darkPaper : lightPaper
+        EveeVisualPalette.rgb(.canvas, appearance: appearance)
     }
 
-    public static let foreground = RGBColor(red: 1, green: 1, blue: 1)
+    public static let foreground = EveeVisualPalette.rgb(.surface, appearance: .light)
     public static let disabledBorder = RGBColor(red: 0.365, green: 0.373, blue: 0.937)
 }
