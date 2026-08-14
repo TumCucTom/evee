@@ -156,6 +156,7 @@ struct OnboardingView: View {
                 Button(presentation.modelActionTitle ?? "Download", action: activateModelAction)
                     .buttonStyle(.plain)
                     .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+                    .accessibilityLabel(presentation.modelAccessibilityLabel)
                     .accessibilityHint(presentation.modelAccessibilityHint)
                 Text(presentation.modelAccessibilityValue ?? "")
                     .accessibilityLabel("Local model download status")

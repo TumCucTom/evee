@@ -439,13 +439,17 @@ private func checkOnboardingActionAccessibility() throws {
     }
 
     let actionSource = String(source[actionStart..<actionEnd])
-    guard actionSource.contains(".accessibilityRepresentation {"),
-          actionSource.contains("Button(presentation.modelActionTitle ?? \"Download\", action: activateModelAction)"),
-          actionSource.contains("Text(presentation.modelAccessibilityValue ?? \"\")"),
-          actionSource.contains(".accessibilityLabel(\"Local model download status\")"),
+    guard let representationStart = actionSource.range(of: ".accessibilityRepresentation {")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("model action does not provide an accessibility representation")
+    }
+    let representationSource = String(actionSource[representationStart...])
+    guard representationSource.contains("Button(presentation.modelActionTitle ?? \"Download\", action: activateModelAction)"),
+          representationSource.contains(".accessibilityLabel(presentation.modelAccessibilityLabel)"),
+          representationSource.contains("Text(presentation.modelAccessibilityValue ?? \"\")"),
+          representationSource.contains(".accessibilityLabel(\"Local model download status\")"),
           !actionSource.contains(".accessibilityValue(") else {
         throw CoreCheckError.assertionFailed(
-            "model action does not preserve a native button name and separate download status"
+            "model action does not preserve a named native button and separate download status"
         )
     }
     print("onboarding-action-accessibility: passed")
