@@ -15,132 +15,130 @@ struct RecordDetailView: View {
     init(record: WorkspaceRecord) { _draft = State(initialValue: record) }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        TextField("Title", text: $draft.title).font(.system(size: 22, weight: .bold)).textFieldStyle(.plain)
-                        Text(draft.createdAt.formatted(date: .long, time: .shortened)).font(.caption).foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            actionBar
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: EveeSpacing.xLarge) {
+                    TextField("Title", text: $draft.title)
+                        .font(EveeTypography.pageTitle)
+                        .foregroundStyle(EveeVisual.primaryText)
+                        .textFieldStyle(.plain)
+                        .accessibilityLabel("Record title")
+
+                    metadata
+
+                    if let context = draft.context {
+                        contextSection(context)
                     }
-                    Spacer()
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(draft.text, forType: .string)
-                    } label: { Label("Copy", systemImage: "doc.on.doc") }
-                    .buttonStyle(.bordered)
-                    .help("Copy the finished text")
-                    .accessibilityLabel("Copy \(draft.kind.rawValue) text")
-                    .accessibilityHint("Copies the finished text to the clipboard.")
-                    Button("Save", action: saveRecord)
-                        .buttonStyle(AlphaButtonStyle())
-                        .keyboardShortcut("s", modifiers: .command)
-                        .accessibilityLabel("Save changes to \(draft.kind.rawValue) \(draft.title)")
-                    Button(role: .destructive) { confirmDelete = true } label: { Image(systemName: "trash") }
-                        .buttonStyle(.borderless)
-                        .help("Delete this record")
-                        .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
-                        .accessibilityHint("Shows a confirmation before deleting this record and retained audio.")
-                }
 
-                metadata
+                    if !retainedAudioTracks.isEmpty {
+                        retainedAudioSection
+                    }
 
-                if let context = draft.context {
-                    contextSection(context)
-                }
+                    if draft.kind == .meeting,
+                       let intelligence = draft.meetingIntelligence,
+                       !intelligence.isEmpty {
+                        meetingIntelligenceSection(intelligence)
+                    }
 
-                if !retainedAudioTracks.isEmpty {
-                    retainedAudioSection
-                }
+                    if draft.kind == .memo,
+                       let intelligence = draft.memoIntelligence,
+                       !intelligence.isEmpty {
+                        memoIntelligenceSection(intelligence)
+                    }
 
-                if draft.kind == .meeting,
-                   let intelligence = draft.meetingIntelligence,
-                   !intelligence.isEmpty {
-                    meetingIntelligenceSection(intelligence)
-                }
+                    if draft.kind == .meeting {
+                        section("Notes", subtitle: "Your notes stay distinct from the transcript") {
+                            TextEditor(text: $draft.notes)
+                                .font(EveeTypography.body)
+                                .frame(minHeight: 130)
+                                .scrollContentBackground(.hidden)
+                                .padding(EveeSpacing.small)
+                                .background(EveeVisual.elevatedSurface)
+                                .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
+                                .accessibilityLabel("Meeting notes")
+                        }
+                    }
 
-                if draft.kind == .memo,
-                   let intelligence = draft.memoIntelligence,
-                   !intelligence.isEmpty {
-                    memoIntelligenceSection(intelligence)
-                }
-
-                if draft.kind == .meeting {
-                    section("Notes", subtitle: "Your notes stay distinct from the transcript") {
-                        TextEditor(text: $draft.notes)
-                            .font(.system(size: 13))
-                            .frame(minHeight: 130)
+                    section(draft.kind == .meeting ? "Transcript" : "Text", subtitle: draft.rawText == draft.text ? nil : "Polished locally") {
+                        TextEditor(text: $draft.text)
+                            .font(.system(size: 14))
+                            .frame(minHeight: 260)
                             .scrollContentBackground(.hidden)
-                            .padding(6)
-                            .background(AnimaTheme.raisedSurface)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            .accessibilityLabel("Meeting notes")
+                            .padding(EveeSpacing.small)
+                            .background(EveeVisual.elevatedSurface)
+                            .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
+                            .accessibilityLabel(draft.kind == .meeting ? "Meeting transcript" : "Record text")
                     }
-                }
 
-                section(draft.kind == .meeting ? "Transcript" : "Text", subtitle: draft.rawText == draft.text ? nil : "Polished locally") {
-                    TextEditor(text: $draft.text)
-                        .font(.system(size: 14))
-                        .frame(minHeight: 260)
-                        .scrollContentBackground(.hidden)
-                        .padding(6)
-                        .background(AnimaTheme.raisedSurface)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .accessibilityLabel(draft.kind == .meeting ? "Meeting transcript" : "Record text")
-                }
-
-                if !draft.segments.isEmpty {
-                    section("Speaker timeline", subtitle: "Relabelling rebuilds the transcript and meeting overview from these timed segments; participant numbers are anonymous local speaker clusters") {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(draft.segments) { segment in
-                                HStack(alignment: .top, spacing: 10) {
-                                    Text(timestamp(segment.start))
-                                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 44, alignment: .leading)
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(spacing: 6) {
-                                            TextField("Speaker label", text: speakerLabelDraftBinding(for: segment.id))
-                                                .textFieldStyle(.plain)
-                                                .font(.caption.weight(.semibold))
-                                                .foregroundStyle(AnimaTheme.violet)
-                                                .focused($focusedSpeakerLabelID, equals: segment.id)
-                                                .onSubmit { commitSpeakerLabel(for: segment.id) }
-                                                .help("Correct this anonymous speaker label, then Save")
-                                                .accessibilityLabel(AccessibilityCopy.speakerLabel(start: segment.start, currentLabel: segment.speaker))
-                                                .accessibilityHint("Enter a consistent name for this anonymous speaker, then save the label or record.")
-                                            Button {
-                                                commitSpeakerLabel(for: segment.id)
-                                                if focusedSpeakerLabelID == segment.id { focusedSpeakerLabelID = nil }
-                                            } label: {
-                                                Label("Save Speaker Label", systemImage: "checkmark.circle")
-                                                    .labelStyle(.iconOnly)
+                    if !draft.segments.isEmpty {
+                        section("Speaker timeline", subtitle: "Relabelling rebuilds the transcript and meeting overview from these timed segments; participant numbers are anonymous local speaker clusters") {
+                            VStack(alignment: .leading, spacing: 12) {
+                                ForEach(draft.segments) { segment in
+                                    HStack(alignment: .top, spacing: 10) {
+                                        Text(timestamp(segment.start))
+                                            .font(EveeTypography.timestamp)
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 44, alignment: .leading)
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            HStack(spacing: 6) {
+                                                TextField("Speaker label", text: speakerLabelDraftBinding(for: segment.id))
+                                                    .textFieldStyle(.plain)
+                                                    .font(.caption.weight(.semibold))
+                                                    .foregroundStyle(AnimaTheme.violet)
+                                                    .focused($focusedSpeakerLabelID, equals: segment.id)
+                                                    .onSubmit { commitSpeakerLabel(for: segment.id) }
+                                                    .help("Correct this anonymous speaker label, then Save")
+                                                    .accessibilityLabel(AccessibilityCopy.speakerLabel(start: segment.start, currentLabel: segment.speaker))
+                                                    .accessibilityHint("Enter a consistent name for this anonymous speaker, then save the label or record.")
+                                                Button {
+                                                    commitSpeakerLabel(for: segment.id)
+                                                    if focusedSpeakerLabelID == segment.id { focusedSpeakerLabelID = nil }
+                                                } label: {
+                                                    Label("Save Speaker Label", systemImage: "checkmark.circle")
+                                                        .labelStyle(.iconOnly)
+                                                }
+                                                .buttonStyle(.borderless)
+                                                .controlSize(.small)
+                                                .help("Apply this speaker label to the timed transcript")
+                                                .accessibilityLabel("Save Speaker Label")
+                                                .accessibilityHint("Rebuilds the transcript and meeting overview from this label without saving the record to disk.")
                                             }
-                                            .buttonStyle(.borderless)
-                                            .controlSize(.small)
-                                            .help("Apply this speaker label to the timed transcript")
-                                            .accessibilityLabel("Save Speaker Label")
-                                            .accessibilityHint("Rebuilds the transcript and meeting overview from this label without saving the record to disk.")
+                                            if let provenance = segmentProvenance(segment) {
+                                                Text(provenance)
+                                                    .font(.system(size: 9, weight: .medium))
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                            Text(segment.text).font(.system(size: 12)).textSelection(.enabled)
                                         }
-                                        if let provenance = segmentProvenance(segment) {
-                                            Text(provenance)
-                                                .font(.system(size: 9, weight: .medium))
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Text(segment.text).font(.system(size: 12)).textSelection(.enabled)
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                if let raw = draft.rawText, raw != draft.text {
-                    DisclosureGroup("Original transcript") { Text(raw).font(.system(size: 12)).foregroundStyle(.secondary).textSelection(.enabled).padding(.top, 8) }
+                    if let raw = draft.rawText, raw != draft.text {
+                        DisclosureGroup("Original transcript") {
+                            Text(raw)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .padding(.top, EveeSpacing.small)
+                        }
+                    }
                 }
+                .frame(maxWidth: 820, alignment: .leading)
+                .padding(EveeSpacing.xxLarge)
+                .background(EveeVisual.surface)
+                .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
+                .shadow(color: EveeVisual.primaryText.opacity(0.07), radius: 16, y: 6)
+                .padding(EveeSpacing.xLarge)
+                .frame(maxWidth: .infinity)
             }
-            .padding(24)
         }
-        .background(AnimaTheme.paper)
+        .background(EveeVisual.canvas)
         .id(draft.id)
         .onAppear(perform: selectInitialAudioTrack)
         .onChange(of: focusedSpeakerLabelID) { previous, current in
@@ -154,27 +152,82 @@ struct RecordDetailView: View {
         } message: { Text("The local record and retained audio will be removed. This cannot be undone in Evee.") }
     }
 
-    private var metadata: some View {
-        HStack(spacing: 8) {
+    private var actionBar: some View {
+        HStack(spacing: EveeSpacing.medium) {
             Label(draft.kind.rawValue.capitalized, systemImage: kindIcon)
-            if draft.operation == .selectionTransform {
-                Label("Selection transform", systemImage: "wand.and.stars")
-            }
-            if let duration = draft.duration {
-                Label(timestamp(duration), systemImage: "clock")
-            }
-            if let app = draft.sourceApplication, !app.isEmpty {
-                Label(app, systemImage: "app")
-            }
-            if !retainedAudioTracks.isEmpty {
-                Label("Audio retained", systemImage: "internaldrive")
-            }
-            if draft.tags.contains("Recovered from system audio") {
-                Label("Recovered from system audio", systemImage: "speaker.wave.2")
+                .font(EveeTypography.metadata)
+                .foregroundStyle(EveeVisual.secondaryText)
+            Spacer(minLength: EveeSpacing.medium)
+            ViewThatFits(in: .horizontal) {
+                actionButtons.labelStyle(.titleAndIcon)
+                actionButtons.labelStyle(.iconOnly)
             }
         }
-        .font(.caption)
-        .foregroundStyle(.secondary)
+        .padding(.horizontal, EveeSpacing.xLarge)
+        .padding(.vertical, EveeSpacing.medium)
+        .background(EveeVisual.surface)
+    }
+
+    private var actionButtons: some View {
+        HStack(spacing: EveeSpacing.small) {
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(draft.text, forType: .string)
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+            .buttonStyle(EveeSecondaryButtonStyle())
+            .help("Copy the finished text")
+            .accessibilityLabel("Copy \(draft.kind.rawValue) text")
+            .accessibilityHint("Copies the finished text to the clipboard.")
+
+            if !retainedAudioTracks.isEmpty {
+                Button(action: exportSelectedAudioTrack) {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(EveeSecondaryButtonStyle())
+                .disabled(selectedAudioTrack == nil)
+                .help("Export the selected retained audio track")
+                .accessibilityLabel(AccessibilityCopy.exportRetainedTrack(named: selectedAudioTrackName))
+                .accessibilityHint("Opens a save panel for the selected local audio track.")
+            }
+
+            Button(action: saveRecord) {
+                Label("Save", systemImage: "checkmark")
+            }
+            .buttonStyle(EveePrimaryButtonStyle())
+            .keyboardShortcut("s", modifiers: .command)
+            .accessibilityLabel("Save changes to \(draft.kind.rawValue) \(draft.title)")
+
+            Button(role: .destructive) { confirmDelete = true } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            .buttonStyle(EveeDestructiveButtonStyle())
+            .help("Delete this record")
+            .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
+            .accessibilityHint("Shows a confirmation before deleting this record and retained audio.")
+        }
+    }
+
+    private var metadata: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)], alignment: .leading, spacing: EveeSpacing.small) {
+            EveeStatusChip(label: draft.createdAt.formatted(date: .long, time: .shortened), systemImage: "calendar")
+            if draft.operation == .selectionTransform {
+                EveeStatusChip(label: "Selection transform", systemImage: "wand.and.stars")
+            }
+            if let duration = draft.duration {
+                EveeStatusChip(label: timestamp(duration), systemImage: "clock")
+            }
+            if let app = draft.sourceApplication, !app.isEmpty {
+                EveeStatusChip(label: app, systemImage: "app")
+            }
+            if !retainedAudioTracks.isEmpty {
+                EveeStatusChip(label: "Audio retained", systemImage: "internaldrive")
+            }
+            if draft.tags.contains("Recovered from system audio") {
+                EveeStatusChip(label: "Recovered from system audio", systemImage: "speaker.wave.2")
+            }
+        }
         .accessibilityElement(children: .combine)
     }
 
@@ -390,14 +443,6 @@ struct RecordDetailView: View {
                         .font(.caption.monospacedDigit())
                         .frame(minWidth: 42, alignment: .leading)
 
-                    Button(action: exportSelectedAudioTrack) {
-                        Label("Export", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(selectedAudioTrack == nil)
-                    .help("Export the selected retained audio track")
-                    .accessibilityLabel(AccessibilityCopy.exportRetainedTrack(named: selectedAudioTrackName))
-                    .accessibilityHint("Opens a save panel for the selected local audio track.")
                 }
 
                 if let message = audioPlayer.errorMessage ?? audioStatusMessage {
@@ -539,10 +584,18 @@ struct RecordDetailView: View {
     }
 
     private func section<Content: View>(_ title: String, subtitle: String? = nil, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.system(size: 14, weight: .semibold))
-            if let subtitle { Text(subtitle).font(.caption).foregroundStyle(.secondary) }
+        VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+            Text(title)
+                .font(EveeTypography.sectionTitle)
+                .foregroundStyle(EveeVisual.primaryText)
+            if let subtitle {
+                Text(subtitle)
+                    .font(EveeTypography.metadata)
+                    .foregroundStyle(EveeVisual.secondaryText)
+            }
             content()
-        }.animaCard()
+        }
+        .padding(.vertical, EveeSpacing.large)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }

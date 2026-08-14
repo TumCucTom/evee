@@ -27,27 +27,23 @@ struct LibraryView: View {
     var body: some View {
         VStack(spacing: 0) {
             if showsHeader {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(title).font(.system(size: 22, weight: .bold)).foregroundStyle(AnimaTheme.ink)
-                        Text("Your local voice archive").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
+                EveePageHeader(title, subtitle: "Your local voice archive") {
                     if kind == .memo {
                         if isRecordingMemo {
-                            Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
-                                .buttonStyle(.bordered)
-                                .help("Stop and permanently discard this memo")
-                                .accessibilityLabel("Discard the current memo recording")
-                                .accessibilityHint("Stops recording and permanently deletes this memo capture.")
-                            Button("Stop and save") { Task { await store.finishCapture() } }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.red)
-                                .keyboardShortcut(.return, modifiers: [])
-                                .accessibilityLabel("Stop and save the current memo recording")
+                            HStack(spacing: EveeSpacing.small) {
+                                Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                                    .buttonStyle(EveeDestructiveButtonStyle())
+                                    .help("Stop and permanently discard this memo")
+                                    .accessibilityLabel("Discard the current memo recording")
+                                    .accessibilityHint("Stops recording and permanently deletes this memo capture.")
+                                Button("Stop and save") { Task { await store.finishCapture() } }
+                                    .buttonStyle(EveePrimaryButtonStyle())
+                                    .keyboardShortcut(.return, modifiers: [])
+                                    .accessibilityLabel("Stop and save the current memo recording")
+                            }
                         } else {
                             Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
-                                .buttonStyle(AlphaButtonStyle())
+                                .buttonStyle(EveePrimaryButtonStyle())
                                 .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
                                 .help(store.captureState == .idle ? "Record a private voice memo" : "Finish the current capture first")
                                 .accessibilityLabel("Record a new private memo")
@@ -55,7 +51,8 @@ struct LibraryView: View {
                         }
                     }
                 }
-                .padding(20)
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.top, EveeSpacing.xLarge)
             }
 
             if !recoveryRows.isEmpty {
@@ -146,36 +143,27 @@ struct LibraryView: View {
                         .accessibilityElement(children: .contain)
                     }
                 }
-                .animaCard()
+                .padding(EveeSpacing.large)
+                .background(EveeVisual.surface)
+                .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
+                        .stroke(EveeVisual.warning.opacity(0.55), lineWidth: 1)
+                }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 12)
             }
 
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Search everything you have said…", text: $store.search)
-                    .textFieldStyle(.plain)
-                if !store.search.isEmpty {
-                    Button { store.search = "" } label: {
-                        Image(systemName: "xmark.circle.fill").accessibilityHidden(true)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel(AccessibilityCopy.clearSearch)
-                    .accessibilityHint("Removes the current query and shows all workspace records.")
-                }
-            }
-            .padding(.horizontal, 12).frame(height: 38)
-            .background(AnimaTheme.surface).clipShape(RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).stroke(AnimaTheme.border))
-            .padding(.horizontal, 20).padding(.bottom, 12)
+            EveeSearchField(text: $store.search, prompt: "Search everything you have said…")
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.bottom, EveeSpacing.medium)
 
             if rows.isEmpty {
-                ContentUnavailableView(
+                EveeEmptyState(
                     store.search.isEmpty ? "Your voice workspace is ready" : "Nothing matched",
-                    systemImage: store.search.isEmpty ? "waveform" : "magnifyingglass",
-                    description: Text(store.search.isEmpty ? "Hold ⌥⌘Space in any app to create your first dictation." : "Try a person, project, phrase or app name.")
+                    message: store.search.isEmpty ? "Hold ⌥⌘Space in any app to create your first dictation." : "Try a person, project, phrase or app name."
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List(selection: $store.selectedRecordID) {
                     if store.search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -195,15 +183,20 @@ struct LibraryView: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .background(AnimaTheme.paper)
+        .background(EveeVisual.canvas)
     }
 
     @ViewBuilder
     private func recordRow(_ record: WorkspaceRecord) -> some View {
-        RecordRow(record: record, snippet: store.indexedSnippet(for: record.id))
+        RecordRow(
+            record: record,
+            snippet: store.indexedSnippet(for: record.id),
+            isSelected: store.selectedRecordID == record.id
+        )
             .tag(record.id)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
     }
 
     private var isRecordingMemo: Bool {
@@ -233,12 +226,17 @@ struct LibraryView: View {
 private struct RecordRow: View {
     let record: WorkspaceRecord
     var snippet: String?
+    let isSelected: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovering = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon)
-                .font(.system(size: 13, weight: .semibold)).foregroundStyle(colour)
-                .frame(width: 30, height: 30).background(colour.opacity(0.1)).clipShape(RoundedRectangle(cornerRadius: 8))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(colour)
+                .frame(width: 24, height: 30)
             VStack(alignment: .leading, spacing: 5) {
                 Text(record.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                 Text(snippet ?? record.text).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
@@ -250,13 +248,25 @@ private struct RecordRow: View {
             }
             Spacer()
         }
-        .padding(12).background(AnimaTheme.surface.opacity(0.88)).clipShape(RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(AnimaTheme.border.opacity(0.8)))
-        .padding(.vertical, 3)
+        .padding(.horizontal, EveeSpacing.medium)
+        .padding(.vertical, EveeSpacing.small)
+        .contentShape(Rectangle())
+        .background(rowSurface)
+        .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
+        .shadow(color: EveeVisual.primaryText.opacity(isSelected ? 0.08 : 0), radius: isSelected ? 8 : 0, y: isSelected ? 2 : 0)
+        .onHover { isHovering = $0 }
+        .animation(EveeVisual.animation(.selection, reduceMotion: reduceMotion), value: isSelected)
+        .animation(EveeVisual.animation(.selection, reduceMotion: reduceMotion), value: isHovering)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(AccessibilityCopy.recordRow(record: record, snippet: snippet))
+        .accessibilityValue(isSelected ? "Selected" : "Not selected")
     }
 
     private var icon: String { switch record.kind { case .dictation: "text.cursor"; case .meeting: "person.2.wave.2"; case .memo: "waveform" } }
     private var colour: Color { record.kind == .meeting ? AnimaTheme.violet : record.kind == .memo ? AnimaTheme.magenta : AnimaTheme.indigo }
+    private var rowSurface: Color {
+        if isSelected { return EveeVisual.elevatedSurface }
+        if isHovering { return EveeVisual.surface.opacity(0.72) }
+        return .clear
+    }
 }
