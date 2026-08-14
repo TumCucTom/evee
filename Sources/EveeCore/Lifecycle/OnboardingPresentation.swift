@@ -37,6 +37,15 @@ public enum OnboardingLayoutMode: Equatable, Sendable {
     }
 }
 
+public enum OnboardingSceneLayout: Equatable, Sendable {
+    case stacked
+    case twoZone
+
+    public static func forViewport(width: CGFloat, height: CGFloat) -> Self {
+        width >= 860 && height >= 700 ? .twoZone : .stacked
+    }
+}
+
 public struct OnboardingPresentation: Equatable, Sendable {
     public let focusTarget: OnboardingFocusTarget
     public let microphoneActionTitle: String

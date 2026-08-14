@@ -28,6 +28,10 @@ struct LibraryView: View {
         VStack(spacing: 0) {
             if showsHeader {
                 EveePageHeader(title, subtitle: "Your local voice archive") {
+                    if kind == .memo, isRecordingMemo {
+                        memoRecordingStatus
+                    }
+                } actions: {
                     if kind == .memo {
                         if isRecordingMemo {
                             HStack(spacing: EveeSpacing.small) {
@@ -186,6 +190,28 @@ struct LibraryView: View {
         .background(EveeVisual.canvas)
     }
 
+    private var memoRecordingStatus: some View {
+        HStack(spacing: EveeSpacing.small) {
+            VoiceThread(
+                presentation: VoiceThreadPresentation.make(
+                    phase: store.systemVoiceStatus.phase,
+                    level: captureLevel
+                ),
+                lineWidth: 1.5
+            )
+            .frame(width: 72, height: 20)
+            EveeStatusChip(label: "Memo recording", systemImage: "record.circle.fill", tone: .accent)
+            if let startedAt = recordingStartedAt {
+                Text(startedAt, style: .timer)
+                    .font(EveeTypography.timestamp)
+                    .monospacedDigit()
+                    .foregroundStyle(EveeVisual.secondaryText)
+                    .accessibilityLabel("Elapsed memo recording time")
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
     @ViewBuilder
     private func recordRow(_ record: WorkspaceRecord) -> some View {
         RecordRow(
@@ -202,6 +228,16 @@ struct LibraryView: View {
     private var isRecordingMemo: Bool {
         guard store.captureKind == .memo, case .recording = store.captureState else { return false }
         return true
+    }
+
+    private var recordingStartedAt: Date? {
+        guard case .recording(let startedAt, _) = store.captureState else { return nil }
+        return startedAt
+    }
+
+    private var captureLevel: Double? {
+        guard case .recording(_, let level) = store.captureState else { return nil }
+        return Double(level)
     }
 
     private func isValid(_ role: AudioTrackRole, in capture: CaptureRecoveryManifest) -> Bool {

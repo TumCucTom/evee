@@ -16,22 +16,34 @@ struct OnboardingView: View {
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
-            Circle()
-                .stroke(AnimaTheme.violet.opacity(0.10), lineWidth: 2)
-                .frame(width: 620, height: 620)
-                .offset(x: 330, y: -250)
-                .accessibilityHidden(true)
 
             GeometryReader { proxy in
-                let layout = OnboardingLayoutMode.forViewportHeight(proxy.size.height)
-                ScrollView {
-                    onboardingContent(
-                        spacing: layout == .spacious ? 22 : 14,
-                        padding: layout == .spacious ? 40 : 20,
-                        showsFeatures: layout == .spacious
-                    )
+                let sceneLayout = OnboardingSceneLayout.forViewport(
+                    width: proxy.size.width,
+                    height: proxy.size.height
+                )
+                let density = OnboardingLayoutMode.forViewportHeight(proxy.size.height)
+
+                if sceneLayout == .twoZone {
+                    HStack(alignment: .center, spacing: EveeSpacing.xxLarge) {
+                        brandVoiceRegion
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        readinessPanel
+                            .frame(width: 420)
+                    }
+                    .padding(EveeSpacing.xxLarge)
                     .frame(minHeight: proxy.size.height)
-                    .frame(maxWidth: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: density == .spacious ? EveeSpacing.xLarge : EveeSpacing.large) {
+                            brandVoiceRegion
+                            readinessPanel
+                        }
+                        .frame(maxWidth: 560, alignment: .leading)
+                        .padding(density == .spacious ? EveeSpacing.xLarge : EveeSpacing.large)
+                        .frame(minHeight: proxy.size.height)
+                        .frame(maxWidth: .infinity)
+                    }
                 }
             }
         }
@@ -49,38 +61,49 @@ struct OnboardingView: View {
         }
     }
 
-    private func onboardingContent(
-        spacing: CGFloat,
-        padding: CGFloat,
-        showsFeatures: Bool
-    ) -> some View {
-        VStack(spacing: spacing) {
-            HStack(spacing: 12) {
-                EveeMark(size: showsFeatures ? 48 : 40)
+    private var brandVoiceRegion: some View {
+        VStack(alignment: .leading, spacing: EveeSpacing.xLarge) {
+            HStack(spacing: EveeSpacing.medium) {
+                EveeMark(size: 52)
                 Text("Evee")
-                    .font(.system(size: showsFeatures ? 35 : 30, weight: .bold))
-                    .foregroundStyle(AnimaTheme.aubergine)
+                    .font(EveeTypography.pageTitle)
+                    .foregroundStyle(EveeVisual.primaryText)
             }
-            VStack(spacing: 8) {
+
+            VStack(alignment: .leading, spacing: EveeSpacing.small) {
                 Text("Speak naturally. Stay in flow.")
-                    .font(.system(size: showsFeatures ? 30 : 24, weight: .bold))
+                    .font(.system(size: 32, weight: .bold))
                     .tracking(-0.7)
+                    .foregroundStyle(EveeVisual.primaryText)
                 Text("Private dictation, meetings and voice memory. Everything runs on your Mac.")
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 500)
+                    .font(EveeTypography.body)
+                    .foregroundStyle(EveeVisual.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            if showsFeatures {
-                VStack(alignment: .leading, spacing: 13) {
-                    feature("command", "Dictate anywhere", "Hold ⌥⌘Space, speak, release.")
-                    feature("person.2.wave.2", "Capture meetings", "No bots join your call.")
-                    feature("lock.shield", "Your voice stays yours", "No analytics or cloud processing.")
-                }
-                .animaCard()
-                .frame(maxWidth: 480)
+
+            VoiceThread(
+                presentation: VoiceThreadPresentation.make(phase: .ready, level: nil),
+                lineWidth: 1.5
+            )
+            .frame(maxWidth: 360)
+            .frame(height: 32)
+
+            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+                feature("command", "Dictate anywhere", "Hold ⌥⌘Space, speak, release.")
+                feature("person.2.wave.2", "Capture meetings", "No bots join your call.")
+                feature("lock.shield", "Your voice stays yours", "No analytics or cloud processing.")
             }
+        }
+    }
+
+    private var readinessPanel: some View {
+        EveePanel(isElevated: true) {
             VStack(spacing: 10) {
+                Text("Ready your voice workspace")
+                    .font(EveeTypography.sectionTitle)
+                    .foregroundStyle(EveeVisual.primaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
                 permissionRow(
                     title: "Microphone",
                     state: store.microphonePermissionState,
@@ -95,6 +118,9 @@ struct OnboardingView: View {
                         Task { await store.requestMicrophonePermission() }
                     }
                 }
+
+                Divider()
+
                 permissionRow(
                     title: "Accessibility",
                     state: store.accessibilityPermissionState,
@@ -105,18 +131,30 @@ struct OnboardingView: View {
                 ) {
                     store.requestAccessibilityPermission()
                 }
-            }
-            .animaCard()
-            .frame(maxWidth: 480)
 
-            VStack(spacing: 10) {
-                modelDownloadControl
-                Text("Parakeet v3 · about 735 MB · Apple Silicon")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Divider()
+
+                modelReadinessRow
             }
         }
-        .padding(padding)
+    }
+
+    private var modelReadinessRow: some View {
+        HStack(alignment: .top, spacing: EveeSpacing.small) {
+            Image(systemName: isModelReady ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(isModelReady ? EveeVisual.success : EveeVisual.accent)
+                .frame(width: 16, height: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: EveeSpacing.xSmall) {
+                Text("Local speech model")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Parakeet v3 · about 735 MB · Apple Silicon")
+                    .font(EveeTypography.metadata)
+                    .foregroundStyle(EveeVisual.secondaryText)
+                modelDownloadControl
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     @ViewBuilder
@@ -126,7 +164,7 @@ struct OnboardingView: View {
             modelActionButton
             if presentation.modelAction == .cancel {
                 ProgressView(value: store.modelProgress?.fraction ?? 0)
-                    .frame(width: 260)
+                    .frame(maxWidth: 260)
                     .accessibilityLabel("Local model download progress")
                     .accessibilityValue(presentation.modelAccessibilityValue ?? "Starting")
             }
@@ -188,17 +226,21 @@ struct OnboardingView: View {
         }
     }
 
+    private var isModelReady: Bool {
+        if case .ready = onboardingModelState { true } else { false }
+    }
+
     private func feature(_ icon: String, _ title: String, _ detail: String) -> some View {
         HStack(spacing: 12) {
             Image(systemName: icon)
-                .foregroundStyle(AnimaTheme.indigo)
+                .foregroundStyle(EveeVisual.accent)
                 .frame(width: 28, height: 28)
-                .background(AnimaTheme.indigo.opacity(0.08))
+                .background(EveeVisual.accent.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .semibold))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(EveeTypography.metadata).foregroundStyle(EveeVisual.secondaryText)
             }
         }
         .accessibilityElement(children: .combine)
@@ -215,13 +257,13 @@ struct OnboardingView: View {
     ) -> some View {
         HStack {
             Image(systemName: state == .granted ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(state == .granted ? .green : AnimaTheme.indigo)
+                .foregroundStyle(state == .granted ? EveeVisual.success : EveeVisual.accent)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .semibold))
                 Text(permissionStatus(for: title))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(EveeTypography.metadata)
+                    .foregroundStyle(EveeVisual.secondaryText)
             }
             Spacer()
             if state != .granted {

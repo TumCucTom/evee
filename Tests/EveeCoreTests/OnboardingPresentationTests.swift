@@ -61,6 +61,12 @@ final class OnboardingPresentationTests: XCTestCase {
         XCTAssertEqual(OnboardingLayoutMode.forViewportHeight(900), .spacious)
     }
 
+    func testSceneLayoutUsesTwoZonesOnlyWhenWidthAndHeightPermit() {
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 920, height: 720), .twoZone)
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 760, height: 720), .stacked)
+        XCTAssertEqual(OnboardingSceneLayout.forViewport(width: 920, height: 640), .stacked)
+    }
+
     func testActionIdentityChangesRestoreStableModelFocusWhenPermissionsAreReady() {
         let download = OnboardingPresentation(microphone: .granted, accessibility: .granted, model: .idle)
         let cancel = OnboardingPresentation(
