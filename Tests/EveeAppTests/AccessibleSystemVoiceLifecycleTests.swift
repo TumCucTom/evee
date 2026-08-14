@@ -166,6 +166,7 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
 
         systemStop.succeed()
         await finish.value
+        XCTAssertEqual(systemStop.callCount, 1)
         XCTAssertTrue(announcements.contains("Recording stopped. Transcribing locally."))
     }
 
@@ -200,8 +201,13 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
 private final class SuspendedVoidOperation {
     private var continuation: CheckedContinuation<Void, Error>?
     private var waiter: CheckedContinuation<Void, Never>?
+    private(set) var callCount = 0
 
     func run() async throws {
+        callCount += 1
+        guard callCount == 1 else {
+            throw AccessibleSyntheticError.repeatedOperation
+        }
         try await withCheckedThrowingContinuation {
             continuation = $0
             waiter?.resume()
@@ -253,12 +259,15 @@ private final class SuspendedRecoveryPersistence {
 
 private enum AccessibleSyntheticError: LocalizedError {
     case persistenceFailed
+    case repeatedOperation
     case transcriptionFailed
 
     var errorDescription: String? {
         switch self {
         case .persistenceFailed:
             "Synthetic recovery persistence failure."
+        case .repeatedOperation:
+            "Synthetic operation was invoked more than once."
         case .transcriptionFailed:
             "Synthetic transcription failure."
         }

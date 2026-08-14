@@ -1635,7 +1635,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         if isMicrophoneRecording, let stoppedURL = try? await stopMicrophone() {
             activeAudioURL = stoppedURL
         }
-        try? await stopSystemAudio()
+        if isSystemAudioActive {
+            try? await stopSystemAudio()
+        }
         if activeKind == .meeting { await stopLiveMeetingTranscription(discardPendingAudio: true) }
         isSystemAudioActive = false
 
