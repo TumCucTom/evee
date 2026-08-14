@@ -40,9 +40,10 @@ jobs:
         id: app_accessible_capture
         continue-on-error: true
         timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --filter AccessibleSystemVoiceLifecycleTests
+        run: swift test --enable-code-coverage --skip-build --parallel --num-workers 2 --filter AccessibleSystemVoiceLifecycleTests
       - name: Test app termination
         id: app_termination
+        if: steps.app_accessible_capture.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 2
         run: swift test --enable-code-coverage --skip-build --filter ApplicationTerminationCoordinatorTests
