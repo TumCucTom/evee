@@ -130,6 +130,10 @@ struct OnboardingView: View {
                     .accessibilityLabel("Local model download progress")
                     .accessibilityValue(presentation.modelAccessibilityValue ?? "Starting")
             }
+            Text(presentation.modelAccessibilityValue ?? "")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Local model download status")
         case .none:
             if case .cancelling = onboardingModelState {
                 ProgressView()
@@ -147,21 +151,16 @@ struct OnboardingView: View {
     }
 
     private var modelActionButton: some View {
-        Button(presentation.modelActionTitle ?? "Download", action: activateModelAction)
-        .buttonStyle(AlphaButtonStyle())
-        .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+        NativeOnboardingActionButton(
+            title: presentation.modelActionTitle ?? "Download",
+            accessibilityLabel: presentation.modelAccessibilityLabel,
+            accessibilityHelp: presentation.modelAccessibilityHint,
+            isEnabled: store.microphonePermissionGranted && store.accessibilityPermissionGranted,
+            action: activateModelAction
+        )
+        .frame(minHeight: 36)
+        .fixedSize()
         .focused($focusedTarget, equals: .modelAction)
-        .accessibilityRepresentation {
-            VStack(alignment: .leading, spacing: 0) {
-                Button(presentation.modelActionTitle ?? "Download", action: activateModelAction)
-                    .buttonStyle(.plain)
-                    .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
-                    .accessibilityLabel(presentation.modelAccessibilityLabel)
-                    .accessibilityHint(presentation.modelAccessibilityHint)
-                Text(presentation.modelAccessibilityValue ?? "")
-                    .accessibilityLabel("Local model download status")
-            }
-        }
     }
 
     private func activateModelAction() {
@@ -246,6 +245,71 @@ struct OnboardingView: View {
     private func restoreFocus(to target: OnboardingFocusTarget) {
         DispatchQueue.main.async {
             focusedTarget = target
+        }
+    }
+}
+
+@MainActor
+private struct NativeOnboardingActionButton: NSViewRepresentable {
+    let title: String
+    let accessibilityLabel: String
+    let accessibilityHelp: String
+    let isEnabled: Bool
+    let action: @MainActor () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(action: action)
+    }
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton(
+            title: title,
+            target: context.coordinator,
+            action: #selector(Coordinator.activate(_:))
+        )
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        button.font = .systemFont(ofSize: 13, weight: .semibold)
+        button.bezelColor = Self.actionBezelColor
+        button.contentTintColor = .white
+        button.refusesFirstResponder = false
+        configure(button, coordinator: context.coordinator)
+        return button
+    }
+
+    func updateNSView(_ button: NSButton, context: Context) {
+        configure(button, coordinator: context.coordinator)
+    }
+
+    private func configure(_ button: NSButton, coordinator: Coordinator) {
+        button.title = title
+        button.setAccessibilityLabel(accessibilityLabel)
+        button.setAccessibilityHelp(accessibilityHelp)
+        button.toolTip = accessibilityHelp
+        button.isEnabled = isEnabled
+        coordinator.action = action
+    }
+
+    private static let actionBezelColor: NSColor = {
+        let color = AccessibleActionPalette.gradientStops(for: .light)[1]
+        return NSColor(
+            srgbRed: CGFloat(color.red),
+            green: CGFloat(color.green),
+            blue: CGFloat(color.blue),
+            alpha: 1
+        )
+    }()
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var action: @MainActor () -> Void
+
+        init(action: @escaping @MainActor () -> Void) {
+            self.action = action
+        }
+
+        @objc func activate(_ sender: NSButton) {
+            action()
         }
     }
 }

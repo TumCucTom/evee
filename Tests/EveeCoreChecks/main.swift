@@ -439,17 +439,47 @@ private func checkOnboardingActionAccessibility() throws {
     }
 
     let actionSource = String(source[actionStart..<actionEnd])
-    guard let representationStart = actionSource.range(of: ".accessibilityRepresentation {")?.lowerBound else {
-        throw CoreCheckError.assertionFailed("model action does not provide an accessibility representation")
+    guard actionSource.contains("NativeOnboardingActionButton("),
+          actionSource.contains("title: presentation.modelActionTitle ?? \"Download\""),
+          actionSource.contains("accessibilityLabel: presentation.modelAccessibilityLabel"),
+          actionSource.contains("accessibilityHelp: presentation.modelAccessibilityHint"),
+          actionSource.contains("isEnabled: store.microphonePermissionGranted && store.accessibilityPermissionGranted"),
+          actionSource.contains("action: activateModelAction"),
+          actionSource.contains(".focused($focusedTarget, equals: .modelAction)"),
+          actionSource.contains("store.startModelDownload()"),
+          actionSource.contains("store.cancelModelDownload()"),
+          !actionSource.contains(".accessibilityRepresentation") else {
+        throw CoreCheckError.assertionFailed("model action is not hosted by the native AppKit button")
     }
-    let representationSource = String(actionSource[representationStart...])
-    guard representationSource.contains("Button(presentation.modelActionTitle ?? \"Download\", action: activateModelAction)"),
-          representationSource.contains(".accessibilityLabel(presentation.modelAccessibilityLabel)"),
-          representationSource.contains("Text(presentation.modelAccessibilityValue ?? \"\")"),
-          representationSource.contains(".accessibilityLabel(\"Local model download status\")"),
-          !actionSource.contains(".accessibilityValue(") else {
+
+    guard source.contains("Text(presentation.modelAccessibilityValue ?? \"\")"),
+          source.contains(".accessibilityLabel(\"Local model download status\")") else {
+        throw CoreCheckError.assertionFailed("model action does not preserve a separate named download status")
+    }
+
+    guard let bridgeStart = source.range(
+        of: "private struct NativeOnboardingActionButton: NSViewRepresentable {"
+    )?.lowerBound else {
+        throw CoreCheckError.assertionFailed("native onboarding action bridge is missing")
+    }
+    let bridgeSource = String(source[bridgeStart...])
+    let updateCallCount = bridgeSource.components(
+        separatedBy: "configure(button, coordinator: context.coordinator)"
+    ).count - 1
+    guard bridgeSource.contains("func makeNSView(context: Context) -> NSButton"),
+          bridgeSource.contains("func updateNSView(_ button: NSButton, context: Context)"),
+          updateCallCount == 2,
+          bridgeSource.contains("button.title = title"),
+          bridgeSource.contains("button.setAccessibilityLabel(accessibilityLabel)"),
+          bridgeSource.contains("button.setAccessibilityHelp(accessibilityHelp)"),
+          bridgeSource.contains("button.isEnabled = isEnabled"),
+          bridgeSource.contains("coordinator.action = action"),
+          bridgeSource.contains("let action: @MainActor () -> Void"),
+          bridgeSource.contains("action: #selector(Coordinator.activate(_:))"),
+          bridgeSource.contains("@objc func activate(_ sender: NSButton)"),
+          bridgeSource.contains("action()") else {
         throw CoreCheckError.assertionFailed(
-            "model action does not preserve a named native button and separate download status"
+            "native onboarding action does not update its title, accessibility metadata, enabled state, and MainActor action"
         )
     }
     print("onboarding-action-accessibility: passed")
