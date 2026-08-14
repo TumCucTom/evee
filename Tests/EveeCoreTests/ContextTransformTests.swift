@@ -2,6 +2,26 @@ import XCTest
 @testable import EveeCore
 
 final class ContextTransformTests: XCTestCase {
+    func testOrdinaryDictationWithoutRetentionCollectsOnlyDeliveryIdentity() {
+        let policy = ContextCollectionPolicy.ordinaryDictation(
+            retainMetadata: false,
+            captureVisibleText: false
+        )
+
+        XCTAssertTrue(policy.collectsDeliveryIdentity)
+        XCTAssertFalse(policy.collectsSelectedText)
+        XCTAssertFalse(policy.collectsWindowMetadata)
+        XCTAssertFalse(policy.collectsWebAndFileMetadata)
+        XCTAssertFalse(policy.collectsRecipientMetadata)
+        XCTAssertFalse(policy.collectsVisibleText)
+    }
+
+    func testSelectionTransformationAlwaysCollectsSelectedText() {
+        let policy = ContextCollectionPolicy.selectionTransformation(retainMetadata: false)
+
+        XCTAssertTrue(policy.collectsSelectedText)
+    }
+
     func testWorkspaceContextRoundTripsWithSelection() throws {
         let record = WorkspaceRecord(
             kind: .dictation,
@@ -62,8 +82,8 @@ final class ContextTransformTests: XCTestCase {
             "• alpha\n• beta\n• gamma"
         )
         XCTAssertEqual(
-            try pipeline.transform(selectedText: "Send to Alice", instruction: "replace Alice with Bob"),
-            "Send to Bob"
+            try pipeline.transform(selectedText: "Alice met ALICE", instruction: "replace Alice with Bob"),
+            "Bob met Bob"
         )
     }
 
@@ -76,5 +96,9 @@ final class ContextTransformTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? SelectionTransformError, .unsupportedInstruction)
         }
+        XCTAssertEqual(
+            SelectionTransformPipeline.supportedCommandSummary,
+            "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and replace … with … (case-insensitive, all matches)"
+        )
     }
 }

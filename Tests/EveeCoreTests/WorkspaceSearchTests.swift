@@ -1,7 +1,99 @@
 import XCTest
+import SQLite3
 @testable import EveeCore
 
 final class WorkspaceSearchTests: XCTestCase {
+    func testSearchResultsCoverEveryCanonicalTextProjectionAndReturnMatchingSnippets() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let segmentID = UUID()
+        let meeting = WorkspaceRecord(
+            kind: .meeting,
+            title: "TitularQuasar",
+            text: "FinishedNebula",
+            rawText: "RetainedComet",
+            sourceApplication: "SourcePulsar",
+            segments: [.init(
+                id: segmentID,
+                start: 0,
+                end: 2,
+                speaker: "Facilitator",
+                text: "SegmentMeteor"
+            )],
+            meetingIntelligence: .init(
+                summary: ["SummaryOrbit"],
+                decisions: [.init(kind: .decision, text: "DecisionGalaxy")],
+                actionItems: [.init(kind: .actionItem, text: "ActionCosmos", assignee: "OwnerSatellite", dueText: "DueSolstice")],
+                topics: [.init(title: "TopicAsteroid", start: 0, end: 2, sourceSegmentIDs: [segmentID])]
+            ),
+            notes: "NotesZenith",
+            tags: ["TagAurora"],
+            context: .init(
+                bundleIdentifier: "test.context.bundle",
+                applicationName: "ContextNova",
+                windowTitle: "Project Atlas",
+                document: "DocumentEquinox",
+                focusedRole: "RoleApogee",
+                selectedText: "SelectionHorizon",
+                url: "https://example.test/UrlEclipse",
+                codeFile: "CodePerigee.swift",
+                recipient: "RecipientLunar",
+                visibleText: "VisiblePhoton"
+            )
+        )
+        let memo = WorkspaceRecord(
+            kind: .memo,
+            title: "Memo",
+            text: "Ordinary body",
+            memoIntelligence: .init(
+                title: "MemoSupernova",
+                highlights: ["HighlightRadiance"],
+                actionItems: ["MemoActionGravity"]
+            )
+        )
+        try await store.upsert(meeting)
+        try await store.upsert(memo)
+
+        let meetingTerms = [
+            "TitularQuasar", "FinishedNebula", "RetainedComet", "SourcePulsar",
+            "Facilitator", "SegmentMeteor", "SummaryOrbit", "DecisionGalaxy",
+            "ActionCosmos", "OwnerSatellite", "DueSolstice", "TopicAsteroid",
+            "NotesZenith", "TagAurora", "ContextNova", "Project Atlas",
+            "DocumentEquinox", "RoleApogee", "SelectionHorizon", "UrlEclipse",
+            "CodePerigee", "RecipientLunar", "VisiblePhoton",
+        ]
+        for term in meetingTerms {
+            let results = try await store.searchResults(term, kind: .meeting)
+            XCTAssertEqual(results.first?.record.id, meeting.id, "missing indexed field for \(term)")
+            XCTAssertEqual(results.first?.snippet.localizedCaseInsensitiveContains(term), true, "missing indexed snippet for \(term)")
+        }
+
+        for term in ["MemoSupernova", "HighlightRadiance", "MemoActionGravity"] {
+            let results = try await store.searchResults(term, kind: .memo)
+            XCTAssertEqual(results.first?.record.id, memo.id, "missing memo insight field for \(term)")
+            XCTAssertEqual(results.first?.snippet.localizedCaseInsensitiveContains(term), true, "missing memo snippet for \(term)")
+        }
+    }
+
+    func testMatchingHitsThrowsWhenSQLiteStepFails() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("index.sqlite3")
+        var shouldFail = true
+        let index = try WorkspaceSearchIndex(url: url) { statement in
+            if shouldFail {
+                shouldFail = false
+                return SQLITE_IOERR
+            }
+            return sqlite3_step(statement)
+        }
+        try index.rebuild(records: [WorkspaceRecord(kind: .memo, title: "Step", text: "text")])
+
+        XCTAssertThrowsError(try index.matchingHits(query: "text", kind: nil, limit: 20))
+    }
+
     func testFTSSearchFindsDiacriticsAndRanksTitleMatch() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let store = LibraryStore(rootURL: root)
@@ -34,6 +126,39 @@ final class WorkspaceSearchTests: XCTestCase {
         XCTAssertTrue(obsoleteResults.isEmpty)
         XCTAssertEqual(updatedResults.map(\.id), [record.id])
         try? FileManager.default.removeItem(at: root)
+    }
+
+    func testFTSProjectionRefreshesAfterMeetingSpeakerRelabel() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(rootURL: root)
+        let segmentID = UUID()
+        let original = WorkspaceRecord(
+            kind: .meeting,
+            title: "Planning",
+            text: "Participant 1: First statement",
+            segments: [TranscriptSegment(
+                id: segmentID,
+                start: 0,
+                end: 4,
+                speaker: "Participant 1",
+                text: "First statement",
+                attribution: .diarized
+            )]
+        )
+        try await store.upsert(original)
+
+        let changed = try MeetingRecordProjection().relabel(
+            record: original,
+            segmentID: segmentID,
+            label: "Facilitator"
+        )
+        try await store.upsert(changed)
+
+        let newLabelResults = try await store.search("Facilitator")
+        let oldLabelResults = try await store.search("Participant 1")
+        XCTAssertEqual(newLabelResults.map(\.id), [original.id])
+        XCTAssertTrue(oldLabelResults.isEmpty)
     }
 
     func testIndexFileUsesOwnerOnlyPermissions() async throws {

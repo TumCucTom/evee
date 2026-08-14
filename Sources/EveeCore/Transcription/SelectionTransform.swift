@@ -12,7 +12,7 @@ public enum SelectionTransformError: LocalizedError, Equatable {
         case .emptyInstruction:
             "Evee did not hear a transform instruction. The selected text was not changed."
         case .unsupportedInstruction:
-            "That instruction needs a generative language model, which this local build does not configure. Try concise, clean up, uppercase, lowercase, title case, bullets, numbered list, or ‘replace … with …’."
+            "That instruction is unsupported in this deterministic build. Supported commands: \(SelectionTransformPipeline.supportedCommandSummary). The selected text was not changed."
         }
     }
 }
@@ -21,6 +21,8 @@ public enum SelectionTransformError: LocalizedError, Equatable {
 /// pretend to support an open-ended AI rewrite: instructions outside this
 /// documented set fail without changing the user's selection.
 public struct SelectionTransformPipeline: Sendable {
+    public static let supportedCommandSummary = "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and replace … with … (case-insensitive, all matches)"
+
     private let cleanup = TextCleanupPipeline()
 
     public init() {}

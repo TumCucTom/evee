@@ -30,15 +30,25 @@ public final class MicrophoneRecorder: ObservableObject {
     private var file: AVAudioFile?
     private var outputURL: URL?
     private let bufferRelay = AudioBufferRelay()
+    private var levelMeter: MicrophoneLevelMeter?
 
     public init() {}
 
-    public func setBufferHandler(_ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?) {
+    public func setBufferHandler(_ handler: (@Sendable (CopiedAudioBuffer) -> Void)?) {
         bufferRelay.set(handler)
     }
 
     public static var isPermissionGranted: Bool {
-        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        authorizationState == .granted
+    }
+
+    public static var authorizationState: PermissionState {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined: .notDetermined
+        case .authorized: .granted
+        case .denied, .restricted: .denied
+        @unknown default: .denied
+        }
     }
 
     public func requestPermission() async -> Bool {
@@ -71,10 +81,13 @@ public final class MicrophoneRecorder: ObservableObject {
         guard format.sampleRate > 0, format.channelCount > 0 else { throw AudioCaptureError.invalidFormat }
 
         let output = try AVAudioFile(forWriting: url, settings: format.settings)
+        let levelMeter = MicrophoneLevelMeter { [weak self] level in self?.level = level }
+        levelMeter.start()
+        self.levelMeter = levelMeter
         writeErrors.reset()
         let writeErrors = self.writeErrors
         let bufferRelay = self.bufferRelay
-        input.installTap(onBus: 0, bufferSize: lowLatency ? 256 : 1_024, format: format) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: lowLatency ? 256 : 1_024, format: format) { buffer, _ in
             do {
                 try output.write(from: buffer)
             } catch {
@@ -86,7 +99,7 @@ public final class MicrophoneRecorder: ObservableObject {
             var sum: Float = 0
             for index in 0..<count { sum += channel[index] * channel[index] }
             let rms = sqrt(sum / Float(count))
-            Task { @MainActor in self?.level = min(1, rms * 14) }
+            levelMeter.offer(min(1, rms * 14))
             bufferRelay.publishCopy(of: buffer)
         }
 
@@ -99,19 +112,23 @@ public final class MicrophoneRecorder: ObservableObject {
         } catch {
             input.removeTap(onBus: 0)
             engine.stop()
+            await levelMeter.cancel()
+            self.levelMeter = nil
             try? FileManager.default.removeItem(at: url)
             throw error
         }
     }
 
-    public func stop() throws -> URL {
+    public func stop() async throws -> URL {
         guard isRecording, let outputURL else { throw AudioCaptureError.notRecording }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         file = nil
         self.outputURL = nil
-        level = 0
         isRecording = false
+        if let levelMeter { await levelMeter.finish() }
+        self.levelMeter = nil
+        level = 0
         if let writeError = writeErrors.take() {
             throw AudioCaptureError.writeFailed(writeError.localizedDescription)
         }

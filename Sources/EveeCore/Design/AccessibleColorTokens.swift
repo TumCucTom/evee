@@ -1,0 +1,53 @@
+import Foundation
+
+public struct RGBColor: Equatable, Sendable {
+    public let red: Double
+    public let green: Double
+    public let blue: Double
+
+    public init(red: Double, green: Double, blue: Double) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    public var relativeLuminance: Double {
+        func linear(_ component: Double) -> Double {
+            component <= 0.03928
+                ? component / 12.92
+                : pow((component + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    public func contrastRatio(with other: RGBColor) -> Double {
+        let high = max(relativeLuminance, other.relativeLuminance)
+        let low = min(relativeLuminance, other.relativeLuminance)
+        return (high + 0.05) / (low + 0.05)
+    }
+}
+
+public enum InterfaceAppearance: CaseIterable, Sendable {
+    case light
+    case dark
+}
+
+public enum AccessibleActionPalette {
+    private static let magenta = RGBColor(red: 0.714, green: 0.102, blue: 0.835)
+    private static let violet = RGBColor(red: 0.486, green: 0.141, blue: 0.882)
+    private static let electric = RGBColor(red: 0.098, green: 0.220, blue: 0.953)
+    private static let lightPaper = RGBColor(red: 0.980, green: 0.980, blue: 1)
+    private static let darkPaper = RGBColor(red: 0.055, green: 0.052, blue: 0.075)
+
+    public static func gradientStops(for appearance: InterfaceAppearance) -> [RGBColor] {
+        _ = appearance
+        return [magenta, violet, electric]
+    }
+
+    public static func paper(for appearance: InterfaceAppearance) -> RGBColor {
+        appearance == .dark ? darkPaper : lightPaper
+    }
+
+    public static let foreground = RGBColor(red: 1, green: 1, blue: 1)
+    public static let disabledBorder = RGBColor(red: 0.365, green: 0.373, blue: 0.937)
+}

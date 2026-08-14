@@ -52,10 +52,30 @@ public struct WorkspaceContext: Codable, Hashable, Sendable {
     }
 }
 
-public enum AudioTrackRole: String, Codable, CaseIterable, Sendable {
+public enum AudioTrackRole: String, Codable, CaseIterable, Hashable, Sendable {
     case microphone
     case system
     case mixed
+}
+
+public struct RecoveryTrackAssessment: Identifiable, Equatable, Sendable {
+    public let track: WorkspaceAudioTrack
+    public let isValid: Bool
+    public let failureReason: String?
+
+    public init(track: WorkspaceAudioTrack, isValid: Bool, failureReason: String? = nil) {
+        self.track = track
+        self.isValid = isValid
+        self.failureReason = failureReason
+    }
+
+    public var id: UUID { track.id }
+    public var role: AudioTrackRole { track.role }
+}
+
+public enum RecoveryTrackSelection: Equatable, Sendable {
+    case allValid
+    case roles(Set<AudioTrackRole>)
 }
 
 public struct WorkspaceAudioTrack: Identifiable, Codable, Hashable, Sendable {
@@ -136,10 +156,75 @@ public struct MeetingDraft: Codable, Equatable, Sendable {
     }
 }
 
+public struct RecoveredLibraryLoad<Value: Sendable>: Sendable {
+    public let value: Value
+    public let preservedCorruptURL: URL?
+    public let manualRecoveryWarning: String?
+
+    public init(
+        value: Value,
+        preservedCorruptURL: URL? = nil,
+        manualRecoveryWarning: String? = nil
+    ) {
+        self.value = value
+        self.preservedCorruptURL = preservedCorruptURL
+        self.manualRecoveryWarning = manualRecoveryWarning
+    }
+}
+
+/// Durable evidence that unreadable record metadata was preserved. While this
+/// marker exists, record-audio cleanup is disabled until the user explicitly
+/// resets metadata protection.
+public struct RecordsQuarantineMarker: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable {
+        case pending
+        case complete
+    }
+
+    public let markerVersion: Int
+    public let phase: Phase
+    public let preservedCorruptRelativePath: String?
+    public let reason: String
+    public let createdAt: Date
+
+    public init(
+        markerVersion: Int = 2,
+        phase: Phase,
+        preservedCorruptRelativePath: String? = nil,
+        reason: String,
+        createdAt: Date = .now
+    ) {
+        self.markerVersion = markerVersion
+        self.phase = phase
+        self.preservedCorruptRelativePath = preservedCorruptRelativePath
+        self.reason = reason
+        self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case markerVersion
+        case phase
+        case preservedCorruptRelativePath
+        case reason
+        case createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        markerVersion = try container.decodeIfPresent(Int.self, forKey: .markerVersion) ?? 1
+        preservedCorruptRelativePath = try container.decodeIfPresent(String.self, forKey: .preservedCorruptRelativePath)
+        phase = try container.decodeIfPresent(Phase.self, forKey: .phase)
+            ?? (preservedCorruptRelativePath == nil ? .pending : .complete)
+        reason = try container.decode(String.self, forKey: .reason)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+    }
+}
+
 public enum WebhookDeliveryState: String, Codable, Sendable {
     case pending
     case delivered
     case failed
+    case cancelled
 }
 
 public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
@@ -154,6 +239,7 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
     public var payloadBody: Data?
     public var retryable: Bool
     public var nextAttemptAt: Date?
+    public var requiresExplicitReplacement: Bool
 
     public init(
         id: UUID = UUID(),
@@ -166,7 +252,8 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         lastError: String? = nil,
         payloadBody: Data? = nil,
         retryable: Bool = true,
-        nextAttemptAt: Date? = nil
+        nextAttemptAt: Date? = nil,
+        requiresExplicitReplacement: Bool = false
     ) {
         self.id = id
         self.destination = destination
@@ -179,11 +266,12 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         self.payloadBody = payloadBody
         self.retryable = retryable
         self.nextAttemptAt = nextAttemptAt
+        self.requiresExplicitReplacement = requiresExplicitReplacement
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, destination, state, attemptCount, lastAttemptAt, deliveredAt, responseStatusCode, lastError
-        case payloadBody, retryable, nextAttemptAt
+        case payloadBody, retryable, nextAttemptAt, requiresExplicitReplacement
     }
 
     public init(from decoder: Decoder) throws {
@@ -199,6 +287,7 @@ public struct WebhookDelivery: Identifiable, Codable, Hashable, Sendable {
         payloadBody = try values.decodeIfPresent(Data.self, forKey: .payloadBody)
         retryable = try values.decodeIfPresent(Bool.self, forKey: .retryable) ?? true
         nextAttemptAt = try values.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
+        requiresExplicitReplacement = try values.decodeIfPresent(Bool.self, forKey: .requiresExplicitReplacement) ?? false
     }
 }
 
@@ -210,6 +299,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
     public var text: String
     public var channel: AudioTrackRole?
     public var attribution: SpeakerAttribution
+    public var diarizationClusterID: String?
     public var confidence: Float?
     public var timingSource: TranscriptTimingSource
 
@@ -221,6 +311,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         text: String,
         channel: AudioTrackRole? = nil,
         attribution: SpeakerAttribution = .unknown,
+        diarizationClusterID: String? = nil,
         confidence: Float? = nil,
         timingSource: TranscriptTimingSource = .trackEstimate
     ) {
@@ -231,12 +322,13 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         self.text = text
         self.channel = channel
         self.attribution = attribution
+        self.diarizationClusterID = diarizationClusterID
         self.confidence = confidence
         self.timingSource = timingSource
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, start, end, speaker, text, channel, attribution, confidence, timingSource
+        case id, start, end, speaker, text, channel, attribution, diarizationClusterID, confidence, timingSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -248,6 +340,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         text = try values.decode(String.self, forKey: .text)
         channel = try values.decodeIfPresent(AudioTrackRole.self, forKey: .channel)
         attribution = try values.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution) ?? .unknown
+        diarizationClusterID = try values.decodeIfPresent(String.self, forKey: .diarizationClusterID)
         confidence = try values.decodeIfPresent(Float.self, forKey: .confidence)
         timingSource = try values.decodeIfPresent(TranscriptTimingSource.self, forKey: .timingSource) ?? .trackEstimate
     }
@@ -347,6 +440,16 @@ public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {
         recoverySourceID = try values.decodeIfPresent(UUID.self, forKey: .recoverySourceID)
         operation = try values.decodeIfPresent(WorkspaceRecordOperation.self, forKey: .operation) ?? .capture
         context = try values.decodeIfPresent(WorkspaceContext.self, forKey: .context)
+    }
+}
+
+public struct WorkspaceSearchResult: Sendable {
+    public let record: WorkspaceRecord
+    public let snippet: String
+
+    public init(record: WorkspaceRecord, snippet: String) {
+        self.record = record
+        self.snippet = snippet
     }
 }
 
@@ -483,6 +586,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var meetingDiarizationEnabled = false
     public var liveMeetingTranscriptionEnabled = true
     public var localAPIEnabled = false
+    public var mcpEnabled = false
     public var localAPIPort: UInt16 = 4739
     public var webhookURL = ""
     /// Only populated while decoding settings written by older Evee builds. New
@@ -506,14 +610,21 @@ public struct EveeSettings: Codable, Equatable, Sendable {
     public var historyRetentionDays = 0
     public var dictionary: [DictionaryTerm] = []
     public var appStyles: [AppWritingStyle] = []
+    public var meetingSuggestionsEnabled = false
+    public var meetingSuggestionNativeBundleIdentifiers: [String] = []
+    public var meetingSuggestionBrowserBundleIdentifiers: [String] = []
+    public var meetingSuggestionBrowserTitleTerms: [String] = []
+    public var meetingSuggestionDismissedUntilByBundleIdentifier: [String: Date] = [:]
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
         case model, languageCode, retainDictationAudio, retainMemoAudio, retainMeetingAudio, meetingCaptureEnabled, meetingDiarizationEnabled, liveMeetingTranscriptionEnabled
-        case localAPIEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
+        case localAPIEnabled, mcpEnabled, localAPIPort, webhookURL, webhookSecret, defaultTone, dictionary, appStyles
         case textDeliveryMode, retainContextMetadata, retainSelectedText, captureVisibleContext, audioCuesEnabled, hotMicEnabled, wakePhrase
         case inputDeviceUID, lowLatencyMode, emailFormattingMode, emailSignOff, learnCorrections, smartLinks, historyRetentionDays
+        case meetingSuggestionsEnabled, meetingSuggestionNativeBundleIdentifiers, meetingSuggestionBrowserBundleIdentifiers
+        case meetingSuggestionBrowserTitleTerms, meetingSuggestionDismissedUntilByBundleIdentifier
     }
 
     public init(from decoder: Decoder) throws {
@@ -527,6 +638,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         meetingDiarizationEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingDiarizationEnabled) ?? false
         liveMeetingTranscriptionEnabled = try values.decodeIfPresent(Bool.self, forKey: .liveMeetingTranscriptionEnabled) ?? true
         localAPIEnabled = try values.decodeIfPresent(Bool.self, forKey: .localAPIEnabled) ?? false
+        mcpEnabled = try values.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? false
         localAPIPort = try values.decodeIfPresent(UInt16.self, forKey: .localAPIPort) ?? 4_739
         webhookURL = try values.decodeIfPresent(String.self, forKey: .webhookURL) ?? ""
         webhookSecret = try values.decodeIfPresent(String.self, forKey: .webhookSecret) ?? ""
@@ -547,6 +659,11 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         historyRetentionDays = try values.decodeIfPresent(Int.self, forKey: .historyRetentionDays) ?? 0
         dictionary = try values.decodeIfPresent([DictionaryTerm].self, forKey: .dictionary) ?? []
         appStyles = try values.decodeIfPresent([AppWritingStyle].self, forKey: .appStyles) ?? []
+        meetingSuggestionsEnabled = try values.decodeIfPresent(Bool.self, forKey: .meetingSuggestionsEnabled) ?? false
+        meetingSuggestionNativeBundleIdentifiers = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionNativeBundleIdentifiers) ?? []
+        meetingSuggestionBrowserBundleIdentifiers = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionBrowserBundleIdentifiers) ?? []
+        meetingSuggestionBrowserTitleTerms = try values.decodeIfPresent([String].self, forKey: .meetingSuggestionBrowserTitleTerms) ?? []
+        meetingSuggestionDismissedUntilByBundleIdentifier = try values.decodeIfPresent([String: Date].self, forKey: .meetingSuggestionDismissedUntilByBundleIdentifier) ?? [:]
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -560,6 +677,7 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(meetingDiarizationEnabled, forKey: .meetingDiarizationEnabled)
         try values.encode(liveMeetingTranscriptionEnabled, forKey: .liveMeetingTranscriptionEnabled)
         try values.encode(localAPIEnabled, forKey: .localAPIEnabled)
+        try values.encode(mcpEnabled, forKey: .mcpEnabled)
         try values.encode(localAPIPort, forKey: .localAPIPort)
         try values.encode(webhookURL, forKey: .webhookURL)
         try values.encode(defaultTone, forKey: .defaultTone)
@@ -579,6 +697,11 @@ public struct EveeSettings: Codable, Equatable, Sendable {
         try values.encode(historyRetentionDays, forKey: .historyRetentionDays)
         try values.encode(dictionary, forKey: .dictionary)
         try values.encode(appStyles, forKey: .appStyles)
+        try values.encode(meetingSuggestionsEnabled, forKey: .meetingSuggestionsEnabled)
+        try values.encode(meetingSuggestionNativeBundleIdentifiers, forKey: .meetingSuggestionNativeBundleIdentifiers)
+        try values.encode(meetingSuggestionBrowserBundleIdentifiers, forKey: .meetingSuggestionBrowserBundleIdentifiers)
+        try values.encode(meetingSuggestionBrowserTitleTerms, forKey: .meetingSuggestionBrowserTitleTerms)
+        try values.encode(meetingSuggestionDismissedUntilByBundleIdentifier, forKey: .meetingSuggestionDismissedUntilByBundleIdentifier)
         // webhookSecret is deliberately omitted. It exists in CodingKeys only so
         // a one-time migration can read settings produced by older versions.
     }
@@ -590,5 +713,15 @@ public enum CaptureState: Equatable, Sendable {
     case recording(startedAt: Date, level: Float)
     case transcribing
     case delivering
+    case checkpointed(String)
     case failed(String)
+
+    public func protectedForTerminationFailure(_ message: String) -> CaptureState {
+        switch self {
+        case .starting, .recording, .transcribing, .delivering:
+            .checkpointed(message)
+        case .idle, .checkpointed, .failed:
+            self
+        }
+    }
 }

@@ -45,13 +45,56 @@ public enum WebhookPayloadError: LocalizedError, Sendable {
     case empty
     case tooLarge
     case invalidJSON
+    case invalidMeeting
+    case unsupportedSchema
 
     public var errorDescription: String? {
         switch self {
         case .empty: "The webhook payload is empty."
         case .tooLarge: "The webhook payload is too large to queue safely."
         case .invalidJSON: "The webhook payload is not valid JSON."
+        case .invalidMeeting: "Only meeting records can be delivered to the meeting webhook."
+        case .unsupportedSchema: "The queued webhook payload uses an unsupported schema and must be retried explicitly."
         }
+    }
+}
+
+/// The complete and intentionally narrow wire contract for meeting webhooks.
+/// Persistence-only fields must never be added implicitly by encoding a
+/// `WorkspaceRecord` at this boundary.
+public struct MeetingWebhookPayload: Codable, Equatable, Sendable {
+    public static let schemaIdentifier = "evee.meeting.completed"
+    public static let currentVersion = 1
+
+    public let schema: String
+    public let version: Int
+    public let meetingID: UUID
+    public let createdAt: Date
+    public let updatedAt: Date
+    public let title: String
+    public let transcript: String
+    public let sourceApplication: String?
+    public let duration: TimeInterval?
+    public let segments: [TranscriptSegment]
+    public let meetingIntelligence: MeetingIntelligence?
+    public let notes: String
+    public let tags: [String]
+
+    public init(record: WorkspaceRecord) throws {
+        guard record.kind == .meeting else { throw WebhookPayloadError.invalidMeeting }
+        schema = Self.schemaIdentifier
+        version = Self.currentVersion
+        meetingID = record.id
+        createdAt = record.createdAt
+        updatedAt = record.updatedAt
+        title = record.title
+        transcript = record.text
+        sourceApplication = record.sourceApplication
+        duration = record.duration
+        segments = record.segments
+        meetingIntelligence = record.meetingIntelligence
+        notes = record.notes
+        tags = record.tags
     }
 }
 
@@ -70,6 +113,7 @@ public enum WebhookEndpointPolicy {
 
 public struct MeetingWebhook: Sendable {
     public static let maximumPayloadSize = 10 * 1_024 * 1_024
+    public static let eventName = "meeting.completed"
     private let session: URLSession
 
     public init(session: URLSession = .shared) {
@@ -100,6 +144,7 @@ public struct MeetingWebhook: Sendable {
             body = try Self.payload(for: record)
         }
         try Self.validatePayload(body)
+        guard Self.isCurrentPayload(body) else { throw WebhookPayloadError.unsupportedSchema }
         let attempts = max(1, min(maxAttempts, 5))
         var delivery = WebhookDelivery(
             id: deliveryID,
@@ -119,13 +164,20 @@ public struct MeetingWebhook: Sendable {
                 request.timeoutInterval = 15
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.setValue("application/json", forHTTPHeaderField: "Accept")
-                request.setValue("meeting.completed", forHTTPHeaderField: "X-Evee-Event")
+                request.setValue(Self.eventName, forHTTPHeaderField: "X-Evee-Event")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "X-Evee-Delivery-ID")
                 request.setValue(deliveryID.uuidString, forHTTPHeaderField: "Idempotency-Key")
-                request.setValue(ISO8601DateFormatter().string(from: attemptDate), forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
+                let timestamp = ISO8601DateFormatter().string(from: attemptDate)
+                request.setValue(timestamp, forHTTPHeaderField: "X-Evee-Delivery-Timestamp")
 
                 if !secret.isEmpty {
-                    request.setValue(Self.signature(for: body, secret: secret), forHTTPHeaderField: "X-Evee-Signature-256")
+                    request.setValue(Self.signature(
+                        body: body,
+                        secret: secret,
+                        event: Self.eventName,
+                        deliveryID: deliveryID,
+                        timestamp: timestamp
+                    ), forHTTPHeaderField: "X-Evee-Signature-256")
                 }
 
                 let (_, response) = try await session.data(for: request, delegate: SafeWebhookRedirectDelegate())
@@ -185,13 +237,61 @@ public struct MeetingWebhook: Sendable {
         return Data(signature).map { String(format: "%02x", $0) }.joined()
     }
 
+    public static func signature(
+        body: Data,
+        secret: String,
+        event: String,
+        deliveryID: UUID,
+        timestamp: String
+    ) -> String {
+        let input = canonicalSignatureInput(
+            body: body,
+            event: event,
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        )
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let signature = HMAC<SHA256>.authenticationCode(for: input, using: key)
+        return Data(signature).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func canonicalSignatureInput(
+        body: Data,
+        event: String,
+        deliveryID: UUID,
+        timestamp: String
+    ) -> Data {
+        let bodyDigest = SHA256.hash(data: body)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let fields = [
+            ("event", event),
+            ("timestamp", timestamp),
+            ("delivery-id", deliveryID.uuidString),
+            ("body-sha256", bodyDigest),
+        ]
+        var input = Data("evee-webhook-v1\n".utf8)
+        for (name, value) in fields {
+            input.append(Data("\(name):\(value.utf8.count)\n".utf8))
+            input.append(Data(value.utf8))
+            input.append(0x0A)
+        }
+        return input
+    }
+
     public static func payload(for record: WorkspaceRecord) throws -> Data {
-        var stable = record
-        stable.webhookDeliveries = []
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(stable)
+        return try encoder.encode(MeetingWebhookPayload(record: record))
+    }
+
+    public static func isCurrentPayload(_ body: Data) -> Bool {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let payload = try? decoder.decode(MeetingWebhookPayload.self, from: body) else { return false }
+        return payload.schema == MeetingWebhookPayload.schemaIdentifier
+            && payload.version == MeetingWebhookPayload.currentVersion
     }
 
     public static func validatePayload(_ body: Data) throws {

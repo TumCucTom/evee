@@ -51,7 +51,16 @@ final class WorkspaceIntelligenceRuntime {
                 ? frontmostWindowTitle(processIdentifier: processIdentifier)
                 : nil
             let accessibilityContext = preferences.includeWebAddresses == true || preferences.includeFocusedText == true
-                ? TextDelivery.frontmostApplication(includeVisibleText: preferences.includeFocusedText == true)?.focusedTarget
+                ? TextDelivery.frontmostApplication(
+                    policy: ContextCollectionPolicy(
+                        collectsDeliveryIdentity: true,
+                        collectsSelectedText: preferences.includeFocusedText == true,
+                        collectsWindowMetadata: false,
+                        collectsWebAndFileMetadata: preferences.includeWebAddresses == true,
+                        collectsRecipientMetadata: false,
+                        collectsVisibleText: preferences.includeFocusedText == true
+                    )
+                )?.focusedTarget
                 : nil
             let webAddress = preferences.includeWebAddresses == true ? accessibilityContext?.url : nil
             let observation = WorkspaceApplicationObservation(
@@ -122,16 +131,33 @@ struct WorkspaceIntelligencePrivacyView: View {
             }
             .disabled(!preferences.isEnabled)
 
-            HStack {
-                Button("Save activity privacy settings") { Task { await save() } }
-                Button("Delete activity data", role: .destructive) { showingPurgeConfirmation = true }
-                if let status { Text(status).font(.caption).foregroundStyle(.secondary) }
+            ViewThatFits(in: .horizontal) {
+                HStack { activityActions }
+                VStack(alignment: .leading, spacing: 8) { activityActions }
             }
         }
         .task { await load() }
         .confirmationDialog("Delete all stored activity and journal data?", isPresented: $showingPurgeConfirmation) {
             Button("Delete activity data", role: .destructive) { Task { await purge() } }
+                .accessibilityLabel(AccessibilityCopy.deleteActivityData)
+                .accessibilityHint("Permanently deletes all locally stored activity observations and generated journal entries.")
             Button("Cancel", role: .cancel) {}
+                .accessibilityLabel("Cancel activity data deletion")
+        }
+    }
+
+    @ViewBuilder
+    private var activityActions: some View {
+        Button("Save activity privacy settings") { Task { await save() } }
+            .accessibilityLabel("Save local activity privacy settings")
+        Button("Delete activity data", role: .destructive) { showingPurgeConfirmation = true }
+            .accessibilityLabel(AccessibilityCopy.deleteActivityData)
+            .accessibilityHint("Shows a confirmation before permanently deleting local activity data.")
+        if let status {
+            Text(status)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Activity privacy status: \(status)")
         }
     }
 

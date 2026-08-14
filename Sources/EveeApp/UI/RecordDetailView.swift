@@ -9,6 +9,8 @@ struct RecordDetailView: View {
     @State private var confirmDelete = false
     @State private var selectedAudioPath = ""
     @State private var audioStatusMessage: String?
+    @State private var speakerLabelDrafts: [UUID: MeetingSpeakerLabelDraft] = [:]
+    @FocusState private var focusedSpeakerLabelID: UUID?
 
     init(record: WorkspaceRecord) { _draft = State(initialValue: record) }
 
@@ -27,13 +29,17 @@ struct RecordDetailView: View {
                     } label: { Label("Copy", systemImage: "doc.on.doc") }
                     .buttonStyle(.bordered)
                     .help("Copy the finished text")
-                    Button("Save") { Task { await store.update(draft) } }
+                    .accessibilityLabel("Copy \(draft.kind.rawValue) text")
+                    .accessibilityHint("Copies the finished text to the clipboard.")
+                    Button("Save", action: saveRecord)
                         .buttonStyle(AlphaButtonStyle())
                         .keyboardShortcut("s", modifiers: .command)
+                        .accessibilityLabel("Save changes to \(draft.kind.rawValue) \(draft.title)")
                     Button(role: .destructive) { confirmDelete = true } label: { Image(systemName: "trash") }
                         .buttonStyle(.borderless)
                         .help("Delete this record")
-                        .accessibilityLabel("Delete \(draft.kind.rawValue)")
+                        .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
+                        .accessibilityHint("Shows a confirmation before deleting this record and retained audio.")
                 }
 
                 metadata
@@ -83,23 +89,38 @@ struct RecordDetailView: View {
                 }
 
                 if !draft.segments.isEmpty {
-                    section("Speaker timeline", subtitle: "Participant numbers are anonymous local speaker clusters, not identified people") {
+                    section("Speaker timeline", subtitle: "Relabelling rebuilds the transcript and meeting overview from these timed segments; participant numbers are anonymous local speaker clusters") {
                         VStack(alignment: .leading, spacing: 12) {
-                            ForEach($draft.segments) { $segment in
+                            ForEach(draft.segments) { segment in
                                 HStack(alignment: .top, spacing: 10) {
                                     Text(timestamp(segment.start))
                                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                         .foregroundStyle(.secondary)
                                         .frame(width: 44, alignment: .leading)
                                     VStack(alignment: .leading, spacing: 3) {
-                                        TextField("Speaker label", text: Binding(
-                                            get: { segment.speaker ?? "" },
-                                            set: { segment.speaker = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-                                        ))
-                                        .textFieldStyle(.plain)
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(AnimaTheme.violet)
-                                        .help("Correct this anonymous speaker label, then Save")
+                                        HStack(spacing: 6) {
+                                            TextField("Speaker label", text: speakerLabelDraftBinding(for: segment.id))
+                                                .textFieldStyle(.plain)
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(AnimaTheme.violet)
+                                                .focused($focusedSpeakerLabelID, equals: segment.id)
+                                                .onSubmit { commitSpeakerLabel(for: segment.id) }
+                                                .help("Correct this anonymous speaker label, then Save")
+                                                .accessibilityLabel(AccessibilityCopy.speakerLabel(start: segment.start, currentLabel: segment.speaker))
+                                                .accessibilityHint("Enter a consistent name for this anonymous speaker, then save the label or record.")
+                                            Button {
+                                                commitSpeakerLabel(for: segment.id)
+                                                if focusedSpeakerLabelID == segment.id { focusedSpeakerLabelID = nil }
+                                            } label: {
+                                                Label("Save Speaker Label", systemImage: "checkmark.circle")
+                                                    .labelStyle(.iconOnly)
+                                            }
+                                            .buttonStyle(.borderless)
+                                            .controlSize(.small)
+                                            .help("Apply this speaker label to the timed transcript")
+                                            .accessibilityLabel("Save Speaker Label")
+                                            .accessibilityHint("Rebuilds the transcript and meeting overview from this label without saving the record to disk.")
+                                        }
                                         if let provenance = segmentProvenance(segment) {
                                             Text(provenance)
                                                 .font(.system(size: 9, weight: .medium))
@@ -122,9 +143,14 @@ struct RecordDetailView: View {
         .background(AnimaTheme.paper)
         .id(draft.id)
         .onAppear(perform: selectInitialAudioTrack)
+        .onChange(of: focusedSpeakerLabelID) { previous, current in
+            guard let previous, previous != current else { return }
+            commitSpeakerLabel(for: previous)
+        }
         .onDisappear { audioPlayer.stop() }
         .confirmationDialog("Delete this \(draft.kind.rawValue)?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete permanently", role: .destructive) { Task { await store.delete(draft) } }
+                .accessibilityLabel(AccessibilityCopy.deleteRecord(kind: draft.kind, title: draft.title))
         } message: { Text("The local record and retained audio will be removed. This cannot be undone in Evee.") }
     }
 
@@ -142,6 +168,9 @@ struct RecordDetailView: View {
             }
             if !retainedAudioTracks.isEmpty {
                 Label("Audio retained", systemImage: "internaldrive")
+            }
+            if draft.tags.contains("Recovered from system audio") {
+                Label("Recovered from system audio", systemImage: "speaker.wave.2")
             }
         }
         .font(.caption)
@@ -339,6 +368,7 @@ struct RecordDetailView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(audioPlayer.loadedURL == nil)
+                    .accessibilityLabel(audioPlayer.isPlaying ? "Pause retained \(selectedAudioTrackName) audio" : "Play retained \(selectedAudioTrackName) audio")
                     .accessibilityHint(audioPlayer.isPlaying ? "Pauses retained audio" : "Plays retained audio")
 
                     Text(timestamp(audioPlayer.currentTime))
@@ -366,6 +396,8 @@ struct RecordDetailView: View {
                     .buttonStyle(.bordered)
                     .disabled(selectedAudioTrack == nil)
                     .help("Export the selected retained audio track")
+                    .accessibilityLabel(AccessibilityCopy.exportRetainedTrack(named: selectedAudioTrackName))
+                    .accessibilityHint("Opens a save panel for the selected local audio track.")
                 }
 
                 if let message = audioPlayer.errorMessage ?? audioStatusMessage {
@@ -386,9 +418,43 @@ struct RecordDetailView: View {
         }
     }
 
+    private var selectedAudioTrackName: String {
+        selectedAudioTrack.map { audioTrackTitle($0.role) } ?? "selected"
+    }
+
     private func timestamp(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
         return String(format: "%02d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private func speakerLabelDraftBinding(for segmentID: UUID) -> Binding<String> {
+        Binding(
+            get: {
+                speakerLabelDrafts[segmentID]?.text
+                    ?? draft.segments.first(where: { $0.id == segmentID })?.speaker
+                    ?? ""
+            },
+            set: { label in
+                speakerLabelDrafts[segmentID] = MeetingSpeakerLabelDraft(segmentID: segmentID, text: label)
+            }
+        )
+    }
+
+    private func commitSpeakerLabel(for segmentID: UUID) {
+        guard let labelDraft = speakerLabelDrafts.removeValue(forKey: segmentID) else { return }
+        do {
+            draft = try labelDraft.applying(to: draft)
+        } catch {
+            speakerLabelDrafts[segmentID] = labelDraft
+        }
+    }
+
+    private func saveRecord() {
+        for segmentID in speakerLabelDrafts.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            commitSpeakerLabel(for: segmentID)
+        }
+        let changed = draft
+        Task { await store.update(changed) }
     }
 
     private func selectInitialAudioTrack() {
@@ -430,16 +496,15 @@ struct RecordDetailView: View {
                 panel.prompt = "Export"
                 guard panel.runModal() == .OK, let destination = panel.url else { return }
 
+                let exportedTrack = audioTrackTitle(track.role).lowercased()
                 try await Task.detached(priority: .utility) {
-                    let manager = FileManager.default
-                    if manager.fileExists(atPath: destination.path) {
-                        try manager.removeItem(at: destination)
-                    }
-                    try manager.copyItem(at: source, to: destination)
+                    try await AtomicFileExporter().export(source: source, to: destination)
                 }.value
-                audioStatusMessage = "Exported \(audioTrackTitle(track.role).lowercased()) audio."
+                audioStatusMessage = "Exported \(exportedTrack) audio."
+                store.accessibilityAnnouncements.post(.audioExported(exportedTrack))
             } catch {
                 audioStatusMessage = "Export failed: \(error.localizedDescription)"
+                store.accessibilityAnnouncements.post(.audioExportFailed(error.localizedDescription))
             }
         }
     }

@@ -15,10 +15,14 @@ struct DictionaryView: View {
             HStack {
                 TextField("What it sounds like", text: $spoken)
                     .accessibilityLabel("Spoken form")
-                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                Image(systemName: "arrow.right").foregroundStyle(.secondary).accessibilityHidden(true)
                 TextField("How to write it", text: $replacement)
                     .accessibilityLabel("Written replacement")
-                Button("Add") { add() }.buttonStyle(AlphaButtonStyle()).disabled(spoken.isEmpty || replacement.isEmpty)
+                Button("Add") { add() }
+                    .buttonStyle(AlphaButtonStyle())
+                    .disabled(spoken.isEmpty || replacement.isEmpty)
+                    .accessibilityLabel("Add dictionary replacement")
+                    .accessibilityHint("Adds the spoken and written forms to Evee's local dictionary.")
             }.animaCard()
 
             if store.settings.dictionary.isEmpty {
@@ -26,10 +30,20 @@ struct DictionaryView: View {
             } else {
                 List {
                     ForEach(store.settings.dictionary) { term in
-                        HStack { Text(term.spoken); Spacer(); Image(systemName: "arrow.right").foregroundStyle(.tertiary); Text(term.replacement).fontWeight(.semibold) }
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel("Replace \(term.spoken) with \(term.replacement)")
-                    }.onDelete(perform: delete)
+                        HStack {
+                            Text(term.spoken)
+                            Spacer()
+                            Image(systemName: "arrow.right").foregroundStyle(.tertiary).accessibilityHidden(true)
+                            Text(term.replacement).fontWeight(.semibold)
+                            Button(role: .destructive) { delete(term.id) } label: {
+                                Image(systemName: "trash").accessibilityHidden(true)
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(AccessibilityCopy.removeDictionaryTerm(spoken: term.spoken, replacement: term.replacement))
+                            .accessibilityHint("Permanently removes this local dictionary entry.")
+                        }
+                            .accessibilityElement(children: .contain)
+                    }
                 }.scrollContentBackground(.hidden)
             }
         }.padding(20).background(AnimaTheme.paper)
@@ -41,8 +55,8 @@ struct DictionaryView: View {
         Task { await store.saveSettings() }
     }
 
-    private func delete(_ offsets: IndexSet) {
-        store.settings.dictionary.remove(atOffsets: offsets)
+    private func delete(_ id: UUID) {
+        store.settings.dictionary.removeAll { $0.id == id }
         Task { await store.saveSettings() }
     }
 }

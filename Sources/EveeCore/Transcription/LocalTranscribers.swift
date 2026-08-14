@@ -2,7 +2,7 @@ import AVFoundation
 import FluidAudio
 import Foundation
 
-public struct ModelProgress: Sendable {
+public struct ModelProgress: Equatable, Sendable {
     public var fraction: Double
     public var status: String
 
@@ -12,11 +12,14 @@ public struct ModelProgress: Sendable {
     }
 }
 
-public protocol LocalTranscriber: AnyObject, Sendable {
-    var model: SpeechModel { get }
+public protocol LocalModelDownloading: Sendable {
     var isDownloaded: Bool { get }
     func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws
     func load() async throws
+}
+
+public protocol LocalTranscriber: AnyObject, LocalModelDownloading {
+    var model: SpeechModel { get }
     func transcribe(fileURL: URL, languageCode: String?) async throws -> String
     func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript
     func unload()
@@ -58,6 +61,7 @@ public enum TranscriptionError: LocalizedError {
 
 public enum TranscriberFactory {
     public static func make(_ model: SpeechModel) throws -> any LocalTranscriber {
+        try SpeechModelAvailability.current.validate(model)
         switch model {
         case .parakeet:
             return ParakeetTranscriber()

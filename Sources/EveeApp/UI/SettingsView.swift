@@ -11,6 +11,8 @@ struct SettingsView: View {
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
     @State private var integrationMessage: String?
+    @State private var mcpInspections: [MCPClientRegistrationInspection] = []
+    @State private var selectedMCPClientIDs: Set<String> = []
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newLinkPhrase = ""
     @State private var newLinkDestination = ""
@@ -20,22 +22,31 @@ struct SettingsView: View {
             Section("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
+                KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
+                Text("Default discard shortcut: \(GlobalShortcutDefaults.cancelCaptureDescription)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 KeyboardShortcuts.Recorder("Transform selection:", name: .transformSelection)
                 Picker("Local model", selection: $store.settings.model) {
-                    ForEach(SpeechModel.allCases, id: \.self) { model in Text(model.title).tag(model) }
+                    ForEach(SpeechModel.allCases, id: \.self) { model in
+                        Text(model.title)
+                            .tag(model)
+                            .disabled(!store.isSpeechModelSupported(model))
+                    }
                 }
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(store.settings.model.detail).font(.caption).foregroundStyle(.secondary)
-                        if let progress = store.modelProgress {
-                            ProgressView(value: progress.fraction) { Text(progress.status) }.frame(maxWidth: 280)
-                        }
+                if let reason = store.speechModelUnavailableReason(.qwen3) {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        modelDownloadStatus
+                        Spacer()
+                        modelDownloadButton
                     }
-                    Spacer()
-                    Button(selectedModelReady ? "Downloaded" : "Download") {
-                        Task { await store.downloadSelectedModel() }
+                    VStack(alignment: .leading, spacing: 8) {
+                        modelDownloadStatus
+                        modelDownloadButton
                     }
-                    .disabled(selectedModelReady || store.modelProgress != nil)
                 }
                 Picker("Language", selection: $store.settings.languageCode) {
                     ForEach(SupportedLanguage.all) { language in
@@ -53,7 +64,7 @@ struct SettingsView: View {
                 Text(store.settings.textDeliveryMode.detail)
                     .font(.caption)
                     .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? .orange : .secondary)
-                Text("Selection transform is local and deterministic in this build: concise, clean up, case changes, lists, and ‘replace … with …’. Unsupported generative rewrites leave the selection unchanged.")
+                Text("Selection transform is local and deterministic. Supported commands: \(SelectionTransformPipeline.supportedCommandSummary). Unsupported rewrites leave the selection unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Picker("Microphone", selection: $store.settings.inputDeviceUID) {
@@ -87,15 +98,14 @@ struct SettingsView: View {
                                 store.settings.smartLinks.removeAll { $0.id == link.id }
                             } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless)
-                            .accessibilityLabel("Remove smart link for \(link.phrase)")
+                            .accessibilityLabel(AccessibilityCopy.removeSmartLink(phrase: link.phrase))
+                            .accessibilityHint("Permanently removes this local smart link.")
                         }
                     }
                 }
-                HStack {
-                    TextField("Spoken phrase", text: $newLinkPhrase)
-                    TextField("https://destination.example", text: $newLinkDestination)
-                    Button("Add", action: addSmartLink)
-                        .disabled(!validNewLink)
+                ViewThatFits(in: .horizontal) {
+                    HStack { smartLinkFields }
+                    VStack(alignment: .leading, spacing: 8) { smartLinkFields }
                 }
                 Text("Smart links replace an exact spoken phrase with its web address locally. Only HTTP and HTTPS destinations are accepted.")
                     .font(.caption)
@@ -119,6 +129,8 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.borderless)
                             .help("Remove this app style")
+                            .accessibilityLabel(AccessibilityCopy.removeAppStyle(named: style.displayName.isEmpty ? style.bundleIdentifier : style.displayName))
+                            .accessibilityHint("Permanently removes this per-app writing style.")
                         }
                         HStack {
                             Picker("Tone", selection: $style.tone) {
@@ -130,15 +142,9 @@ struct SettingsView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                HStack {
-                    TextField("App name", text: $newAppName)
-                    TextField("Bundle identifier (for example com.apple.mail)", text: $newBundleIdentifier)
-                    Picker("Tone", selection: $newAppTone) {
-                        ForEach(WritingTone.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                    }
-                    .labelsHidden()
-                    Button("Add", action: addStyle)
-                        .disabled(trimmedBundleIdentifier.isEmpty || newAppName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                ViewThatFits(in: .horizontal) {
+                    HStack { newAppStyleFields }
+                    VStack(alignment: .leading, spacing: 8) { newAppStyleFields }
                 }
             }
 
@@ -164,6 +170,8 @@ struct SettingsView: View {
                             store.isPreparingMeetingDiarization ||
                             store.captureState != .idle
                         )
+                        .accessibilityLabel("Prepare anonymous speaker separation model")
+                        .accessibilityHint("Downloads and prepares the additional local meeting model.")
                     }
                 }
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
@@ -192,7 +200,9 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 HStack {
                     Button("Export JSON") { Task { await store.exportWorkspace(format: .json) } }
+                        .accessibilityLabel("Export workspace records as JSON")
                     Button("Export Markdown") { Task { await store.exportWorkspace(format: .markdown) } }
+                        .accessibilityLabel("Export workspace records as Markdown")
                     Spacer()
                     Text("Exports omit retry payload bodies and never include Keychain secrets.")
                         .font(.caption)
@@ -211,10 +221,16 @@ struct SettingsView: View {
                             .disabled(true)
                         Button("Copy") { copy(store.localAPICredentials?.token ?? "") }
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel("Copy local API token")
+                            .accessibilityHint("Copies the Keychain-backed token for sixty seconds.")
                         Button("Rotate", action: store.rotateLocalAPIToken)
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel("Rotate local API token")
+                            .accessibilityHint("Replaces the current token and invalidates clients using it.")
                         Button("Revoke", role: .destructive) { Task { await store.revokeLocalAPIAccess() } }
                             .disabled(store.localAPICredentials == nil)
+                            .accessibilityLabel(AccessibilityCopy.revokeLocalAPIAccess)
+                            .accessibilityHint("Disables authenticated local API access until settings are saved again.")
                     }
                     Text("Save to publish a token. The API is read-only, accepts connections from this Mac only, and stores its token in Keychain.")
                         .font(.caption)
@@ -229,7 +245,10 @@ struct SettingsView: View {
                             .foregroundStyle(.orange)
                         Spacer()
                         Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
+                            .accessibilityLabel("Retry all undelivered webhook items now")
                         Button("Cancel outbox", role: .destructive) { Task { await store.cancelWebhookOutbox() } }
+                            .accessibilityLabel(AccessibilityCopy.cancelWebhookOutbox)
+                            .accessibilityHint("Marks every pending webhook delivery as cancelled.")
                     }
                 }
                 Text("Webhook secrets are stored in Keychain. HTTPS is required except for localhost development.")
@@ -238,14 +257,71 @@ struct SettingsView: View {
             }
 
             Section("MCP") {
-                Text("Register Evee with detected local MCP clients so local agents can search your voice workspace. Existing server entries are preserved.")
+                Text("Local helper access lets the selected apps search your Evee workspace. It is off by default and can be revoked at any time without changing unrelated client settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack {
-                    Button("Register detected clients", action: registerMCP)
-                    if let integrationMessage {
-                        Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
+                if mcpInspections.isEmpty {
+                    Text("No supported local clients were detected. Evee will not create a fallback configuration.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(mcpInspections) { inspection in
+                        HStack(alignment: .top) {
+                            if inspection.disposition == .unregistered || inspection.disposition == .recognizedLegacy {
+                                Toggle(isOn: mcpSelectionBinding(for: inspection.client)) {
+                                    mcpClientLabel(inspection)
+                                }
+                                .disabled(store.settings.mcpEnabled)
+                            } else {
+                                mcpClientLabel(inspection)
+                            }
+                            Spacer()
+                            if !store.settings.mcpEnabled, inspection.disposition == .recognizedLegacy {
+                                Button("Adopt") {
+                                    Task { await adoptMCP(inspection.client) }
+                                }
+                                .accessibilityLabel("Adopt existing Evee registration for \(inspection.client.name)")
+                                .accessibilityHint("Marks the existing helper entry as owned so Evee can revoke it later.")
+                                Button("Remove", role: .destructive) {
+                                    Task { await removeLegacyMCP(inspection.client) }
+                                }
+                                .accessibilityLabel("Remove existing Evee registration from \(inspection.client.name)")
+                                .accessibilityHint("Removes only the recognized Evee entry and preserves unrelated client settings.")
+                            }
+                        }
                     }
+                }
+                if !store.settings.mcpEnabled, !unresolvedMCPRegistrations.isEmpty {
+                    Text("Local helper access remains disabled until every existing Evee entry below is explicitly selected and adopted or removed. Manual or ambiguous entries must be reviewed outside Evee.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                HStack {
+                    if store.settings.mcpEnabled {
+                        Label("Local helper access enabled", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Button("Revoke access", role: .destructive) {
+                            Task { await revokeMCP() }
+                        }
+                        .accessibilityLabel(AccessibilityCopy.helperRevocation)
+                        .accessibilityHint("Disables helper authorization and removes owned client registrations.")
+                    } else {
+                        Button("Enable selected clients") {
+                            Task { await registerMCP() }
+                        }
+                        .disabled(selectedMCPClientIDs.isEmpty)
+                        .accessibilityLabel(AccessibilityCopy.helperRegistration(clientCount: selectedMCPClientIDs.count))
+                        .accessibilityHint("Adds an owned Evee helper registration to each selected local client.")
+                        Button("Adopt selected legacy entries") {
+                            Task { await adoptSelectedMCP() }
+                        }
+                        .disabled(selectedLegacyMCPClients.isEmpty)
+                        .accessibilityLabel("Adopt \(selectedLegacyMCPClients.count) selected legacy helper \(selectedLegacyMCPClients.count == 1 ? "entry" : "entries")")
+                    }
+                }
+                if let integrationMessage {
+                    Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                 }
             }
 
@@ -255,6 +331,13 @@ struct SettingsView: View {
 
             Section("Application") {
                 LaunchAtLogin.Toggle()
+                Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)
+                    .accessibilityLabel(
+                        PrivacyPresentation(enabled: store.privacyModeEnabled).accessibilityLabel
+                    )
+                Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
                 Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
                     .disabled(store.settings.model != .parakeet)
@@ -270,11 +353,24 @@ struct SettingsView: View {
                         Task { await store.checkForUpdates() }
                     }
                     .disabled(store.isCheckingForUpdates)
+                    .accessibilityLabel(store.isCheckingForUpdates ? "Checking for Evee updates" : "Check for Evee updates")
                     if let update = store.availableUpdate {
                         Link("Open Evee \(update.version) release", destination: update.pageURL)
                     }
                     Button("Export diagnostics") { Task { await store.exportDiagnostics() } }
+                        .accessibilityLabel("Export private Evee diagnostics")
+                        .accessibilityHint("Creates a local diagnostic export without workspace content or secrets.")
                 }
+            }
+
+            Section("Meeting suggestions") {
+                Toggle("Suggest meeting recording", isOn: $store.settings.meetingSuggestionsEnabled)
+                Text("Off by default. Evee only suggests; it never starts recording automatically. Native apps are matched by bundle identifier. Browsers also require an allowed title term and Evee’s existing Accessibility permission. Page content is never read.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Native bundle identifiers, comma-separated", text: nativeMeetingApps)
+                TextField("Browser bundle identifiers, comma-separated", text: browserMeetingApps)
+                TextField("Browser title terms, comma-separated", text: browserMeetingTitleTerms)
             }
 
             HStack {
@@ -282,6 +378,7 @@ struct SettingsView: View {
                 Button("Save settings") { Task { await store.saveSettings() } }
                     .buttonStyle(AlphaButtonStyle())
                     .keyboardShortcut("s", modifiers: .command)
+                    .accessibilityLabel("Save Evee settings")
             }
         }
         .formStyle(.grouped)
@@ -290,9 +387,110 @@ struct SettingsView: View {
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()
+            await refreshMCPClients()
         }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
+    }
+
+    @ViewBuilder
+    private var modelDownloadStatus: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(store.settings.model.detail).font(.caption).foregroundStyle(.secondary)
+            if let progress = store.modelProgress {
+                ProgressView(value: progress.fraction) { Text(progress.status) }
+                    .frame(maxWidth: 280)
+                    .accessibilityLabel("Local model download progress")
+                    .accessibilityValue("\(Int((progress.fraction * 100).rounded())) percent, \(progress.status)")
+            }
+        }
+    }
+
+    private var modelDownloadButton: some View {
+        Button(modelDownloadButtonTitle) {
+            if isModelDownloading {
+                store.cancelModelDownload()
+            } else {
+                store.startModelDownload()
+            }
+        }
+        .disabled(selectedModelReady || isModelCancellationPending || !store.isSpeechModelSupported(store.settings.model))
+        .accessibilityLabel(modelDownloadAccessibilityLabel)
+        .accessibilityValue(store.onboardingPresentation.modelAccessibilityValue ?? "")
+        .accessibilityHint(store.onboardingPresentation.modelAccessibilityHint)
+    }
+
+    private var modelDownloadButtonTitle: String {
+        if selectedModelReady { return "Downloaded" }
+        if isModelCancellationPending { return "Cancelling…" }
+        if isModelDownloading { return "Cancel" }
+        return store.modelDownloadNeedsRetry ? "Retry" : "Download"
+    }
+
+    private var modelDownloadAccessibilityLabel: String {
+        if selectedModelReady { return "Selected local model is downloaded" }
+        if isModelCancellationPending { return "Cancelling local model download" }
+        if isModelDownloading { return "Cancel local model download" }
+        return store.modelDownloadNeedsRetry ? "Retry local model download" : "Download local model"
+    }
+
+    private var isModelDownloading: Bool {
+        if case .downloading = store.modelDownloadState { return true }
+        return false
+    }
+
+    private var isModelCancellationPending: Bool {
+        if case .cancelling = store.modelDownloadState { return true }
+        return false
+    }
+
+    private var nativeMeetingApps: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionNativeBundleIdentifiers)
+    }
+
+    private var browserMeetingApps: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionBrowserBundleIdentifiers)
+    }
+
+    private var browserMeetingTitleTerms: Binding<String> {
+        commaSeparatedBinding(\.meetingSuggestionBrowserTitleTerms)
+    }
+
+    private func commaSeparatedBinding(_ keyPath: WritableKeyPath<EveeSettings, [String]>) -> Binding<String> {
+        Binding(
+            get: { store.settings[keyPath: keyPath].joined(separator: ", ") },
+            set: { value in
+                store.settings[keyPath: keyPath] = value
+                    .split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var smartLinkFields: some View {
+        TextField("Spoken phrase", text: $newLinkPhrase)
+            .accessibilityLabel("Smart link spoken phrase")
+        TextField("https://destination.example", text: $newLinkDestination)
+            .accessibilityLabel("Smart link web address")
+        Button("Add", action: addSmartLink)
+            .disabled(!validNewLink)
+            .accessibilityLabel("Add local smart link")
+    }
+
+    @ViewBuilder
+    private var newAppStyleFields: some View {
+        TextField("App name", text: $newAppName)
+        TextField("Bundle identifier (for example com.apple.mail)", text: $newBundleIdentifier)
+        Picker("Tone", selection: $newAppTone) {
+            ForEach(WritingTone.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+        }
+        .labelsHidden()
+        .accessibilityLabel("New app writing tone")
+        Button("Add", action: addStyle)
+            .disabled(trimmedBundleIdentifier.isEmpty || newAppName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .accessibilityLabel("Add per-app writing style")
     }
 
     private var trimmedBundleIdentifier: String {
@@ -338,20 +536,147 @@ struct SettingsView: View {
     }
 
     private func refreshModelState() {
-        selectedModelReady = (try? TranscriberFactory.make(store.settings.model).isDownloaded) == true
+        selectedModelReady = store.modelDownloadState == .ready(model: store.settings.model)
     }
 
-    private func registerMCP() {
+    private func refreshMCPClients() async {
+        do {
+            mcpInspections = try await store.inspectLocalHelperClients()
+            selectedMCPClientIDs = Set(
+                mcpInspections
+                    .filter { $0.disposition == .unregistered }
+                    .map(\.client.id)
+            )
+        } catch {
+            mcpInspections = []
+            selectedMCPClientIDs = []
+            integrationMessage = "Client registration scan failed without changing any configuration: \(error.localizedDescription)"
+        }
+    }
+
+    @ViewBuilder
+    private func mcpClientLabel(_ inspection: MCPClientRegistrationInspection) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(inspection.client.name)
+            Text(inspection.client.configurationURL.path)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            switch inspection.disposition {
+            case .unregistered:
+                Text("No Evee entry")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .ownedCurrent:
+                Text("Owned Evee registration")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            case .recognizedLegacy:
+                Text("Existing Evee entry — adopt it or remove it")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .ambiguous:
+                Text("Manual or ambiguous Evee entry — review this file manually")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func mcpSelectionBinding(for client: MCPClientConfiguration) -> Binding<Bool> {
+        Binding(
+            get: { selectedMCPClientIDs.contains(client.id) },
+            set: { selected in
+                if selected {
+                    selectedMCPClientIDs.insert(client.id)
+                } else {
+                    selectedMCPClientIDs.remove(client.id)
+                }
+            }
+        )
+    }
+
+    private var selectedLegacyMCPClients: [MCPClientConfiguration] {
+        mcpInspections
+            .filter { $0.disposition == .recognizedLegacy && selectedMCPClientIDs.contains($0.client.id) }
+            .map(\.client)
+    }
+
+    private var unresolvedMCPRegistrations: [MCPClientRegistrationInspection] {
+        mcpInspections.filter { $0.disposition == .recognizedLegacy || $0.disposition == .ambiguous }
+    }
+
+    private func registerMCP() async {
         let mcpURL = MCPRegistration.bundledExecutableURL()
         guard FileManager.default.isExecutableFile(atPath: mcpURL.path) else {
             integrationMessage = "The MCP helper is not bundled in this installation."
             return
         }
+        let selected = mcpInspections
+            .filter { $0.disposition == .unregistered && selectedMCPClientIDs.contains($0.client.id) }
+            .map(\.client)
+        guard !selected.isEmpty else { return }
         do {
-            let results = try MCPRegistration.writeDetectedClientConfigurations()
-            integrationMessage = "Registered \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
+            let results = try await store.enableLocalHelperAccess(for: selected)
+            integrationMessage = "Enabled \(results.count) \(results.count == 1 ? "client" : "clients"). Restart them to connect."
         } catch {
             integrationMessage = "Registration failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func adoptMCP(_ client: MCPClientConfiguration) async {
+        do {
+            _ = try await store.adoptLegacyLocalHelperAccess(for: [client])
+            integrationMessage = "Adopted the existing Evee entry for \(client.name). Revoking access will remove that entry rather than restore it."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Adoption failed without authorizing the helper: \(error.localizedDescription)"
+        }
+    }
+
+    private func adoptSelectedMCP() async {
+        guard !selectedLegacyMCPClients.isEmpty else { return }
+        do {
+            let results = try await store.adoptLegacyLocalHelperAccess(for: selectedLegacyMCPClients)
+            integrationMessage = "Adopted \(results.count) existing Evee \(results.count == 1 ? "entry" : "entries"). Restart the selected clients to connect."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Adoption failed without authorizing the helper: \(error.localizedDescription)"
+        }
+    }
+
+    private func removeLegacyMCP(_ client: MCPClientConfiguration) async {
+        do {
+            let outcome = try await store.removeLegacyLocalHelperRegistrations(for: [client])
+            integrationMessage = outcome.cleanupFailures.isEmpty
+                ? "Removed the recognized Evee entry from \(client.name) and preserved its other settings."
+                : "Local helper access remains disabled, but the client entry needs manual cleanup."
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = "Removal failed without changing an ambiguous entry: \(error.localizedDescription)"
+        }
+    }
+
+    private func revokeMCP() async {
+        do {
+            let outcome = try await store.revokeLocalHelperAccess()
+            let removed = outcome.removals.filter(\.removedRegistration).count
+            if !outcome.authorizationDisabled {
+                integrationMessage = outcome.cleanupFailures.isEmpty
+                    ? "Local helper access remains enabled because the setting could not be saved."
+                    : "Local helper access remains enabled. Registration recovery needs manual cleanup."
+            } else if outcome.cleanupFailures.isEmpty, outcome.cleanupWarnings.isEmpty {
+                integrationMessage = removed == 0
+                    ? "Local helper access is disabled. No owned client registrations were present."
+                    : "Local helper access is disabled. Removed \(removed) owned \(removed == 1 ? "client entry" : "client entries"). Restart those clients to disconnect."
+            } else {
+                let cleanupCount = outcome.cleanupWarnings.count + outcome.cleanupFailures.count
+                integrationMessage = "Local helper access is disabled. Removed \(removed) owned \(removed == 1 ? "client entry" : "client entries"); \(cleanupCount) \(cleanupCount == 1 ? "item needs" : "items need") manual cleanup."
+            }
+            await refreshMCPClients()
+        } catch {
+            integrationMessage = store.settings.mcpEnabled
+                ? "Local helper access remains enabled because the setting could not be saved: \(error.localizedDescription)"
+                : "Local helper access is disabled, but registration cleanup failed: \(error.localizedDescription)"
         }
     }
 

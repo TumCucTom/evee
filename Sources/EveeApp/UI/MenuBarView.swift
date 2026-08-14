@@ -11,11 +11,27 @@ struct MenuBarView: View {
                 EveeMark(size: 24)
                 Text("Evee").font(.headline)
                 Spacer()
-                Label(status, systemImage: statusIcon)
+                Label(store.systemVoiceStatus.menuTitle, systemImage: statusIcon)
                     .font(.caption)
                     .foregroundStyle(statusColour)
             }
             Divider()
+            Toggle("Privacy mode", isOn: $store.privacyModeEnabled)
+                .accessibilityLabel(
+                    PrivacyPresentation(enabled: store.privacyModeEnabled).accessibilityLabel
+                )
+                .accessibilityHint("Hides sensitive content in Evee windows for this session.")
+            Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(Array(store.systemVoiceStatus.warnings.enumerated()), id: \.offset) { _, warning in
+                Label(warning.message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .accessibilityLabel("Capture warning: \(warning.message)")
+            }
 
             switch store.captureState {
             case .starting:
@@ -23,16 +39,26 @@ struct MenuBarView: View {
                     ProgressView().controlSize(.small)
                     Text("Preparing \(captureName)…").font(.caption)
                 }
-                Button("Cancel", role: .destructive) { Task { await store.cancelCapture() } }
+                if store.systemVoiceStatus.availableActions.contains(.discard) {
+                    Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                        .accessibilityLabel("Discard preparation for \(captureName)")
+                }
             case .recording:
                 Text("Recording \(captureName)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
-                    Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
-                    Button("Stop and transcribe") { Task { await store.finishCapture() } }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.red)
+                    if store.systemVoiceStatus.availableActions.contains(.discard) {
+                        Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
+                            .accessibilityLabel("Discard \(captureName)")
+                            .accessibilityHint("Stops recording and permanently deletes this capture.")
+                    }
+                    if store.systemVoiceStatus.availableActions.contains(.stopAndTranscribe) {
+                        Button("Stop and transcribe") { Task { await store.finishCapture() } }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .accessibilityLabel("Stop and transcribe \(captureName)")
+                    }
                 }
             case .transcribing, .delivering:
                 HStack(spacing: 9) {
@@ -46,13 +72,31 @@ struct MenuBarView: View {
                     .foregroundStyle(.orange)
                     .lineLimit(3)
                 Button("Open Evee", action: showMainWindow)
+                    .accessibilityLabel("Open Evee to review the capture error")
+            case .checkpointed(let message):
+                Label(message, systemImage: "checkmark.shield.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .lineLimit(3)
+                HStack {
+                    Button("Open Recovery") {
+                        store.openCheckpointedRecovery()
+                    }
+                    .accessibilityLabel("Open Evee capture recovery")
+                    Button("Retry Quit") { NSApp.terminate(nil) }
+                        .accessibilityLabel("Retry quitting Evee")
+                }
             case .idle:
                 Button("Start dictation") { Task { await store.beginDictation() } }
                     .buttonStyle(.borderedProminent)
                     .tint(AnimaTheme.indigo)
+                    .accessibilityLabel("Start a new dictation")
                 Button("Transform selected text") { Task { await store.beginSelectionTransform() } }
+                    .accessibilityLabel("Start a selected-text transform instruction")
                 Button("Record meeting") { Task { await store.beginMeeting() } }
+                    .accessibilityLabel("Start a new meeting recording")
                 Button("Record memo") { Task { await store.beginMemo() } }
+                    .accessibilityLabel("Start a new memo recording")
             }
 
             Divider()
@@ -61,6 +105,7 @@ struct MenuBarView: View {
                 .foregroundStyle(.secondary)
             Button("Open Evee", action: showMainWindow)
                 .keyboardShortcut(",", modifiers: .command)
+                .accessibilityLabel("Open the Evee window")
         }
         .padding(14)
         .frame(width: 290)
@@ -76,39 +121,55 @@ struct MenuBarView: View {
         }
     }
 
-    private var status: String {
-        switch store.captureState {
-        case .idle: "Ready"
-        case .starting: "Starting"
-        case .recording: "Recording"
-        case .transcribing: "Transcribing"
-        case .delivering: "Inserting"
-        case .failed: "Error"
-        }
-    }
-
     private var statusIcon: String {
-        switch store.captureState {
-        case .idle: "checkmark.circle.fill"
-        case .starting: "waveform.circle"
+        if !store.systemVoiceStatus.warnings.isEmpty {
+            return "exclamationmark.triangle.fill"
+        }
+        return switch store.systemVoiceStatus.phase {
+        case .ready: "checkmark.circle.fill"
+        case .wakeStarting, .captureStarting: "waveform.circle"
+        case .wakeListening, .wakeStopping: "mic.circle.fill"
         case .recording: "record.circle"
-        case .transcribing, .delivering: "ellipsis.circle"
+        case .processing, .delivering: "ellipsis.circle"
+        case .protected: "checkmark.shield.fill"
         case .failed: "exclamationmark.triangle.fill"
         }
     }
 
     private var statusColour: Color {
-        switch store.captureState {
-        case .idle: .green
-        case .starting: .secondary
+        if !store.systemVoiceStatus.warnings.isEmpty {
+            return .orange
+        }
+        return switch store.systemVoiceStatus.phase {
+        case .ready: .green
+        case .wakeListening, .wakeStopping: AnimaTheme.magenta
         case .recording: .red
+        case .protected: .green
         case .failed: .orange
-        default: .secondary
+        case .wakeStarting, .captureStarting, .processing, .delivering: .secondary
         }
     }
 
     private func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.windows.first(where: { !($0 is NSPanel) })?.makeKeyAndOrderFront(nil)
+        if let window = NSApp.windows.first(where: {
+            $0.title == "Evee" && $0.styleMask.contains(.titled)
+        }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openNewMainWindow()
+        }
+    }
+
+    private func openNewMainWindow() {
+        let menus = NSApp.mainMenu?.items.compactMap(\.submenu) ?? []
+        for menu in menus {
+            guard let index = menu.items.firstIndex(where: { item in
+                item.keyEquivalent.lowercased() == "n" &&
+                    item.keyEquivalentModifierMask.contains(.command)
+            }) else { continue }
+            menu.performActionForItem(at: index)
+            return
+        }
     }
 }

@@ -17,9 +17,10 @@ jobs:
       - name: Resolve dependencies
         run: swift package resolve
       - name: Build
-        run: swift build
+        run: swift build --build-tests --enable-code-coverage
       - name: Test
-        run: swift test --enable-code-coverage
+        timeout-minutes: 5
+        run: swift test --enable-code-coverage --skip-build
       - name: Smoke test MCP protocol and tools
         run: bash scripts/smoke_mcp.sh
       - name: Package app

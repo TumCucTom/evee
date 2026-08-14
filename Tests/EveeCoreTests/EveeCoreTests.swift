@@ -66,8 +66,18 @@ final class EveeCoreTests: XCTestCase {
         XCTAssertEqual(settings.languageCode, "en")
         XCTAssertEqual(settings.model, .parakeet)
         XCTAssertFalse(settings.localAPIEnabled)
+        XCTAssertFalse(settings.mcpEnabled)
         XCTAssertTrue(settings.dictionary.isEmpty)
         XCTAssertFalse(settings.audioCuesEnabled)
+    }
+
+    func testMCPEnabledPreferenceRoundTrips() throws {
+        var settings = EveeSettings()
+        settings.mcpEnabled = true
+
+        let restored = try JSONDecoder().decode(EveeSettings.self, from: JSONEncoder().encode(settings))
+
+        XCTAssertTrue(restored.mcpEnabled)
     }
 
     func testAudioCuePreferenceRoundTrips() throws {
@@ -102,9 +112,9 @@ final class EveeCoreTests: XCTestCase {
         let input = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
         let microphone = input.appendingPathComponent("microphone.caf")
-        let system = input.appendingPathComponent("system.m4a")
-        try Data("microphone".utf8).write(to: microphone)
-        try Data("system".utf8).write(to: system)
+        let system = input.appendingPathComponent("system.wav")
+        try coreTestsSilentWAV().write(to: microphone)
+        try coreTestsSilentWAV().write(to: system)
 
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .meeting)
@@ -126,7 +136,7 @@ final class EveeCoreTests: XCTestCase {
     func testRecoveryTrackPreservesCaptureClock() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
-        try Data("audio".utf8).write(to: input)
+        try coreTestsSilentWAV().write(to: input)
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .meeting)
         let trackStart = capture.startedAt.addingTimeInterval(0.75)
@@ -215,11 +225,106 @@ final class EveeCoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testMCPRemovalPreservesUnrelatedJSONConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let configuration = root.appendingPathComponent("client/config.json")
+        try FileManager.default.createDirectory(at: configuration.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{\"theme\":\"quiet\",\"mcpServers\":{\"evee\":{\"command\":\"old\"},\"other\":{\"command\":\"other\"}}}".utf8).write(to: configuration)
+
+        let result = try MCPRegistration.removeConfiguration(at: configuration)
+
+        XCTAssertTrue(result.removedRegistration)
+        let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: configuration)) as? [String: Any])
+        XCTAssertEqual(object["theme"] as? String, "quiet")
+        let servers = try XCTUnwrap(object["mcpServers"] as? [String: Any])
+        XCTAssertNil(servers["evee"])
+        XCTAssertNotNil(servers["other"])
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testMCPDetectionHasNoFallbackAndDoesNotWriteConfiguration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+
+        let detected = MCPRegistration.detectedClients(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        let results = try MCPRegistration.writeDetectedClientConfigurations(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+
+        XCTAssertTrue(detected.isEmpty)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: support.appendingPathComponent("Claude/claude_desktop_config.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".codex/config.toml").path))
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testMCPDetectsCodexAndRoundTripPreservesUnrelatedTOMLExactly() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let support = home.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let codexDirectory = home.appendingPathComponent(".codex", isDirectory: true)
+        let configuration = codexDirectory.appendingPathComponent("config.toml")
+        let executable = root.appendingPathComponent("Helpers/evee-mcp")
+        try FileManager.default.createDirectory(at: codexDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = "model = \"gpt-test\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"
+        try Data(original.utf8).write(to: configuration)
+        try Data("#!/bin/sh\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+
+        let detected = MCPRegistration.detectedClients(
+            fileManager: .default,
+            homeURL: home,
+            applicationSupportURL: support
+        )
+        XCTAssertEqual(detected.map(\.name), ["Codex"])
+        XCTAssertEqual(detected.first?.configurationURL, configuration)
+
+        _ = try MCPRegistration.writeConfiguration(at: configuration, executableURL: executable)
+        let registered = try String(contentsOf: configuration, encoding: .utf8)
+        XCTAssertTrue(registered.contains("[mcp_servers.evee]"))
+        XCTAssertTrue(registered.contains("command = \"") && registered.contains(executable.path))
+
+        let removal = try MCPRegistration.removeConfiguration(at: configuration)
+        XCTAssertTrue(removal.removedRegistration)
+        XCTAssertEqual(try String(contentsOf: configuration, encoding: .utf8), original)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func testWebhookSignatureIsStableAndHexEncoded() {
-        let signature = MeetingWebhook.signature(for: Data("payload".utf8), secret: "secret")
+        let body = Data("payload".utf8)
+        let deliveryID = UUID(uuidString: "48B2B47F-9D39-43C7-8B22-9DD0E5C0E1AD")!
+        let timestamp = "2026-08-13T10:15:00Z"
+        let signature = MeetingWebhook.signature(
+            body: body,
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        )
         XCTAssertEqual(signature.count, 64)
-        XCTAssertEqual(signature, MeetingWebhook.signature(for: Data("payload".utf8), secret: "secret"))
-        XCTAssertNotEqual(signature, MeetingWebhook.signature(for: Data("different".utf8), secret: "secret"))
+        XCTAssertEqual(signature, MeetingWebhook.signature(
+            body: body,
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        ))
+        XCTAssertNotEqual(signature, MeetingWebhook.signature(
+            body: Data("different".utf8),
+            secret: "secret",
+            event: "meeting.completed",
+            deliveryID: deliveryID,
+            timestamp: timestamp
+        ))
     }
 
     func testMeetingDraftRoundTripsAndCanBeCleared() async throws {
@@ -259,7 +364,7 @@ final class EveeCoreTests: XCTestCase {
     func testRecoveredRecordCommitOwnsAudioBeforeRecoveryIsRemoved() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
-        try Data("audio".utf8).write(to: input)
+        try coreTestsSilentWAV().write(to: input)
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .memo)
         _ = try await store.addRecoveryTrack(captureID: capture.id, kind: .memo, role: .microphone, sourceURL: input)
@@ -427,4 +532,21 @@ final class EveeCoreTests: XCTestCase {
             insertedText: "world"
         ))
     }
+}
+
+private func coreTestsSilentWAV() -> Data {
+    let sampleRate: UInt32 = 8_000
+    let sampleCount: UInt32 = 800
+    let dataSize = sampleCount * 2
+    var data = Data()
+    func append(_ text: String) { data.append(contentsOf: text.utf8) }
+    func append<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+    append("RIFF"); append(UInt32(36) + dataSize); append("WAVE")
+    append("fmt "); append(UInt32(16)); append(UInt16(1)); append(UInt16(1))
+    append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
+    append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
+    return data
 }

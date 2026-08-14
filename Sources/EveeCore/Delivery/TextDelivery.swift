@@ -95,6 +95,26 @@ public enum TextInsertionVerification {
     }
 }
 
+/// Owns restoration for a temporary clipboard mutation. Once `markOwned` is
+/// called, every return, error, or task cancellation runs the restore closure
+/// while the caller's revision is still current.
+@MainActor
+public enum TemporaryClipboardTransaction {
+    public static func withRestoration<Result>(
+        currentRevision: () -> Int,
+        restore: () -> Void,
+        operation: (_ markOwned: (Int) -> Void) async throws -> Result
+    ) async rethrows -> Result {
+        var ownedRevision: Int?
+        defer {
+            if let ownedRevision, currentRevision() == ownedRevision {
+                restore()
+            }
+        }
+        return try await operation { ownedRevision = $0 }
+    }
+}
+
 @MainActor
 public enum TextDelivery {
     public enum DeliveryError: LocalizedError {
@@ -158,9 +178,9 @@ public enum TextDelivery {
         }
     }
 
-    public static func frontmostApplication(includeVisibleText: Bool = false) -> FrontmostApplication? {
+    public static func frontmostApplication(policy: ContextCollectionPolicy) -> FrontmostApplication? {
         guard let app = NSWorkspace.shared.frontmostApplication,
-              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier, includeVisibleText: includeVisibleText) else { return nil }
+              let focusedTarget = focusedTarget(processIdentifier: app.processIdentifier, policy: policy) else { return nil }
         return FrontmostApplication(
             bundleIdentifier: app.bundleIdentifier ?? "unknown",
             name: app.localizedName ?? "App",
@@ -184,76 +204,69 @@ public enum TextDelivery {
         sendAfterPaste: Bool = false,
         restoreClipboardAfter delay: TimeInterval = 0.6
     ) async throws {
+        try Task.checkCancellation()
         guard isAccessibilityTrusted else {
             requestAccessibility()
             throw DeliveryError.accessibilityRequired
         }
 
+        try Task.checkCancellation()
         try verifyTarget(target, expectedSelectedText: expectedSelectedText)
         let valueBeforePaste = sendAfterPaste ? focusedEditableValue(processIdentifier: target.processIdentifier) : nil
 
+        try Task.checkCancellation()
         let pasteboard = NSPasteboard.general
         let prior = PasteboardSnapshot(pasteboard)
-        pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
-            prior.restore(to: pasteboard)
-            throw DeliveryError.clipboardWriteFailed
-        }
-        let dictatedClipboardChange = pasteboard.changeCount
-
-        do {
-            try verifyTarget(target, expectedSelectedText: expectedSelectedText)
-        } catch {
-            if pasteboard.changeCount == dictatedClipboardChange {
+        try await TemporaryClipboardTransaction.withRestoration(
+            currentRevision: { pasteboard.changeCount },
+            restore: { prior.restore(to: pasteboard) }
+        ) { markOwned in
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
                 prior.restore(to: pasteboard)
+                throw DeliveryError.clipboardWriteFailed
             }
-            throw error
-        }
+            markOwned(pasteboard.changeCount)
 
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
-        down?.flags = .maskCommand
-        let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
-        up?.flags = .maskCommand
-        down?.post(tap: .cghidEventTap)
-        up?.post(tap: .cghidEventTap)
+            try verifyTarget(target, expectedSelectedText: expectedSelectedText)
+            try Task.checkCancellation()
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
+            down?.flags = .maskCommand
+            let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
+            up?.flags = .maskCommand
+            down?.post(tap: .cghidEventTap)
+            up?.post(tap: .cghidEventTap)
 
-        if sendAfterPaste {
-            var insertionVerified = false
-            for _ in 0..<12 {
-                try? await Task.sleep(for: .milliseconds(100))
-                do {
-                    try verifyTarget(target, expectedSelectedText: nil)
-                } catch {
-                    if pasteboard.changeCount == dictatedClipboardChange {
-                        prior.restore(to: pasteboard)
+            if sendAfterPaste {
+                var insertionVerified = false
+                for _ in 0..<12 {
+                    try await Task.sleep(for: .milliseconds(100))
+                    try Task.checkCancellation()
+                    do {
+                        try verifyTarget(target, expectedSelectedText: nil)
+                    } catch {
+                        throw DeliveryError.autoSendDeclined(target.name)
                     }
-                    throw DeliveryError.autoSendDeclined(target.name)
+                    if let before = valueBeforePaste,
+                       let after = focusedEditableValue(processIdentifier: target.processIdentifier),
+                       TextInsertionVerification.confirmsInsertion(
+                           before: before,
+                           after: after,
+                           insertedText: text,
+                           replacing: expectedSelectedText
+                       ) {
+                        insertionVerified = true
+                        break
+                    }
                 }
-                if let before = valueBeforePaste,
-                   let after = focusedEditableValue(processIdentifier: target.processIdentifier),
-                   TextInsertionVerification.confirmsInsertion(
-                       before: before,
-                       after: after,
-                       insertedText: text,
-                       replacing: expectedSelectedText
-                   ) {
-                    insertionVerified = true
-                    break
-                }
+                guard insertionVerified else { throw DeliveryError.autoSendDeclined(target.name) }
+                try Task.checkCancellation()
+                postKey(virtualKey: 36)
             }
-            guard insertionVerified else {
-                if pasteboard.changeCount == dictatedClipboardChange {
-                    prior.restore(to: pasteboard)
-                }
-                throw DeliveryError.autoSendDeclined(target.name)
-            }
-            postKey(virtualKey: 36)
-        }
 
-        try? await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
-        if pasteboard.changeCount == dictatedClipboardChange {
-            prior.restore(to: pasteboard)
+            try await Task.sleep(for: .milliseconds(Int(delay * 1_000)))
+            try Task.checkCancellation()
         }
     }
 
@@ -276,6 +289,7 @@ public enum TextDelivery {
         mode: TextDeliveryMode,
         expectedSelectedText: String? = nil
     ) async throws {
+        try Task.checkCancellation()
         switch mode {
         case .copyOnly:
             try copyToClipboard(text)
@@ -304,7 +318,15 @@ public enum TextDelivery {
 
 
         guard let expected = target.focusedTarget else { throw DeliveryError.targetContextChanged(target.name) }
-        guard let actual = focusedTarget(processIdentifier: target.processIdentifier),
+        let verificationPolicy = ContextCollectionPolicy(
+            collectsDeliveryIdentity: true,
+            collectsSelectedText: expectedSelectedText != nil,
+            collectsWindowMetadata: expected.windowFingerprint != nil || expected.windowTitle != nil,
+            collectsWebAndFileMetadata: expected.document != nil,
+            collectsRecipientMetadata: false,
+            collectsVisibleText: false
+        )
+        guard let actual = focusedTarget(processIdentifier: target.processIdentifier, policy: verificationPolicy),
               actual.elementFingerprint == expected.elementFingerprint,
               actual.windowFingerprint == expected.windowFingerprint,
               equivalent(actual.document, expected.document),
@@ -320,28 +342,46 @@ public enum TextDelivery {
         }
     }
 
-    private static func focusedTarget(processIdentifier: pid_t, includeVisibleText: Bool = false) -> FocusedTargetContext? {
+    private static func focusedTarget(
+        processIdentifier: pid_t,
+        policy: ContextCollectionPolicy
+    ) -> FocusedTargetContext? {
+        guard policy.collectsDeliveryIdentity else { return nil }
         let application = AXUIElementCreateApplication(processIdentifier)
         guard let element = copyElement(kAXFocusedUIElementAttribute as CFString, from: application) else { return nil }
-        let window = copyElement(kAXWindowAttribute as CFString, from: element)
-            ?? copyElement(kAXFocusedWindowAttribute as CFString, from: application)
-        let document = window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) }
-        let url = copyURLString("AXURL" as CFString, from: element)
-            ?? window.flatMap { copyURLString("AXURL" as CFString, from: $0) }
-            ?? document.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+        let needsWindow = policy.collectsWindowMetadata
+            || policy.collectsWebAndFileMetadata
+            || policy.collectsVisibleText
+        let window = needsWindow
+            ? copyElement(kAXWindowAttribute as CFString, from: element)
+                ?? copyElement(kAXFocusedWindowAttribute as CFString, from: application)
+            : nil
+        let document = policy.collectsWebAndFileMetadata
+            ? window.flatMap { copyString(kAXDocumentAttribute as CFString, from: $0) }
+            : nil
+        let windowTitle = policy.collectsWindowMetadata || policy.collectsWebAndFileMetadata
+            ? window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) }
+            : nil
+        let url = policy.collectsWebAndFileMetadata
+            ? copyURLString("AXURL" as CFString, from: element)
+                ?? window.flatMap { copyURLString("AXURL" as CFString, from: $0) }
+                ?? document.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+            : nil
         return FocusedTargetContext(
-            windowFingerprint: window.map { Int(CFHash($0)) },
-            windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) },
+            windowFingerprint: policy.collectsWindowMetadata ? window.map { Int(CFHash($0)) } : nil,
+            windowTitle: policy.collectsWindowMetadata ? windowTitle : nil,
             document: document,
             elementFingerprint: Int(CFHash(element)),
             elementIdentifier: copyString(kAXIdentifierAttribute as CFString, from: element),
             role: copyString(kAXRoleAttribute as CFString, from: element),
             subrole: copyString(kAXSubroleAttribute as CFString, from: element),
-            selectedText: selectedText(from: element),
+            selectedText: policy.collectsSelectedText ? selectedText(from: element) : nil,
             url: url,
-            codeFile: codeFile(from: document, windowTitle: window.flatMap { copyString(kAXTitleAttribute as CFString, from: $0) }),
-            recipient: recipient(from: element),
-            visibleText: includeVisibleText ? window.flatMap { visibleText(from: $0) } : nil
+            codeFile: policy.collectsWebAndFileMetadata
+                ? codeFile(from: document, windowTitle: windowTitle)
+                : nil,
+            recipient: policy.collectsRecipientMetadata ? recipient(from: element) : nil,
+            visibleText: policy.collectsVisibleText ? window.flatMap { visibleText(from: $0) } : nil
         )
     }
 
@@ -362,7 +402,7 @@ public enum TextDelivery {
         guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
               let value,
               CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return value as! AXUIElement
+        return (value as! AXUIElement)
     }
 
     private static func copyString(_ attribute: CFString, from element: AXUIElement) -> String? {

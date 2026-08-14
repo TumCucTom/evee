@@ -1,3 +1,4 @@
+import CryptoKit
 import FluidAudio
 import Foundation
 
@@ -371,6 +372,7 @@ public struct MeetingTranscriptAssembler: Sendable {
                     text: segment.text,
                     channel: .system,
                     attribution: match == nil ? .channel : .diarized,
+                    diarizationClusterID: match?.speakerID,
                     confidence: combinedConfidence(segment.confidence, match?.confidence),
                     timingSource: segment.timingSource
                 )
@@ -512,6 +514,10 @@ public struct MeetingTranscriptAssembler: Sendable {
 /// Deterministic local extraction with source evidence. It intentionally avoids
 /// claiming semantic conclusions that are not explicitly stated in the transcript.
 public struct MeetingIntelligencePipeline: Sendable {
+    private static let topicNamespace = UUID(uuidString: "DC68E83C-5A18-4D98-8938-FA591E6F452D")!
+    private static let decisionNamespace = UUID(uuidString: "32AC5C8F-CE47-4467-92CA-D38A90903D35")!
+    private static let actionNamespace = UUID(uuidString: "A7931AE4-0758-4C29-BB6D-46A43621D3C2")!
+
     public init() {}
 
     public func generate(from segments: [TranscriptSegment], generatedAt: Date = .now) -> MeetingIntelligence {
@@ -550,11 +556,12 @@ public struct MeetingIntelligencePipeline: Sendable {
             accumulatedKeywords.formUnion(words)
         }
         if !current.isEmpty { groups.append(current) }
-        return groups.compactMap { group in
+        return groups.enumerated().compactMap { ordinal, group in
             guard let first = group.first, let last = group.last else { return nil }
             let words = first.text.split(whereSeparator: \.isWhitespace).prefix(8).joined(separator: " ")
             let title = words.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
             return MeetingTopic(
+                id: stableID(namespace: Self.topicNamespace, sourceSegmentID: first.id, ordinal: ordinal),
                 title: title.isEmpty ? "Discussion" : title,
                 start: first.start,
                 end: last.end,
@@ -579,6 +586,7 @@ public struct MeetingIntelligencePipeline: Sendable {
         ]
         guard !isQuestion(text), markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
+            id: stableID(namespace: Self.decisionNamespace, sourceSegmentID: segment.id),
             kind: .decision,
             text: text,
             sourceSegmentID: segment.id,
@@ -602,6 +610,7 @@ public struct MeetingIntelligencePipeline: Sendable {
               !negations.contains(where: lower.contains),
               markers.contains(where: lower.contains) else { return nil }
         return MeetingInsight(
+            id: stableID(namespace: Self.actionNamespace, sourceSegmentID: segment.id),
             kind: .actionItem,
             text: text,
             assignee: assignee(in: text, fallbackSpeaker: segment.speaker),
@@ -658,5 +667,19 @@ public struct MeetingIntelligencePipeline: Sendable {
 
     private func isQuestion(_ text: String) -> Bool {
         text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+    }
+
+    private func stableID(namespace: UUID, sourceSegmentID: UUID, ordinal: Int = 0) -> UUID {
+        var bytes = Array(SHA256.hash(data: Data(
+            "\(namespace.uuidString.lowercased())|\(sourceSegmentID.uuidString.lowercased())|\(ordinal)".utf8
+        )).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x80
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[12], bytes[13], bytes[14], bytes[15]
+        ))
     }
 }

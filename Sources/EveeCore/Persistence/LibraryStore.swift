@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum LibraryStoreError: LocalizedError, Sendable {
@@ -5,7 +6,10 @@ public enum LibraryStoreError: LocalizedError, Sendable {
     case unsafeRelativePath(String)
     case missingAudioSource(URL)
     case missingRecoveryCapture(UUID)
+    case emptyRecoverySelection
+    case invalidRecoveryTrack(AudioTrackRole, String)
     case unsupportedSchema(found: Int, supported: Int)
+    case metadataInstalledButDurabilityUncertain(URL, String)
 
     public var errorDescription: String? {
         switch self {
@@ -17,10 +21,28 @@ public enum LibraryStoreError: LocalizedError, Sendable {
             return "The audio source no longer exists at \(url.path)."
         case .missingRecoveryCapture(let id):
             return "The recovery capture \(id.uuidString) is unavailable, so retained audio was not committed."
+        case .emptyRecoverySelection:
+            return "Choose at least one valid recovery track."
+        case .invalidRecoveryTrack(let role, let reason):
+            return "The \(role.rawValue) recovery track cannot be saved. \(reason)"
         case .unsupportedSchema(let found, let supported):
             return "This Evee library uses schema \(found), but this version supports up to schema \(supported)."
+        case .metadataInstalledButDurabilityUncertain(let url, let reason):
+            return "Evee installed \(url.lastPathComponent), but could not confirm directory durability: \(reason)"
         }
     }
+}
+
+@_spi(Testing) public enum LibraryStoreWritePoint: Hashable, Sendable {
+    case recordAudioDirectorySync
+    case recordMetadataBeforeReplacement
+    case recordMetadataAfterReplacement
+    case recordsQuarantineAfterArming
+    case recordsQuarantineAfterPreserving
+}
+
+private struct SchemaVersionProbe: Decodable {
+    var schemaVersion: Int
 }
 
 private struct RecordsEnvelope: Codable {
@@ -47,8 +69,10 @@ public actor LibraryStore {
     private let recordsURL: URL
     private let settingsURL: URL
     private let meetingDraftURL: URL
+    private let recordsQuarantineURL: URL
     private let searchIndexURL: URL
     private var searchIndex: WorkspaceSearchIndex?
+    private var failNextWritesAt: Set<LibraryStoreWritePoint>
 
     public init(rootURL: URL? = nil) {
         let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -58,9 +82,28 @@ public actor LibraryStore {
         self.recordsURL = self.rootURL.appendingPathComponent("records.json")
         self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
         self.meetingDraftURL = self.rootURL.appendingPathComponent("meeting-draft.json")
+        self.recordsQuarantineURL = self.rootURL.appendingPathComponent("records-quarantine.json")
         self.searchIndexURL = self.rootURL.appendingPathComponent("workspace-index.sqlite3")
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
+        self.failNextWritesAt = []
+        self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        self.encoder.dateEncodingStrategy = .iso8601
+        self.decoder.dateDecodingStrategy = .iso8601
+    }
+
+    @_spi(Testing) public init(rootURL: URL, failNextWritesAt: Set<LibraryStoreWritePoint>) {
+        self.rootURL = rootURL.standardizedFileURL
+        self.audioURL = self.rootURL.appendingPathComponent("Audio", isDirectory: true)
+        self.recoveryURL = self.audioURL.appendingPathComponent("Recovery", isDirectory: true)
+        self.recordsURL = self.rootURL.appendingPathComponent("records.json")
+        self.settingsURL = self.rootURL.appendingPathComponent("settings.json")
+        self.meetingDraftURL = self.rootURL.appendingPathComponent("meeting-draft.json")
+        self.recordsQuarantineURL = self.rootURL.appendingPathComponent("records-quarantine.json")
+        self.searchIndexURL = self.rootURL.appendingPathComponent("workspace-index.sqlite3")
+        self.encoder = JSONEncoder()
+        self.decoder = JSONDecoder()
+        self.failNextWritesAt = failNextWritesAt
         self.encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         self.encoder.dateEncodingStrategy = .iso8601
         self.decoder.dateDecodingStrategy = .iso8601
@@ -77,17 +120,7 @@ public actor LibraryStore {
         guard FileManager.default.fileExists(atPath: recordsURL.path) else { return [] }
         let data = try Data(contentsOf: recordsURL)
         do {
-            if let envelope = try? decoder.decode(RecordsEnvelope.self, from: data) {
-                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
-                }
-                return envelope.records
-            }
-
-            // Version 1 stored the records array directly. Upgrade it on the first successful read.
-            let legacy = try decoder.decode([WorkspaceRecord].self, from: data)
-            try save(legacy)
-            return legacy
+            return try decodeRecords(data)
         } catch let error as LibraryStoreError {
             throw error
         } catch {
@@ -96,10 +129,88 @@ public actor LibraryStore {
         }
     }
 
+    public func loadRecordsRecoveringCorruption() throws -> RecoveredLibraryLoad<[WorkspaceRecord]> {
+        try prepare()
+        if let quarantine = try recordsQuarantine() {
+            return try loadRecords(under: quarantine)
+        }
+        guard FileManager.default.fileExists(atPath: recordsURL.path) else {
+            return RecoveredLibraryLoad(value: [])
+        }
+        let data = try Data(contentsOf: recordsURL)
+        do {
+            return RecoveredLibraryLoad(value: try decodeRecords(data))
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let preserved = try quarantineCorruptRecords(expectedData: data)
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+    }
+
+    private func loadRecords(
+        under quarantine: RecordsQuarantineMarker
+    ) throws -> RecoveredLibraryLoad<[WorkspaceRecord]> {
+        if quarantine.phase == .pending {
+            guard FileManager.default.fileExists(atPath: recordsURL.path) else {
+                return RecoveredLibraryLoad(
+                    value: [],
+                    manualRecoveryWarning: "Records preservation was interrupted after metadata protection was armed. The canonical source is unavailable, so record-audio cleanup remains disabled until you review the private library data and explicitly reset protection."
+                )
+            }
+            let preserved = try finishPendingRecordsQuarantine(
+                expectedData: Data(contentsOf: recordsURL),
+                createdAt: quarantine.createdAt
+            )
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+
+        guard let preserved = try preservedURL(for: quarantine) else {
+            return RecoveredLibraryLoad(
+                value: [],
+                manualRecoveryWarning: "Records metadata protection is active, but its verified preserved-copy path is unavailable. Record-audio cleanup remains disabled until you review the private library data and explicitly reset protection."
+            )
+        }
+        guard FileManager.default.fileExists(atPath: recordsURL.path) else {
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: preserved)
+        }
+        let data = try Data(contentsOf: recordsURL)
+        do {
+            return RecoveredLibraryLoad(value: try decodeRecords(data), preservedCorruptURL: preserved)
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let newPreserved = try quarantineCorruptRecords(expectedData: data)
+            return RecoveredLibraryLoad(value: [], preservedCorruptURL: newPreserved)
+        }
+    }
+
+    private func decodeRecords(_ data: Data) throws -> [WorkspaceRecord] {
+        if let version = try? decoder.decode(SchemaVersionProbe.self, from: data).schemaVersion {
+            guard version <= Self.currentSchemaVersion else {
+                throw LibraryStoreError.unsupportedSchema(found: version, supported: Self.currentSchemaVersion)
+            }
+            guard version == Self.currentSchemaVersion else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported records envelope schema."))
+            }
+            let envelope = try decoder.decode(RecordsEnvelope.self, from: data)
+            return envelope.records
+        }
+        // Version 1 stored the records array directly. Upgrade it on the first successful read.
+        let legacy = try decoder.decode([WorkspaceRecord].self, from: data)
+        try save(legacy)
+        return legacy
+    }
+
     public func save(_ records: [WorkspaceRecord]) throws {
         try prepare()
         let envelope = RecordsEnvelope(schemaVersion: Self.currentSchemaVersion, updatedAt: .now, records: records)
-        try writePrivate(encoder.encode(envelope), to: recordsURL)
+        try writePrivate(
+            encoder.encode(envelope),
+            to: recordsURL,
+            beforeReplacementPoint: .recordMetadataBeforeReplacement,
+            afterReplacementPoint: .recordMetadataAfterReplacement
+        )
         do {
             try synchronizeSearchIndex(records)
         } catch {
@@ -110,27 +221,65 @@ public actor LibraryStore {
         }
     }
 
+    public func recordsQuarantine() throws -> RecordsQuarantineMarker? {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: recordsQuarantineURL.path) else { return nil }
+        return try decoder.decode(RecordsQuarantineMarker.self, from: Data(contentsOf: recordsQuarantineURL))
+    }
+
+    /// Explicitly removes metadata protection. Audio is intentionally left
+    /// untouched; any later cleanup is a separate operation.
+    public func resetRecordsQuarantine() throws {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: recordsQuarantineURL.path) else { return }
+        try FileManager.default.removeItem(at: recordsQuarantineURL)
+        try synchronizeDirectory(at: rootURL)
+    }
+
     public func loadSettings() throws -> EveeSettings {
         try prepare()
         guard FileManager.default.fileExists(atPath: settingsURL.path) else { return EveeSettings() }
         let data = try Data(contentsOf: settingsURL)
         do {
-            if let envelope = try? decoder.decode(SettingsEnvelope.self, from: data) {
-                guard envelope.schemaVersion <= Self.currentSchemaVersion else {
-                    throw LibraryStoreError.unsupportedSchema(found: envelope.schemaVersion, supported: Self.currentSchemaVersion)
-                }
-                return envelope.settings
-            }
-
-            let legacy = try decoder.decode(EveeSettings.self, from: data)
-            try save(legacy)
-            return legacy
+            return try decodeSettings(data)
         } catch let error as LibraryStoreError {
             throw error
         } catch {
             let backup = try preserveCorruptFile(settingsURL)
             throw LibraryStoreError.corruptFile(backup)
         }
+    }
+
+    public func loadSettingsRecoveringCorruption() throws -> RecoveredLibraryLoad<EveeSettings> {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: settingsURL.path) else {
+            return RecoveredLibraryLoad(value: EveeSettings())
+        }
+        let data = try Data(contentsOf: settingsURL)
+        do {
+            return RecoveredLibraryLoad(value: try decodeSettings(data))
+        } catch let error as LibraryStoreError {
+            throw error
+        } catch {
+            let preserved = try preserveCorruptCanonicalFile(settingsURL, expectedData: data)
+            return RecoveredLibraryLoad(value: EveeSettings(), preservedCorruptURL: preserved)
+        }
+    }
+
+    private func decodeSettings(_ data: Data) throws -> EveeSettings {
+        if let version = try? decoder.decode(SchemaVersionProbe.self, from: data).schemaVersion {
+            guard version <= Self.currentSchemaVersion else {
+                throw LibraryStoreError.unsupportedSchema(found: version, supported: Self.currentSchemaVersion)
+            }
+            guard version == Self.currentSchemaVersion else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Unsupported settings envelope schema."))
+            }
+            let envelope = try decoder.decode(SettingsEnvelope.self, from: data)
+            return envelope.settings
+        }
+        let legacy = try decoder.decode(EveeSettings.self, from: data)
+        try save(legacy)
+        return legacy
     }
 
     public func save(_ settings: EveeSettings) throws {
@@ -145,6 +294,20 @@ public actor LibraryStore {
         return try decoder.decode(MeetingDraft.self, from: Data(contentsOf: meetingDraftURL))
     }
 
+    public func loadMeetingDraftRecoveringCorruption() throws -> RecoveredLibraryLoad<MeetingDraft?> {
+        try prepare()
+        guard FileManager.default.fileExists(atPath: meetingDraftURL.path) else {
+            return RecoveredLibraryLoad(value: nil)
+        }
+        let data = try Data(contentsOf: meetingDraftURL)
+        do {
+            return RecoveredLibraryLoad(value: try decoder.decode(MeetingDraft.self, from: data))
+        } catch {
+            let preserved = try preserveCorruptCanonicalFile(meetingDraftURL, expectedData: data)
+            return RecoveredLibraryLoad(value: nil, preservedCorruptURL: preserved)
+        }
+    }
+
     public func saveMeetingDraft(_ draft: MeetingDraft?) throws {
         try prepare()
         guard let draft else {
@@ -156,24 +319,42 @@ public actor LibraryStore {
         try writePrivate(encoder.encode(draft), to: meetingDraftURL)
     }
 
-    public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
+    @discardableResult
+    public func clearMeetingDraft(matching captureID: UUID) throws -> Bool {
+        guard let draft = try loadMeetingDraft(), draft.captureID == captureID else { return false }
+        try saveMeetingDraft(nil)
+        return true
+    }
+
+    @discardableResult
+    public func clearMeetingDraft(
+        forCommitted record: WorkspaceRecord,
+        recoveryID: UUID?
+    ) throws -> Bool {
+        guard record.kind == .meeting, let recoveryID else { return false }
+        return try clearMeetingDraft(matching: recoveryID)
+    }
+
+    public func searchResults(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceSearchResult] {
         let records = try loadRecords()
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedLimit = max(1, min(limit, 500))
         if !needle.isEmpty {
-            let ids: [UUID]
+            let hits: [WorkspaceSearchHit]
             do {
                 let index = try workspaceSearchIndex()
                 if try !index.isCurrent(records: records) { try index.rebuild(records: records) }
-                ids = try index.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+                hits = try index.matchingHits(query: needle, kind: kind, limit: boundedLimit)
             } catch {
                 invalidateSearchIndex()
                 let rebuilt = try workspaceSearchIndex()
                 try rebuilt.rebuild(records: records)
-                ids = try rebuilt.matchingIDs(query: needle, kind: kind, limit: boundedLimit)
+                hits = try rebuilt.matchingHits(query: needle, kind: kind, limit: boundedLimit)
             }
             let recordsByID = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
-            return ids.compactMap { recordsByID[$0] }
+            return hits.compactMap { hit in
+                recordsByID[hit.id].map { WorkspaceSearchResult(record: $0, snippet: hit.snippet) }
+            }
         }
         return records
             .filter { record in
@@ -184,7 +365,11 @@ public actor LibraryStore {
             }
             .sorted { $0.createdAt > $1.createdAt }
             .prefix(boundedLimit)
-            .map { $0 }
+            .map { WorkspaceSearchResult(record: $0, snippet: "") }
+    }
+
+    public func search(_ query: String, kind: WorkspaceRecordKind? = nil, limit: Int = 50) throws -> [WorkspaceRecord] {
+        try searchResults(query, kind: kind, limit: limit).map(\.record)
     }
 
     private func workspaceSearchIndex() throws -> WorkspaceSearchIndex {
@@ -240,6 +425,7 @@ public actor LibraryStore {
         // Metadata is the source of ownership. Commit its removal before deleting
         // audio so a failed save cannot leave a record pointing at missing files.
         try save(records)
+        guard try recordsQuarantine() == nil else { return }
 
         let paths = [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
         for relativePath in Set(paths) {
@@ -247,7 +433,7 @@ public actor LibraryStore {
                 try? FileManager.default.removeItem(at: url)
             }
         }
-        try? reconcileRecordAudio(using: records)
+        try? reconcileRecordAudioIfPermitted(using: records)
     }
 
     @discardableResult
@@ -260,13 +446,14 @@ public actor LibraryStore {
         // Commit metadata first so an interrupted purge can leave only harmless
         // orphaned audio, never records pointing at files we already removed.
         try save(retained)
+        guard try recordsQuarantine() == nil else { return removed.count }
         let paths = removed.flatMap { record in
             [record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)
         }
         for relativePath in Set(paths) {
             if let url = try? safeURL(forRelativePath: relativePath) { try? FileManager.default.removeItem(at: url) }
         }
-        try? reconcileRecordAudio(using: retained)
+        try? reconcileRecordAudioIfPermitted(using: retained)
         return removed.count
     }
 
@@ -277,6 +464,10 @@ public actor LibraryStore {
         try prepare()
         let directory = recoveryURL.appendingPathComponent(id.uuidString, isDirectory: true)
         try createPrivateDirectory(directory)
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        if FileManager.default.fileExists(atPath: manifestURL.path) {
+            return try readRecoveryManifest(directory: directory)
+        }
         let manifest = CaptureRecoveryManifest(id: id, kind: kind)
         try writeRecoveryManifest(manifest, directory: directory)
         return manifest
@@ -298,31 +489,50 @@ public actor LibraryStore {
         let directory = recoveryURL.appendingPathComponent(captureID.uuidString, isDirectory: true)
         try createPrivateDirectory(directory)
         let destination = directory.appendingPathComponent("\(role.rawValue)-\(UUID().uuidString).\(sourceURL.pathExtension.isEmpty ? "audio" : sourceURL.pathExtension)")
-        if moveSource {
-            try FileManager.default.moveItem(at: sourceURL, to: destination)
-        } else {
+        do {
+            // Keep the recorder's source path intact until both the copied bytes
+            // and their manifest entry are durable. A normal write failure can
+            // therefore retry without reconstructing an already-stopped writer.
             try FileManager.default.copyItem(at: sourceURL, to: destination)
-        }
-        try makePrivate(destination)
+            try makePrivate(destination)
+            try synchronizeFile(at: destination)
 
-        var manifest = (try? readRecoveryManifest(directory: directory))
-            ?? CaptureRecoveryManifest(id: captureID, kind: kind)
-        let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
-        let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
-        let relativePath = relativePath(for: destination)
-        manifest.tracks.removeAll { $0.role == role }
-        manifest.tracks.append(WorkspaceAudioTrack(
-            role: role,
-            relativePath: relativePath,
-            createdAt: startedAt ?? .now,
-            duration: duration,
-            byteCount: byteCount
-        ))
-        manifest.status = .captured
-        manifest.updatedAt = .now
-        manifest.failureReason = nil
-        try writeRecoveryManifest(manifest, directory: directory)
-        return manifest
+            var manifest = (try? readRecoveryManifest(directory: directory))
+                ?? CaptureRecoveryManifest(id: captureID, kind: kind)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: destination.path)
+            let byteCount = (attributes?[.size] as? NSNumber)?.int64Value
+            let relativePath = relativePath(for: destination)
+            manifest.tracks.removeAll { $0.role == role }
+            manifest.tracks.append(WorkspaceAudioTrack(
+                role: role,
+                relativePath: relativePath,
+                createdAt: startedAt ?? .now,
+                duration: duration,
+                byteCount: byteCount
+            ))
+            manifest.status = .captured
+            manifest.updatedAt = .now
+            manifest.failureReason = nil
+            try writeRecoveryManifest(manifest, directory: directory)
+            if moveSource {
+                do {
+                    try FileManager.default.removeItem(at: sourceURL)
+                } catch {
+                    // The manifest and copied track are already durable. Leaving
+                    // the recorder source as an orphan is safer than reporting a
+                    // retryable checkpoint failure that could duplicate tracks.
+                }
+            }
+            return manifest
+        } catch {
+            let durableManifestOwnsDestination = (try? readRecoveryManifest(directory: directory))?
+                .tracks
+                .contains(where: { $0.relativePath == relativePath(for: destination) }) == true
+            if !durableManifestOwnsDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
+            throw error
+        }
     }
 
     public func updateRecoveryCapture(id: UUID, status: CaptureRecoveryStatus, failureReason: String? = nil) throws {
@@ -394,11 +604,19 @@ public actor LibraryStore {
         return manifests.sorted { $0.startedAt > $1.startedAt }
     }
 
+    public func assessRecoveryTracks(captureID: UUID) throws -> [RecoveryTrackAssessment] {
+        guard let capture = try recoverableCaptures().first(where: { $0.id == captureID }) else {
+            throw LibraryStoreError.missingRecoveryCapture(captureID)
+        }
+        return capture.tracks.map(assessRecoveryTrack)
+    }
+
     /// Establishes durable record metadata before removing its recovery copy.
     /// Retained-file moves are rolled back if the metadata write fails.
     public func commitRecoveredRecord(
         _ proposedRecord: WorkspaceRecord,
         recoveryID: UUID?,
+        trackSelection: RecoveryTrackSelection? = nil,
         keepAudio: Bool
     ) throws -> WorkspaceRecord {
         var record = proposedRecord
@@ -409,10 +627,40 @@ public actor LibraryStore {
 
         let capture = try recoverableCaptures().first { $0.id == recoveryID }
         record.recoverySourceID = recoveryID
-        var moves: [(source: URL, destination: URL)] = []
+        var copies: [URL] = []
+        let automaticAudioCleanupPermitted = try recordsQuarantine() == nil
 
         if keepAudio {
             guard let capture else { throw LibraryStoreError.missingRecoveryCapture(recoveryID) }
+            let assessments = capture.tracks.map(assessRecoveryTrack)
+            let requestedRoles: Set<AudioTrackRole> = switch trackSelection {
+            case .allValid:
+                Set(assessments.filter(\.isValid).map(\.role))
+            case .roles(let roles):
+                roles
+            case nil:
+                Set(capture.tracks.map(\.role))
+            }
+            guard !requestedRoles.isEmpty else { throw LibraryStoreError.emptyRecoverySelection }
+            for role in requestedRoles {
+                if let selectedTrack = capture.tracks.first(where: { $0.role == role }) {
+                    let source = try safeURL(forRelativePath: selectedTrack.relativePath)
+                    guard FileManager.default.fileExists(atPath: source.path) else {
+                        throw LibraryStoreError.missingAudioSource(source)
+                    }
+                }
+                guard let assessment = assessments.first(where: { $0.role == role }) else {
+                    throw LibraryStoreError.invalidRecoveryTrack(role, "The selected source is missing.")
+                }
+                guard assessment.isValid else {
+                    throw LibraryStoreError.invalidRecoveryTrack(role, assessment.failureReason ?? "The selected source is not playable.")
+                }
+            }
+            let selectedTracks = capture.tracks.filter { requestedRoles.contains($0.role) }
+            guard !selectedTracks.isEmpty else { throw LibraryStoreError.emptyRecoverySelection }
+
+            var records = try loadRecords()
+            let previousRecord = records.first(where: { $0.id == record.id })
             let destinationDirectory = audioURL
                 .appendingPathComponent("Records", isDirectory: true)
                 .appendingPathComponent(record.id.uuidString, isDirectory: true)
@@ -420,35 +668,74 @@ public actor LibraryStore {
             var retained: [WorkspaceAudioTrack] = []
 
             do {
-                for track in capture.tracks {
+                for track in selectedTracks {
                     let source = try safeURL(forRelativePath: track.relativePath)
                     guard FileManager.default.fileExists(atPath: source.path) else {
                         throw LibraryStoreError.missingAudioSource(source)
                     }
-                    let destination = destinationDirectory.appendingPathComponent(source.lastPathComponent)
-                    if source != destination {
-                        if FileManager.default.fileExists(atPath: destination.path) {
-                            try FileManager.default.removeItem(at: destination)
-                        }
-                        // Copy first: the recovery capture remains the crash-safe source of
-                        // truth until record metadata has durably committed.
-                        try FileManager.default.copyItem(at: source, to: destination)
-                        moves.append((source, destination))
-                    }
+                    let pathExtension = source.pathExtension.isEmpty ? "audio" : source.pathExtension
+                    let destination = uniqueDestination(
+                        in: destinationDirectory,
+                        prefix: track.role.rawValue,
+                        pathExtension: pathExtension
+                    )
+                    // Copy first: the recovery capture remains the crash-safe source of
+                    // truth until record metadata has durably committed.
+                    try FileManager.default.copyItem(at: source, to: destination)
+                    copies.append(destination)
                     try makePrivate(destination)
+                    try synchronizeFile(at: destination)
+                    let sourceBytes = try fileByteCount(at: source)
+                    let destinationBytes = try fileByteCount(at: destination)
+                    guard sourceBytes == destinationBytes else {
+                        throw LibraryStoreError.invalidRecoveryTrack(track.role, "The retained copy did not match the recovery source.")
+                    }
                     var updated = track
                     updated.relativePath = relativePath(for: destination)
+                    updated.byteCount = destinationBytes
+                    let copiedAssessment = RecoveryTrackValidator().assess(
+                        updated,
+                        sourceURL: destination,
+                        resolvedURL: destination
+                    )
+                    guard copiedAssessment.isValid else {
+                        throw LibraryStoreError.invalidRecoveryTrack(
+                            track.role,
+                            copiedAssessment.failureReason ?? "The retained copy is not playable."
+                        )
+                    }
                     retained.append(updated)
                 }
+                if failNextWritesAt.remove(.recordAudioDirectorySync) != nil {
+                    throw POSIXError(.EIO)
+                }
+                try synchronizeDirectory(at: destinationDirectory)
+                try synchronizeDirectory(at: destinationDirectory.deletingLastPathComponent())
                 record.audioTracks = retained
-                guard retained.count == capture.tracks.count, !retained.isEmpty else {
+                guard retained.count == selectedTracks.count, !retained.isEmpty else {
                     throw LibraryStoreError.missingRecoveryCapture(recoveryID)
                 }
                 record.audioRelativePath = retained.first(where: { $0.role == .microphone })?.relativePath
-                try upsert(record)
+                    ?? retained.first?.relativePath
+                if let index = records.firstIndex(where: { $0.id == record.id }) {
+                    records[index] = record
+                } else {
+                    records.append(record)
+                }
+                try save(records)
+
+                if automaticAudioCleanupPermitted {
+                    let referencedPaths = Set(records.flatMap(recordAudioPaths))
+                    for oldPath in previousRecord.map(recordAudioPaths) ?? [] where !referencedPaths.contains(oldPath) {
+                        removeOwnedRecordAudioIfPresent(relativePath: oldPath, recordID: record.id)
+                    }
+                }
+                try? reconcileRecordAudioIfPermitted(using: records)
             } catch {
-                for move in moves.reversed() where FileManager.default.fileExists(atPath: move.destination.path) {
-                    try? FileManager.default.removeItem(at: move.destination)
+                if !isInstalledDurabilityError(error) {
+                    for copy in copies.reversed() where FileManager.default.fileExists(atPath: copy.path) {
+                        try? FileManager.default.removeItem(at: copy)
+                    }
                 }
                 throw error
             }
@@ -467,7 +754,9 @@ public actor LibraryStore {
 
         // Metadata now owns the result (or intentionally owns no audio), so the
         // recovery copy is safe to remove. Failed cleanup is reconciled on launch.
-        try? removeRecoveryArtifacts(id: recoveryID, tracks: capture?.tracks ?? [])
+        if automaticAudioCleanupPermitted {
+            try? removeRecoveryArtifacts(id: recoveryID, tracks: capture?.tracks ?? [])
+        }
         return record
     }
 
@@ -477,6 +766,7 @@ public actor LibraryStore {
     }
 
     public func reconcileAudioStorage() throws {
+        guard try recordsQuarantine() == nil else { return }
         let records = try loadRecords()
         try reconcileRecordAudio(using: records)
         try reconcileRecoveryAudio(using: records)
@@ -532,6 +822,46 @@ public actor LibraryStore {
         return .microphone
     }
 
+    private func assessRecoveryTrack(_ track: WorkspaceAudioTrack) -> RecoveryTrackAssessment {
+        let sourceURL = rootURL.appendingPathComponent(track.relativePath).standardizedFileURL
+        do {
+            let resolvedURL = try safeURL(forRelativePath: track.relativePath)
+            return RecoveryTrackValidator().assess(track, sourceURL: sourceURL, resolvedURL: resolvedURL)
+        } catch {
+            return RecoveryTrackAssessment(
+                track: track,
+                isValid: false,
+                failureReason: error.localizedDescription
+            )
+        }
+    }
+
+    private func uniqueDestination(in directory: URL, prefix: String, pathExtension: String) -> URL {
+        while true {
+            let candidate = directory.appendingPathComponent("\(prefix)-\(UUID().uuidString).\(pathExtension)")
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+        }
+    }
+
+    private func fileByteCount(at url: URL) throws -> Int64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
+    private func recordAudioPaths(_ record: WorkspaceRecord) -> [String] {
+        Array(Set([record.audioRelativePath].compactMap { $0 } + record.audioTracks.map(\.relativePath)))
+    }
+
+    private func removeOwnedRecordAudioIfPresent(relativePath: String, recordID: UUID) {
+        guard let url = try? safeURL(forRelativePath: relativePath) else { return }
+        let ownedDirectory = audioURL
+            .appendingPathComponent("Records", isDirectory: true)
+            .appendingPathComponent(recordID.uuidString, isDirectory: true)
+            .standardizedFileURL.path + "/"
+        guard url.standardizedFileURL.path.hasPrefix(ownedDirectory) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private func reconcileRecordAudio(using records: [WorkspaceRecord]) throws {
         let recordsDirectory = audioURL.appendingPathComponent("Records", isDirectory: true)
         guard FileManager.default.fileExists(atPath: recordsDirectory.path) else { return }
@@ -547,8 +877,24 @@ public actor LibraryStore {
                UUID(uuidString: child.lastPathComponent) != nil,
                !ownedIDs.contains(child.lastPathComponent) {
                 try? FileManager.default.removeItem(at: child)
+            } else if isDirectory,
+                      let record = records.first(where: { $0.id.uuidString == child.lastPathComponent }) {
+                let referenced = Set(recordAudioPaths(record))
+                let files = try FileManager.default.contentsOfDirectory(
+                    at: child,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                )
+                for file in files where !referenced.contains(relativePath(for: file)) {
+                    try? FileManager.default.removeItem(at: file)
+                }
             }
         }
+    }
+
+    private func reconcileRecordAudioIfPermitted(using records: [WorkspaceRecord]) throws {
+        guard try recordsQuarantine() == nil else { return }
+        try reconcileRecordAudio(using: records)
     }
 
     private func reconcileRecoveryAudio(using records: [WorkspaceRecord]) throws {
@@ -586,13 +932,51 @@ public actor LibraryStore {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 
-    private func writePrivate(_ data: Data, to url: URL) throws {
-        try data.write(to: url, options: .atomic)
-        try makePrivate(url)
+    private func writePrivate(
+        _ data: Data,
+        to url: URL,
+        beforeReplacementPoint: LibraryStoreWritePoint? = nil,
+        afterReplacementPoint: LibraryStoreWritePoint? = nil
+    ) throws {
+        let directory = url.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        var installed = false
+        defer {
+            if !installed, FileManager.default.fileExists(atPath: temporary.path) {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
+
+        try data.write(to: temporary, options: .withoutOverwriting)
+        try makePrivate(temporary)
+        try synchronizeFile(at: temporary)
+        if let beforeReplacementPoint, failNextWritesAt.remove(beforeReplacementPoint) != nil {
+            throw POSIXError(.EIO)
+        }
+
+        guard rename(temporary.path, url.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        installed = true
+        do {
+            if let afterReplacementPoint, failNextWritesAt.remove(afterReplacementPoint) != nil {
+                throw POSIXError(.EIO)
+            }
+            try synchronizeDirectory(at: directory)
+        } catch {
+            throw LibraryStoreError.metadataInstalledButDurabilityUncertain(url, error.localizedDescription)
+        }
     }
 
     private func makePrivate(_ url: URL) throws {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private func synchronizeFile(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     private func preserveCorruptFile(_ url: URL) throws -> URL {
@@ -602,5 +986,85 @@ public actor LibraryStore {
         try FileManager.default.copyItem(at: url, to: backup)
         try makePrivate(backup)
         return backup
+    }
+
+    private func preserveCorruptCanonicalFile(_ url: URL, expectedData: Data) throws -> URL {
+        let directory = rootURL.appendingPathComponent("Corrupt", isDirectory: true)
+        try createPrivateDirectory(directory)
+        let destination = uniqueDestination(
+            in: directory,
+            prefix: url.deletingPathExtension().lastPathComponent,
+            pathExtension: url.pathExtension.isEmpty ? "data" : url.pathExtension
+        )
+        do {
+            try FileManager.default.moveItem(at: url, to: destination)
+            try makePrivate(destination)
+            try synchronizeFile(at: destination)
+            let preservedData = try Data(contentsOf: destination)
+            guard preservedData == expectedData else { throw POSIXError(.EIO) }
+            let permissions = try FileManager.default.attributesOfItem(atPath: destination.path)[.posixPermissions] as? NSNumber
+            guard let permissions, permissions.intValue & 0o077 == 0 else { throw POSIXError(.EPERM) }
+            try synchronizeDirectory(at: directory)
+            try synchronizeDirectory(at: rootURL)
+            return destination
+        } catch {
+            if FileManager.default.fileExists(atPath: destination.path),
+               !FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.moveItem(at: destination, to: url)
+            }
+            throw error
+        }
+    }
+
+    private func quarantineCorruptRecords(expectedData: Data) throws -> URL {
+        let createdAt = Date.now
+        let pending = RecordsQuarantineMarker(
+            phase: .pending,
+            reason: "Unreadable records metadata is awaiting verified private preservation.",
+            createdAt: createdAt
+        )
+        try writePrivate(encoder.encode(pending), to: recordsQuarantineURL)
+        if failNextWritesAt.remove(.recordsQuarantineAfterArming) != nil {
+            throw POSIXError(.EIO)
+        }
+        return try finishPendingRecordsQuarantine(expectedData: expectedData, createdAt: createdAt)
+    }
+
+    private func finishPendingRecordsQuarantine(expectedData: Data, createdAt: Date) throws -> URL {
+        let preserved = try preserveCorruptCanonicalFile(recordsURL, expectedData: expectedData)
+        if failNextWritesAt.remove(.recordsQuarantineAfterPreserving) != nil {
+            throw POSIXError(.EIO)
+        }
+        let complete = RecordsQuarantineMarker(
+            phase: .complete,
+            preservedCorruptRelativePath: relativePath(for: preserved),
+            reason: "Unreadable records metadata was verified in private preservation before safe fallback.",
+            createdAt: createdAt
+        )
+        try writePrivate(encoder.encode(complete), to: recordsQuarantineURL)
+        return preserved
+    }
+
+    private func preservedURL(for marker: RecordsQuarantineMarker) throws -> URL? {
+        guard let relativePath = marker.preservedCorruptRelativePath else { return nil }
+        let url = try safeURL(forRelativePath: relativePath)
+        guard url.deletingLastPathComponent().standardizedFileURL == rootURL
+            .appendingPathComponent("Corrupt", isDirectory: true)
+            .standardizedFileURL else {
+            throw LibraryStoreError.unsafeRelativePath(relativePath)
+        }
+        return url
+    }
+
+    private func isInstalledDurabilityError(_ error: Error) -> Bool {
+        if case LibraryStoreError.metadataInstalledButDurabilityUncertain = error { return true }
+        return false
+    }
+
+    private func synchronizeDirectory(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 }

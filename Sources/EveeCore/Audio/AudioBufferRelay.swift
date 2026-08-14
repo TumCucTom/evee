@@ -1,35 +1,47 @@
 @preconcurrency import AVFoundation
 import Foundation
 
-final class AudioBufferRelay: @unchecked Sendable {
-    typealias Handler = @Sendable (AVAudioPCMBuffer) -> Void
-    private let lock = NSLock()
+@_spi(Testing)
+public final class AudioBufferRelay: @unchecked Sendable {
+    public typealias Handler = @Sendable (CopiedAudioBuffer) -> Void
+    private let condition = NSCondition()
     private var handler: Handler?
+    private var inFlightHandlerCount = 0
 
-    func set(_ handler: Handler?) {
-        lock.lock(); defer { lock.unlock() }
+    public init() {}
+
+    public func set(_ handler: Handler?) {
+        if handler == nil {
+            detachAndWait()
+            return
+        }
+        condition.lock(); defer { condition.unlock() }
         self.handler = handler
     }
 
-    func publishCopy(of source: AVAudioPCMBuffer) {
-        guard let copy = Self.copy(source) else { return }
-        lock.lock()
-        let handler = self.handler
-        lock.unlock()
-        handler?(copy)
+    /// Detaches the producer and waits for handlers that already took a snapshot.
+    public func detachAndWait() {
+        condition.lock()
+        handler = nil
+        while inFlightHandlerCount > 0 { condition.wait() }
+        condition.unlock()
     }
 
-    private static func copy(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: source.frameLength) else { return nil }
-        copy.frameLength = source.frameLength
-        let sourceBuffers = UnsafeMutableAudioBufferListPointer(source.mutableAudioBufferList)
-        let destinationBuffers = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
-        for index in 0..<min(sourceBuffers.count, destinationBuffers.count) {
-            guard let sourceData = sourceBuffers[index].mData, let destinationData = destinationBuffers[index].mData else { continue }
-            let byteCount = min(Int(sourceBuffers[index].mDataByteSize), Int(destinationBuffers[index].mDataByteSize))
-            memcpy(destinationData, sourceData, byteCount)
-            destinationBuffers[index].mDataByteSize = UInt32(byteCount)
+    public func publishCopy(of source: AVAudioPCMBuffer) {
+        guard let copy = CopiedAudioBuffer(copying: source) else { return }
+        condition.lock()
+        guard let handler else {
+            condition.unlock()
+            return
         }
-        return copy
+        inFlightHandlerCount += 1
+        condition.unlock()
+
+        handler(copy)
+
+        condition.lock()
+        inFlightHandlerCount -= 1
+        if inFlightHandlerCount == 0 { condition.broadcast() }
+        condition.unlock()
     }
 }

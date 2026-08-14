@@ -38,15 +38,20 @@ struct LibraryView: View {
                             Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
                                 .buttonStyle(.bordered)
                                 .help("Stop and permanently discard this memo")
+                                .accessibilityLabel("Discard the current memo recording")
+                                .accessibilityHint("Stops recording and permanently deletes this memo capture.")
                             Button("Stop and save") { Task { await store.finishCapture() } }
                                 .buttonStyle(.borderedProminent)
                                 .tint(.red)
                                 .keyboardShortcut(.return, modifiers: [])
+                                .accessibilityLabel("Stop and save the current memo recording")
                         } else {
                             Button { Task { await store.beginMemo() } } label: { Label("New memo", systemImage: "waveform") }
                                 .buttonStyle(AlphaButtonStyle())
-                                .disabled(store.captureState != .idle)
+                                .disabled(store.captureState != .idle || store.isTerminationCheckpointActive)
                                 .help(store.captureState == .idle ? "Record a private voice memo" : "Finish the current capture first")
+                                .accessibilityLabel("Record a new private memo")
+                                .accessibilityHint("Starts a local microphone recording.")
                         }
                     }
                 }
@@ -63,29 +68,80 @@ struct LibraryView: View {
                         .foregroundStyle(.secondary)
 
                     ForEach(recoveryRows) { capture in
-                        HStack(spacing: 10) {
-                            Image(systemName: capture.kind == .meeting ? "person.2.wave.2" : capture.kind == .memo ? "waveform" : "text.cursor")
-                                .frame(width: 24)
-                                .foregroundStyle(AnimaTheme.violet)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Interrupted \(capture.kind.rawValue)")
-                                    .font(.system(size: 12, weight: .semibold))
-                                Text("\(capture.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(capture.tracks.count) audio \(capture.tracks.count == 1 ? "track" : "tracks")")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 9) {
+                            HStack(spacing: 10) {
+                                Image(systemName: capture.kind == .meeting ? "person.2.wave.2" : capture.kind == .memo ? "waveform" : "text.cursor")
+                                    .frame(width: 24)
+                                    .foregroundStyle(AnimaTheme.violet)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Interrupted \(capture.kind.rawValue)")
+                                        .font(.system(size: 12, weight: .semibold))
+                                    Text(capture.startedAt.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
                             }
-                            Spacer()
-                            Button("Discard", role: .destructive) {
-                                Task { await store.discardRecovery(capture) }
+
+                            ForEach(store.recoveryAssessments(for: capture)) { assessment in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: assessment.isValid ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundStyle(assessment.isValid ? Color.green : Color.orange)
+                                        .frame(width: 16)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(recoveryTrackTitle(assessment.role))
+                                            .font(.caption.weight(.semibold))
+                                        Text(assessment.isValid ? "Playable and ready to recover" : assessment.failureReason ?? "This track is not playable")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                }
+                                .accessibilityElement(children: .combine)
                             }
-                            .controlSize(.small)
-                            .disabled(store.captureState != .idle)
-                            Button("Transcribe") {
-                                Task { await store.recover(capture) }
+
+                            HStack(spacing: 7) {
+                                Button("Discard", role: .destructive) {
+                                    Task { await store.discardRecovery(capture) }
+                                }
+                                .controlSize(.small)
+                                .accessibilityLabel(AccessibilityCopy.discardRecovery(kind: capture.kind, startedAt: capture.startedAt))
+                                .accessibilityHint("Permanently deletes the interrupted capture and its local audio.")
+
+                                Spacer()
+
+                                Button("Recover all valid") {
+                                    Task { await store.recover(capture, trackSelection: .allValid) }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(!canRecoverAll(capture))
+                                .accessibilityLabel("Recover all valid tracks from interrupted \(capture.kind.rawValue)")
+                                .accessibilityHint("Transcribes every playable local audio track and saves one workspace record.")
+
+                                if capture.tracks.contains(where: { $0.role == .microphone }) {
+                                    Button("Microphone") {
+                                        Task { await store.recover(capture, trackSelection: .roles([.microphone])) }
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(!isValid(.microphone, in: capture))
+                                    .accessibilityLabel("Recover interrupted \(capture.kind.rawValue) from microphone audio")
+                                }
+
+                                if capture.tracks.contains(where: { $0.role == .system }) {
+                                    Button("System") {
+                                        Task { await store.recover(capture, trackSelection: .roles([.system])) }
+                                    }
+                                    .controlSize(.small)
+                                    .disabled(capture.kind != .meeting || !isValid(.system, in: capture))
+                                    .accessibilityLabel("Recover interrupted meeting from system audio")
+                                }
                             }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .disabled(store.captureState != .idle || !capture.tracks.contains(where: { $0.role == .microphone }))
+                            .disabled(
+                                store.captureState != .idle
+                                    || store.isTerminationCheckpointActive
+                            )
                         }
                         .accessibilityElement(children: .contain)
                     }
@@ -100,7 +156,13 @@ struct LibraryView: View {
                 TextField("Search everything you have said…", text: $store.search)
                     .textFieldStyle(.plain)
                 if !store.search.isEmpty {
-                    Button { store.search = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    Button { store.search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").accessibilityHidden(true)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(AccessibilityCopy.clearSearch)
+                    .accessibilityHint("Removes the current query and shows all workspace records.")
                 }
             }
             .padding(.horizontal, 12).frame(height: 38)
@@ -138,27 +200,33 @@ struct LibraryView: View {
 
     @ViewBuilder
     private func recordRow(_ record: WorkspaceRecord) -> some View {
-        RecordRow(record: record, snippet: searchSnippet(record))
+        RecordRow(record: record, snippet: store.indexedSnippet(for: record.id))
             .tag(record.id)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
     }
 
-    private func searchSnippet(_ record: WorkspaceRecord) -> String? {
-        let query = store.search.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return nil }
-        let source = [record.text, record.notes, record.tags.joined(separator: " ")].joined(separator: "\n")
-        guard let match = source.range(of: query, options: .caseInsensitive) else { return String(source.prefix(180)) }
-        let start = source.index(match.lowerBound, offsetBy: -70, limitedBy: source.startIndex) ?? source.startIndex
-        let end = source.index(match.upperBound, offsetBy: 110, limitedBy: source.endIndex) ?? source.endIndex
-        let prefix = start == source.startIndex ? "" : "…"
-        let suffix = end == source.endIndex ? "" : "…"
-        return prefix + source[start..<end].trimmingCharacters(in: .whitespacesAndNewlines) + suffix
-    }
-
     private var isRecordingMemo: Bool {
         guard store.captureKind == .memo, case .recording = store.captureState else { return false }
         return true
+    }
+
+    private func isValid(_ role: AudioTrackRole, in capture: CaptureRecoveryManifest) -> Bool {
+        store.recoveryAssessments(for: capture).contains { $0.role == role && $0.isValid }
+    }
+
+    private func canRecoverAll(_ capture: CaptureRecoveryManifest) -> Bool {
+        let validRoles = Set(store.recoveryAssessments(for: capture).filter(\.isValid).map(\.role))
+        guard !validRoles.isEmpty else { return false }
+        return capture.kind == .meeting || validRoles.contains(.microphone)
+    }
+
+    private func recoveryTrackTitle(_ role: AudioTrackRole) -> String {
+        switch role {
+        case .microphone: "Microphone track"
+        case .system: "System-audio track"
+        case .mixed: "Mixed track"
+        }
     }
 }
 
@@ -186,7 +254,7 @@ private struct RecordRow: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(AnimaTheme.border.opacity(0.8)))
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(record.kind.rawValue.capitalized), \(record.title), \(record.createdAt.formatted(date: .abbreviated, time: .shortened))")
+        .accessibilityLabel(AccessibilityCopy.recordRow(record: record, snippet: snippet))
     }
 
     private var icon: String { switch record.kind { case .dictation: "text.cursor"; case .meeting: "person.2.wave.2"; case .memo: "waveform" } }
