@@ -66,13 +66,13 @@ final class WorkspaceSearchTests: XCTestCase {
         for term in meetingTerms {
             let results = try await store.searchResults(term, kind: .meeting)
             XCTAssertEqual(results.first?.record.id, meeting.id, "missing indexed field for \(term)")
-            XCTAssertTrue(results.first?.snippet.localizedCaseInsensitiveContains(term), "missing indexed snippet for \(term)")
+            XCTAssertEqual(results.first?.snippet.localizedCaseInsensitiveContains(term), true, "missing indexed snippet for \(term)")
         }
 
         for term in ["MemoSupernova", "HighlightRadiance", "MemoActionGravity"] {
             let results = try await store.searchResults(term, kind: .memo)
             XCTAssertEqual(results.first?.record.id, memo.id, "missing memo insight field for \(term)")
-            XCTAssertTrue(results.first?.snippet.localizedCaseInsensitiveContains(term), "missing memo snippet for \(term)")
+            XCTAssertEqual(results.first?.snippet.localizedCaseInsensitiveContains(term), true, "missing memo snippet for \(term)")
         }
     }
 

@@ -25,7 +25,8 @@ final class SpeechModelAvailabilityAppTests: XCTestCase {
         await store.bootstrap()
 
         XCTAssertEqual(store.settings.model, .parakeet)
-        XCTAssertEqual(try await library.loadSettings().model, .parakeet)
+        let persistedSettings = try await library.loadSettings()
+        XCTAssertEqual(persistedSettings.model, .parakeet)
         XCTAssertTrue(store.statusMessage?.contains("Qwen3") == true)
     }
 
@@ -43,7 +44,8 @@ final class SpeechModelAvailabilityAppTests: XCTestCase {
 
         await store.saveSettings()
 
-        XCTAssertEqual(try await library.loadSettings().model, .parakeet)
+        let persistedSettings = try await library.loadSettings()
+        XCTAssertEqual(persistedSettings.model, .parakeet)
         XCTAssertTrue(store.statusMessage?.contains("macOS 15") == true)
     }
 }

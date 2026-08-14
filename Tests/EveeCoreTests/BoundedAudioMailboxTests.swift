@@ -1,5 +1,5 @@
 @preconcurrency import AVFoundation
-@testable import EveeCore
+@_spi(Testing) @testable import EveeCore
 import FluidAudio
 import XCTest
 

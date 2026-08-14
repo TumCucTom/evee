@@ -91,10 +91,14 @@ final class TerminationCheckpointTests: XCTestCase {
         let joined = Task { try await operation.join() }
         await gate.release(())
 
-        XCTAssertEqual(try await joined.value?.id, record.id)
-        XCTAssertNil(try await operation.join())
-        XCTAssertEqual(try await store.loadRecords().map(\.id), [record.id])
-        XCTAssertTrue(try await store.recoverableCaptures().isEmpty)
+        let joinedRecord = try await joined.value
+        let repeatedJoin = try await operation.join()
+        let records = try await store.loadRecords()
+        let recoverableCaptures = try await store.recoverableCaptures()
+        XCTAssertEqual(joinedRecord?.id, record.id)
+        XCTAssertNil(repeatedJoin)
+        XCTAssertEqual(records.map(\.id), [record.id])
+        XCTAssertTrue(recoverableCaptures.isEmpty)
     }
 
     func testTerminationWaitsForRecorderStartThenStopsOnce() async throws {
@@ -109,8 +113,10 @@ final class TerminationCheckpointTests: XCTestCase {
         }
         await gate.release(output)
 
-        XCTAssertEqual(try await stopped.value, output)
-        XCTAssertFalse(await operation.isActive)
+        let stoppedOutput = try await stopped.value
+        let operationIsActive = await operation.isActive
+        XCTAssertEqual(stoppedOutput, output)
+        XCTAssertFalse(operationIsActive)
     }
 
     func testTerminationCancelsSuspendedDeliveryBeforeAutoSend() async throws {
@@ -129,7 +135,8 @@ final class TerminationCheckpointTests: XCTestCase {
         await gate.release(())
         _ = await cancelled.value
 
-        XCTAssertEqual(await sent.value, 0)
+        let sentCount = await sent.value
+        XCTAssertEqual(sentCount, 0)
     }
 
     func testTemporaryClipboardRestoresSnapshotWhenCancelledDuringDelay() async {
@@ -166,15 +173,19 @@ final class TerminationCheckpointTests: XCTestCase {
         let record = WorkspaceRecord(kind: .meeting, title: "Synthetic", text: "Saved")
 
         let committed = try await store.commitRecoveredRecord(record, recoveryID: recovery.id, keepAudio: false)
-        XCTAssertTrue(try await store.clearMeetingDraft(forCommitted: committed, recoveryID: recovery.id))
+        let clearedCommittedDraft = try await store.clearMeetingDraft(forCommitted: committed, recoveryID: recovery.id)
+        XCTAssertTrue(clearedCommittedDraft)
 
         let relaunched = LibraryStore(rootURL: root)
-        XCTAssertNil(try await relaunched.loadMeetingDraft())
+        let clearedDraft = try await relaunched.loadMeetingDraft()
+        XCTAssertNil(clearedDraft)
 
         let unrelatedID = UUID()
         try await relaunched.saveMeetingDraft(MeetingDraft(captureID: unrelatedID, title: "Other", notes: "Keep"))
-        XCTAssertFalse(try await relaunched.clearMeetingDraft(matching: recovery.id))
-        XCTAssertEqual(try await LibraryStore(rootURL: root).loadMeetingDraft()?.captureID, unrelatedID)
+        let clearedUnrelatedDraft = try await relaunched.clearMeetingDraft(matching: recovery.id)
+        let retainedDraft = try await LibraryStore(rootURL: root).loadMeetingDraft()
+        XCTAssertFalse(clearedUnrelatedDraft)
+        XCTAssertEqual(retainedDraft?.captureID, unrelatedID)
     }
 
     func testRecoveryAdmissionIsRejectedDuringCheckpointAndAdvancesGenerationAfterward() {

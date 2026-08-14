@@ -507,17 +507,28 @@ private func recoveryCapture(
     root: URL,
     kind: WorkspaceRecordKind,
     microphoneData: Data,
-    systemData: Data
+    systemData: Data?
 ) async throws -> CaptureRecoveryManifest {
     let input = root.appendingPathComponent("Inputs", isDirectory: true)
     try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
     let microphone = input.appendingPathComponent("microphone-\(UUID().uuidString).wav")
-    let system = input.appendingPathComponent("system-\(UUID().uuidString).wav")
     try microphoneData.write(to: microphone)
-    try systemData.write(to: system)
     let capture = try await store.beginRecoveryCapture(kind: kind)
-    _ = try await store.addRecoveryTrack(captureID: capture.id, kind: kind, role: .microphone, sourceURL: microphone)
-    return try await store.addRecoveryTrack(captureID: capture.id, kind: kind, role: .system, sourceURL: system)
+    let microphoneCapture = try await store.addRecoveryTrack(
+        captureID: capture.id,
+        kind: kind,
+        role: .microphone,
+        sourceURL: microphone
+    )
+    guard let systemData else { return microphoneCapture }
+    let system = input.appendingPathComponent("system-\(UUID().uuidString).wav")
+    try systemData.write(to: system)
+    return try await store.addRecoveryTrack(
+        captureID: capture.id,
+        kind: kind,
+        role: .system,
+        sourceURL: system
+    )
 }
 
 private func resolvedURLs(_ tracks: [WorkspaceAudioTrack], in store: LibraryStore) async throws -> [URL] {

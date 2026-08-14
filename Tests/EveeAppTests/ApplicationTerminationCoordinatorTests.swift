@@ -34,7 +34,8 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
 
         XCTAssertFalse(harness.store.isTerminationCheckpointActive)
         XCTAssertTrue(harness.store.captureState.isCheckpointedForTests)
-        XCTAssertFalse(try await harness.library.recoverableCaptures().isEmpty)
+        let recoverableCaptures = try await harness.library.recoverableCaptures()
+        XCTAssertFalse(recoverableCaptures.isEmpty)
     }
 
     func testDeadlineFailureReplacesLivePresentationWithProtectedRecovery() {
@@ -116,7 +117,8 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         transcriber.fail()
         try! await checkpoint.value
         XCTAssertEqual(store.captureState, .checkpointed("Capture checkpointed for recovery. Quit again to close Evee, or open Recovery to review it."))
-        XCTAssertTrue(try! await library.recoverableCaptures().contains(where: { $0.id == manifest.id }))
+        let recoverableCaptures = try! await library.recoverableCaptures()
+        XCTAssertTrue(recoverableCaptures.contains(where: { $0.id == manifest.id }))
         await recovery.value
         XCTAssertTrue(store.isTerminationCheckpointActive)
     }
