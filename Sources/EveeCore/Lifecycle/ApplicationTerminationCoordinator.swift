@@ -96,9 +96,9 @@ public final class ApplicationTerminationCoordinator {
         Task { @MainActor [weak self] in
             do {
                 if retry {
-                    try await durability.retry()
+                    try await durability.retry(for: operationGeneration)
                 } else {
-                    try await durability.checkpoint()
+                    try await durability.checkpoint(for: operationGeneration)
                 }
                 self?.finish(
                     operationID: operationID,
@@ -154,6 +154,10 @@ public final class ApplicationTerminationCoordinator {
         reply: @escaping @MainActor (Bool) -> Void,
         reportFailure: @escaping @MainActor (Error) -> Void
     ) {
+        // A late completion from an expired request must not overwrite the
+        // durability state for a newer termination generation.
+        guard operationID == sequence else { return }
+
         let validatedResult: Result<Void, Error>
         switch result {
         case .success:

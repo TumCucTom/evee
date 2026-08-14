@@ -101,14 +101,24 @@ private final class SyntheticGenerationCheckpoint: CaptureCheckpointing {
 
 @MainActor
 private final class SuspendedGenerationCheckpoint: CaptureCheckpointing {
-    private var continuation: CheckedContinuation<Void, Error>?
+    private var continuations: [CheckedContinuation<Void, Error>] = []
     private(set) var terminationWorkGeneration: UInt64 = 0
+    private(set) var callCount = 0
+    private(set) var activeCallCount = 0
+    private(set) var maximumActiveCallCount = 0
     func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
     func checkpointForTermination() async throws {
-        try await withCheckedThrowingContinuation { continuation = $0 }
+        callCount += 1
+        activeCallCount += 1
+        maximumActiveCallCount = max(maximumActiveCallCount, activeCallCount)
+        defer { activeCallCount -= 1 }
+        try await withCheckedThrowingContinuation { continuations.append($0) }
     }
     func beginNewWork() { terminationWorkGeneration &+= 1 }
-    func succeed() { continuation?.resume(); continuation = nil }
+    func succeed() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
+    }
 }
 
 private actor SyntheticOperationGate<Value: Sendable> {
@@ -969,6 +979,23 @@ private func checkTerminationCheckpoint() async throws {
     try require(secondGenerationDecision == .terminateLater, "new work reused a stale successful checkpoint")
     while secondGenerationReplies.values.isEmpty { await Task.yield() }
     try require(generationCheckpoint.callCount == 2, "new work did not run a new checkpoint")
+
+    let serializedGeneration = SuspendedGenerationCheckpoint()
+    let serializedDurability = TerminationCheckpointCoordinator(checkpointer: serializedGeneration)
+    let oldGeneration = Task { try await serializedDurability.checkpoint(for: 0) }
+    let oldGenerationDeadline = Date().addingTimeInterval(1)
+    while serializedGeneration.callCount < 1, Date() < oldGenerationDeadline { await Task.yield() }
+    try require(serializedGeneration.callCount == 1, "old generation checkpoint did not start")
+    let freshGeneration = Task { try await serializedDurability.checkpoint(for: 1) }
+    try await Task.sleep(for: .milliseconds(10))
+    try require(serializedGeneration.callCount == 1, "new generation overlapped an active checkpoint")
+    serializedGeneration.succeed()
+    let freshGenerationDeadline = Date().addingTimeInterval(1)
+    while serializedGeneration.callCount < 2, Date() < freshGenerationDeadline { await Task.yield() }
+    try require(serializedGeneration.callCount == 2, "new generation reused an old checkpoint")
+    try require(serializedGeneration.maximumActiveCallCount == 1, "generation checkpoints overlapped")
+    serializedGeneration.succeed()
+    _ = try await (oldGeneration.value, freshGeneration.value)
 
     let suspendedGeneration = SuspendedGenerationCheckpoint()
     let suspendedReplies = LockedValues<Bool>()

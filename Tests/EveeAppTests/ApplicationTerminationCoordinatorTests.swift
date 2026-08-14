@@ -268,7 +268,7 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
     func testDeadlineCompletionCannotBeReusedAfterNewWorkStarts() async {
         let checkpoint = GenerationCaptureCheckpointer()
         let firstReplies = TerminationReplySink()
-        let coordinator = ApplicationTerminationCoordinator(deadline: .milliseconds(20))
+        let coordinator = ApplicationTerminationCoordinator(deadline: .milliseconds(100))
 
         XCTAssertEqual(coordinator.requestTermination(
             plan: .invalidateDeliveryAndAwaitCommit,
@@ -276,10 +276,12 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
             reply: firstReplies.reply,
             reportFailure: { _ in }
         ), .terminateLater)
-        await checkpoint.waitUntilCalled()
-        await waitUntil { firstReplies.values == [false] }
-        checkpoint.succeed()
-        await waitUntil { checkpoint.callCount == 1 }
+        let firstCheckpointStarted = await waitUntil { checkpoint.callCount == 1 }
+        XCTAssertTrue(firstCheckpointStarted)
+        guard checkpoint.callCount == 1 else { return }
+        let firstRequestExpired = await waitUntil { firstReplies.values == [false] }
+        XCTAssertTrue(firstRequestExpired)
+        guard firstReplies.values == [false] else { return }
 
         checkpoint.beginNewWork()
         let secondReplies = TerminationReplySink()
@@ -289,10 +291,17 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
             reply: secondReplies.reply,
             reportFailure: { _ in }
         ), .terminateLater)
-        await checkpoint.waitUntilCalled(count: 2)
-        XCTAssertEqual(checkpoint.callCount, 2)
+        let overlapped = await waitUntil(timeout: .milliseconds(10)) { checkpoint.callCount > 1 }
+        XCTAssertFalse(overlapped)
+        XCTAssertEqual(checkpoint.maximumActiveCallCount, 1)
         checkpoint.succeed()
-        await waitUntil { secondReplies.values == [true] }
+        let freshCheckpointStarted = await waitUntil { checkpoint.callCount == 2 }
+        XCTAssertTrue(freshCheckpointStarted)
+        guard checkpoint.callCount == 2 else { return }
+        XCTAssertEqual(checkpoint.maximumActiveCallCount, 1)
+        checkpoint.succeed()
+        let freshRequestSucceeded = await waitUntil { secondReplies.values == [true] }
+        XCTAssertTrue(freshRequestSucceeded)
     }
 
     func testWorkStartingWhileCheckpointSuspendedCancelsTermination() async {
@@ -307,24 +316,29 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
             reply: replies.reply,
             reportFailure: failures.report
         ), .terminateLater)
-        await checkpoint.waitUntilCalled()
+        let checkpointStarted = await waitUntil { checkpoint.callCount == 1 }
+        XCTAssertTrue(checkpointStarted)
+        guard checkpoint.callCount == 1 else { return }
         checkpoint.beginNewWork()
         checkpoint.succeed()
-        await waitUntil { !replies.values.isEmpty }
+        let requestFinished = await waitUntil { !replies.values.isEmpty }
+        XCTAssertTrue(requestFinished)
 
         XCTAssertEqual(replies.values, [false])
         XCTAssertEqual(failures.count, 1)
     }
 
+    @discardableResult
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool
-    ) async {
+    ) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         while !condition(), clock.now < deadline {
             await Task.yield()
         }
+        return condition()
     }
 }
 
@@ -416,33 +430,27 @@ private final class FailingCaptureCheckpointer: CaptureCheckpointing {
 
 @MainActor
 private final class GenerationCaptureCheckpointer: CaptureCheckpointing {
-    private var continuation: CheckedContinuation<Void, Error>?
-    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var continuations: [CheckedContinuation<Void, Error>] = []
     private(set) var callCount = 0
+    private(set) var activeCallCount = 0
+    private(set) var maximumActiveCallCount = 0
     private(set) var terminationWorkGeneration: UInt64 = 0
 
     func prepareForTerminationCheckpoint() -> UInt64 { terminationWorkGeneration }
 
     func checkpointForTermination() async throws {
         callCount += 1
-        try await withCheckedThrowingContinuation {
-            continuation = $0
-            let ready = waiters.filter { callCount >= $0.0 }
-            waiters.removeAll { callCount >= $0.0 }
-            ready.forEach { $0.1.resume() }
-        }
+        activeCallCount += 1
+        maximumActiveCallCount = max(maximumActiveCallCount, activeCallCount)
+        defer { activeCallCount -= 1 }
+        try await withCheckedThrowingContinuation { continuations.append($0) }
     }
 
     func beginNewWork() { terminationWorkGeneration &+= 1 }
 
-    func waitUntilCalled(count: Int = 1) async {
-        guard callCount < count else { return }
-        await withCheckedContinuation { waiters.append((count, $0)) }
-    }
-
     func succeed() {
-        continuation?.resume()
-        continuation = nil
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
     }
 }
 

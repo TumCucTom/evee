@@ -32,22 +32,47 @@ public extension ApplicationTerminationCheckpoint {
 public actor TerminationCheckpointCoordinator {
     private struct InFlight {
         var id: UInt64
+        var generation: UInt64
         var task: Task<Void, Error>
+    }
+
+    private struct FailedResult {
+        var generation: UInt64
+        var error: Error
     }
 
     private let checkpointer: any CaptureCheckpointing
     private var sequence: UInt64 = 0
+    private var latestGeneration: UInt64?
     private var inFlight: InFlight?
-    private var failedResult: Error?
+    private var failedResult: FailedResult?
 
     public init(checkpointer: any CaptureCheckpointing) {
         self.checkpointer = checkpointer
     }
 
-    public func checkpoint() async throws {
-        if let failedResult { throw failedResult }
-        if let inFlight {
-            try await inFlight.task.value
+    public func checkpoint(for generation: UInt64 = 0) async throws {
+        if let latestGeneration, generation < latestGeneration {
+            throw ApplicationTerminationWorkChangedError()
+        }
+        if latestGeneration != generation {
+            latestGeneration = generation
+        }
+        if failedResult?.generation != generation {
+            failedResult = nil
+        }
+        if let failedResult { throw failedResult.error }
+
+        if let operation = inFlight {
+            if operation.generation == generation {
+                try await settle(operation)
+                return
+            }
+
+            // A checkpoint owns recorder shutdown and persistence, so a newer
+            // generation must wait for it instead of starting overlapping I/O.
+            _ = try? await settle(operation)
+            try await checkpoint(for: generation)
             return
         }
 
@@ -57,23 +82,32 @@ public actor TerminationCheckpointCoordinator {
         let task = Task { @MainActor in
             try await checkpointer.checkpointForTermination()
         }
-        inFlight = InFlight(id: operationID, task: task)
+        let operation = InFlight(id: operationID, generation: generation, task: task)
+        inFlight = operation
+        try await settle(operation)
+    }
 
+    private func settle(_ operation: InFlight) async throws {
         do {
-            try await task.value
-            if inFlight?.id == operationID { inFlight = nil }
+            try await operation.task.value
+            if inFlight?.id == operation.id { inFlight = nil }
         } catch {
-            if inFlight?.id == operationID {
+            if inFlight?.id == operation.id {
                 inFlight = nil
-                failedResult = error
+                failedResult = FailedResult(generation: operation.generation, error: error)
             }
             throw error
         }
     }
 
-    public func retry() async throws {
-        failedResult = nil
-        try await checkpoint()
+    public func retry(for generation: UInt64 = 0) async throws {
+        if let latestGeneration, generation < latestGeneration {
+            throw ApplicationTerminationWorkChangedError()
+        }
+        if failedResult?.generation == generation {
+            failedResult = nil
+        }
+        try await checkpoint(for: generation)
     }
 }
 
