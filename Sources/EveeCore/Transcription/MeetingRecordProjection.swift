@@ -4,6 +4,20 @@ public enum MeetingRecordProjectionError: Error, Equatable {
     case segmentNotFound(UUID)
 }
 
+public struct MeetingSpeakerLabelDraft: Sendable, Equatable {
+    public let segmentID: UUID
+    public var text: String
+
+    public init(segmentID: UUID, text: String) {
+        self.segmentID = segmentID
+        self.text = text
+    }
+
+    public func applying(to record: WorkspaceRecord) throws -> WorkspaceRecord {
+        try MeetingRecordProjection().relabel(record: record, segmentID: segmentID, label: text)
+    }
+}
+
 public struct MeetingRecordProjection: Sendable {
     public init() {}
 
@@ -12,17 +26,19 @@ public struct MeetingRecordProjection: Sendable {
         segmentID: UUID,
         label: String?
     ) throws -> WorkspaceRecord {
-        guard let target = record.segments.first(where: { $0.id == segmentID }) else {
+        var changed = record
+        assignLegacyClusterIDs(recordID: record.id, segments: &changed.segments)
+        guard let target = changed.segments.first(where: { $0.id == segmentID }) else {
             throw MeetingRecordProjectionError.segmentNotFound(segmentID)
         }
 
         let normalized = label?.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalLabel = normalized?.isEmpty == false ? normalized : nil
-        var changed = record
         for index in changed.segments.indices {
             let belongsToCluster = target.attribution == .diarized
                 && changed.segments[index].attribution == .diarized
-                && changed.segments[index].speaker == target.speaker
+                && target.diarizationClusterID != nil
+                && changed.segments[index].diarizationClusterID == target.diarizationClusterID
             if changed.segments[index].id == segmentID || belongsToCluster {
                 changed.segments[index].speaker = finalLabel
             }
@@ -40,5 +56,26 @@ public struct MeetingRecordProjection: Sendable {
         changed.meetingIntelligence = MeetingIntelligencePipeline()
             .generate(from: changed.segments, generatedAt: now)
         return changed
+    }
+
+    private func assignLegacyClusterIDs(recordID: UUID, segments: inout [TranscriptSegment]) {
+        for index in segments.indices {
+            guard segments[index].attribution == .diarized else {
+                segments[index].diarizationClusterID = nil
+                continue
+            }
+            if let clusterID = segments[index].diarizationClusterID,
+               !clusterID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                continue
+            }
+            let recordKey = recordID.uuidString.lowercased()
+            if let speaker = segments[index].speaker?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !speaker.isEmpty {
+                let labelKey = Data(speaker.utf8).base64EncodedString()
+                segments[index].diarizationClusterID = "legacy-label:\(recordKey):\(labelKey)"
+            } else {
+                segments[index].diarizationClusterID = "legacy-segment:\(recordKey):\(segments[index].id.uuidString.lowercased())"
+            }
+        }
     }
 }

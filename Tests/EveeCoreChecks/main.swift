@@ -1584,6 +1584,52 @@ private func checkPublicRecord() throws {
 }
 
 private func checkMeetingRelabel() async throws {
+    let draftSegmentID = UUID()
+    let draftSource = WorkspaceRecord(
+        kind: .meeting,
+        title: "Draft label",
+        text: "Participant 1: First statement",
+        segments: [TranscriptSegment(
+            id: draftSegmentID,
+            start: 0,
+            end: 5,
+            speaker: "Participant 1",
+            text: "First statement",
+            attribution: .diarized,
+            diarizationClusterID: "cluster-a"
+        )]
+    )
+    var labelDraft = MeetingSpeakerLabelDraft(segmentID: draftSegmentID, text: "Participant 1")
+    labelDraft.text = "Product "
+    try require(labelDraft.text == "Product ", "speaker label draft normalized trailing space while typing")
+    try require(draftSource.segments.first?.speaker == "Participant 1", "speaker label draft mutated the record before commit")
+    labelDraft.text.append("Lead")
+    let appliedDraft = try labelDraft.applying(to: draftSource)
+    try require(appliedDraft.segments.first?.speaker == "Product Lead", "speaker label draft did not commit Product Lead")
+
+    let multiClassSegment = TranscriptSegment(
+        id: UUID(uuidString: "F5DD635B-003E-43C5-A43D-1C59A9F14C88")!,
+        start: 0,
+        end: 5,
+        speaker: "Facilitator",
+        text: "We decided I will follow up by Friday."
+    )
+    let generatedAt = Date(timeIntervalSince1970: 100)
+    let firstIntelligence = MeetingIntelligencePipeline().generate(from: [multiClassSegment], generatedAt: generatedAt)
+    let secondIntelligence = MeetingIntelligencePipeline().generate(from: [multiClassSegment], generatedAt: generatedAt)
+    let firstEvidenceIDs = [
+        try unwrapped(firstIntelligence.topics?.first?.id, "multi-class topic was absent"),
+        try unwrapped(firstIntelligence.decisions.first?.id, "multi-class decision was absent"),
+        try unwrapped(firstIntelligence.actionItems.first?.id, "multi-class action was absent"),
+    ]
+    let secondEvidenceIDs = [
+        try unwrapped(secondIntelligence.topics?.first?.id, "regenerated topic was absent"),
+        try unwrapped(secondIntelligence.decisions.first?.id, "regenerated decision was absent"),
+        try unwrapped(secondIntelligence.actionItems.first?.id, "regenerated action was absent"),
+    ]
+    try require(Set(firstEvidenceIDs).count == 3, "evidence IDs collided across topic, decision, and action classes")
+    try require(firstEvidenceIDs == secondEvidenceIDs, "evidence IDs changed across regeneration")
+
     let firstID = UUID()
     let secondID = UUID()
     let unrelatedID = UUID()
@@ -1631,6 +1677,8 @@ private func checkMeetingRelabel() async throws {
         label: " Facilitator "
     )
     try require(changed.segments.filter { $0.speaker == "Facilitator" }.count == 2, "diarized cluster relabel was partial")
+    let changedClusterIDs = changed.segments.filter { $0.speaker == "Facilitator" }.compactMap(\.diarizationClusterID)
+    try require(changedClusterIDs.count == 2 && Set(changedClusterIDs).count == 1, "legacy labelled cluster identity was not persisted")
     try require(changed.segments.map(\.id) == [firstID, unrelatedID, secondID], "segments were not chronological after relabel")
     try require(changed.text.contains("Facilitator: First statement"), "finished transcript retained the stale speaker")
     try require(changed.rawText?.contains("Facilitator: First statement") == true, "raw transcript retained the stale speaker")
@@ -1679,6 +1727,45 @@ private func checkMeetingRelabel() async throws {
     let channelChanged = try MeetingRecordProjection().relabel(record: channelRecord, segmentID: channelFirstID, label: "Guest")
     try require(channelChanged.segments.first(where: { $0.id == channelFirstID })?.speaker == "Guest", "selected channel segment was not relabelled")
     try require(channelChanged.segments.first(where: { $0.id == channelSecondID })?.speaker == "Other participant", "channel relabel changed an unrelated segment")
+    try require(channelChanged.segments.allSatisfy { $0.diarizationClusterID == nil }, "channel segments received diarization cluster identity")
+
+    let sharedLabelFirstID = UUID()
+    let sharedLabelPeerID = UUID()
+    let sharedLabelOtherID = UUID()
+    let sharedLabelRecord = WorkspaceRecord(
+        kind: .meeting,
+        title: "Shared labels",
+        text: "Participant: First\nParticipant: Second\nParticipant: Third",
+        segments: [
+            TranscriptSegment(id: sharedLabelFirstID, start: 0, end: 2, speaker: "Participant", text: "First", channel: .system, attribution: .diarized, diarizationClusterID: "cluster-a"),
+            TranscriptSegment(id: sharedLabelPeerID, start: 3, end: 5, speaker: "Participant", text: "Second", channel: .system, attribution: .diarized, diarizationClusterID: "cluster-a"),
+            TranscriptSegment(id: sharedLabelOtherID, start: 6, end: 8, speaker: "Participant", text: "Third", channel: .system, attribution: .diarized, diarizationClusterID: "cluster-b"),
+        ]
+    )
+    let sharedLabelChanged = try MeetingRecordProjection().relabel(record: sharedLabelRecord, segmentID: sharedLabelFirstID, label: nil)
+    try require(sharedLabelChanged.segments.first(where: { $0.id == sharedLabelFirstID })?.speaker == nil, "selected shared-label cluster was not cleared")
+    try require(sharedLabelChanged.segments.first(where: { $0.id == sharedLabelPeerID })?.speaker == nil, "selected shared-label cluster peer was not cleared")
+    try require(sharedLabelChanged.segments.first(where: { $0.id == sharedLabelOtherID })?.speaker == "Participant", "matching display label merged a distinct cluster")
+    let sharedLabelRenamed = try MeetingRecordProjection().relabel(record: sharedLabelChanged, segmentID: sharedLabelFirstID, label: "Product Lead")
+    try require(sharedLabelRenamed.segments.first(where: { $0.id == sharedLabelPeerID })?.speaker == "Product Lead", "cleared cluster could not be renamed independently")
+    try require(sharedLabelRenamed.segments.first(where: { $0.id == sharedLabelOtherID })?.speaker == "Participant", "cleared cluster merged with another cluster")
+
+    let legacyNilFirstID = UUID()
+    let legacyNilSecondID = UUID()
+    let legacyNilRecord = WorkspaceRecord(
+        kind: .meeting,
+        title: "Legacy unlabelled",
+        text: "First\nSecond",
+        segments: [
+            TranscriptSegment(id: legacyNilFirstID, start: 0, end: 2, text: "First", channel: .system, attribution: .diarized),
+            TranscriptSegment(id: legacyNilSecondID, start: 3, end: 5, text: "Second", channel: .system, attribution: .diarized),
+        ]
+    )
+    let legacyNilChanged = try MeetingRecordProjection().relabel(record: legacyNilRecord, segmentID: legacyNilFirstID, label: "Product Lead")
+    let legacyNilFirstCluster = legacyNilChanged.segments.first(where: { $0.id == legacyNilFirstID })?.diarizationClusterID
+    let legacyNilSecondCluster = legacyNilChanged.segments.first(where: { $0.id == legacyNilSecondID })?.diarizationClusterID
+    try require(legacyNilChanged.segments.first(where: { $0.id == legacyNilSecondID })?.speaker == nil, "legacy nil labels merged unrelated segments")
+    try require(legacyNilFirstCluster != nil && legacyNilSecondCluster != nil && legacyNilFirstCluster != legacyNilSecondCluster, "legacy nil segments did not receive separate cluster identities")
 
     print("meeting-relabel: passed")
 }

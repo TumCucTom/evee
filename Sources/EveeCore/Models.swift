@@ -299,6 +299,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
     public var text: String
     public var channel: AudioTrackRole?
     public var attribution: SpeakerAttribution
+    public var diarizationClusterID: String?
     public var confidence: Float?
     public var timingSource: TranscriptTimingSource
 
@@ -310,6 +311,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         text: String,
         channel: AudioTrackRole? = nil,
         attribution: SpeakerAttribution = .unknown,
+        diarizationClusterID: String? = nil,
         confidence: Float? = nil,
         timingSource: TranscriptTimingSource = .trackEstimate
     ) {
@@ -320,12 +322,13 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         self.text = text
         self.channel = channel
         self.attribution = attribution
+        self.diarizationClusterID = diarizationClusterID
         self.confidence = confidence
         self.timingSource = timingSource
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, start, end, speaker, text, channel, attribution, confidence, timingSource
+        case id, start, end, speaker, text, channel, attribution, diarizationClusterID, confidence, timingSource
     }
 
     public init(from decoder: Decoder) throws {
@@ -337,6 +340,7 @@ public struct TranscriptSegment: Identifiable, Codable, Hashable, Sendable {
         text = try values.decode(String.self, forKey: .text)
         channel = try values.decodeIfPresent(AudioTrackRole.self, forKey: .channel)
         attribution = try values.decodeIfPresent(SpeakerAttribution.self, forKey: .attribution) ?? .unknown
+        diarizationClusterID = try values.decodeIfPresent(String.self, forKey: .diarizationClusterID)
         confidence = try values.decodeIfPresent(Float.self, forKey: .confidence)
         timingSource = try values.decodeIfPresent(TranscriptTimingSource.self, forKey: .timingSource) ?? .trackEstimate
     }

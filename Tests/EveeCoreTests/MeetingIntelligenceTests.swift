@@ -126,9 +126,11 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertEqual(result[1].speaker, "Participant 1")
         XCTAssertEqual(result[1].start, 5, accuracy: 0.001)
         XCTAssertEqual(result[1].attribution, .diarized)
+        XCTAssertEqual(result[1].diarizationClusterID, "cluster-a")
         XCTAssertEqual(result[2].speaker, "Participant 2")
         XCTAssertEqual(result[2].start, 7, accuracy: 0.001)
         XCTAssertEqual(result[2].channel, .system)
+        XCTAssertEqual(result[2].diarizationClusterID, "cluster-b")
     }
 
     func testAssemblerDoesNotClaimRemoteIdentityWithoutDiarization() {
@@ -239,6 +241,33 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertTrue(result.summary.contains("We decided to ship the smaller scope."))
     }
 
+    func testEvidenceIDsAreStableAndNamespacedAcrossClasses() throws {
+        let segment = TranscriptSegment(
+            id: UUID(uuidString: "F5DD635B-003E-43C5-A43D-1C59A9F14C88")!,
+            start: 12,
+            end: 18,
+            speaker: "Facilitator",
+            text: "We decided I will follow up by Friday."
+        )
+        let generatedAt = Date(timeIntervalSince1970: 100)
+
+        let first = MeetingIntelligencePipeline().generate(from: [segment], generatedAt: generatedAt)
+        let second = MeetingIntelligencePipeline().generate(from: [segment], generatedAt: generatedAt)
+
+        let firstIDs = try [
+            XCTUnwrap(first.topics?.first?.id),
+            XCTUnwrap(first.decisions.first?.id),
+            XCTUnwrap(first.actionItems.first?.id),
+        ]
+        let secondIDs = try [
+            XCTUnwrap(second.topics?.first?.id),
+            XCTUnwrap(second.decisions.first?.id),
+            XCTUnwrap(second.actionItems.first?.id),
+        ]
+        XCTAssertEqual(Set(firstIDs).count, 3)
+        XCTAssertEqual(firstIDs, secondIDs)
+    }
+
     func testExtractiveIntelligenceDoesNotInventCommitments() {
         let segment = TranscriptSegment(
             start: 1,
@@ -276,6 +305,7 @@ final class MeetingIntelligenceTests: XCTestCase {
         XCTAssertEqual(decoded.id, id)
         XCTAssertNil(decoded.channel)
         XCTAssertEqual(decoded.attribution, .unknown)
+        XCTAssertNil(decoded.diarizationClusterID)
         XCTAssertNil(decoded.confidence)
         XCTAssertEqual(decoded.timingSource, .trackEstimate)
     }

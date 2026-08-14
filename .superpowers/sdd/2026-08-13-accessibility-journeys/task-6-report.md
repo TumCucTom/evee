@@ -74,3 +74,55 @@ was read or changed.
 - Full-Xcode XCTest and normal SwiftPM app-target results are therefore not
   claimed. The direct app source typecheck and executable synthetic checks cover
   the changed code available under this host toolchain.
+
+## Fix round 1 — stable evidence and speaker identity
+
+### RED
+
+- Added a synthetic sentence that is simultaneously a topic, decision, and
+  action item. The focused `meeting-relabel` check first failed because all
+  three evidence classes reused the source segment UUID.
+- Added XCTest sources and executable assertions for durable diarization cluster
+  identity. The tests first failed to compile because `TranscriptSegment` had
+  no `diarizationClusterID` field.
+- Added a staged `Product Lead` edit that verifies `Product ` remains untouched
+  while typing and the record stays unchanged until commit. The tests first
+  failed to compile because the speaker-label draft did not exist.
+
+### Implementation
+
+- Evidence IDs are now deterministic UUIDs derived from a fixed per-class
+  namespace, the source segment UUID, and an ordinal where a class can emit
+  multiple values. Topic, decision, and action IDs cannot collide for the same
+  sentence and remain stable across regeneration.
+- `TranscriptSegment` now carries an optional, Codable
+  `diarizationClusterID`. Decoding older records defaults it to `nil`, offline
+  diarization writes the source speaker-cluster ID, and channel-attributed
+  segments retain no cluster ID.
+- Relabelling now matches immutable cluster IDs rather than mutable display
+  labels. Before a legacy record is changed, labelled diarized rows receive a
+  record-scoped legacy cluster ID and unlabelled diarized rows receive separate
+  segment-scoped IDs; those IDs are returned in the canonical record for the
+  existing one-save persistence path.
+- The record detail view stages speaker text locally. Return, focus loss, the
+  explicit accessible **Save Speaker Label** action, or the record Save action
+  applies one normalized projection. Trailing and internal spaces are preserved
+  during typing; only outer whitespace is normalized at commit.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| `swift run --jobs 2 evee-core-checks --filter meeting-relabel` | Passed. Covers namespaced stable IDs, staged `Product Lead`, explicit and legacy cluster identity, canonical projections, durable search, export, and public output. |
+| `swift run --jobs 2 evee-core-checks --filter public-record` | Passed. |
+| `swift run --jobs 2 evee-core-checks --filter mcp-public-output` | Passed. |
+| All 35 explicit `evee-core-checks` filters | Passed serially. |
+| `swift build --target EveeCore --jobs 2` | Passed. |
+| `swift build --product evee-mcp --jobs 2` | Passed. |
+| Direct `swiftc -typecheck` of every `Sources/EveeApp` Swift file | Passed. |
+| `swift build --target EveeApp --jobs 2` | Blocked before EveeApp compilation because the dependency preview macros cannot load `PreviewsMacros` under Command Line Tools. |
+| `swift test --jobs 2 --filter 'Meeting(Intelligence\|RecordProjection)Tests'` | Blocked before test execution because Command Line Tools provides no importable `XCTest` module and cannot load the dependency preview macros. |
+| `git diff --check` | Clean before commit. |
+
+All new records used by this round are in-memory synthetic values. No user
+workspace or recording data was accessed.
