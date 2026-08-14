@@ -82,8 +82,8 @@ final class ContextTransformTests: XCTestCase {
             "• alpha\n• beta\n• gamma"
         )
         XCTAssertEqual(
-            try pipeline.transform(selectedText: "Send to Alice", instruction: "replace Alice with Bob"),
-            "Send to Bob"
+            try pipeline.transform(selectedText: "Alice met ALICE", instruction: "replace Alice with Bob"),
+            "Bob met Bob"
         )
     }
 
@@ -98,7 +98,7 @@ final class ContextTransformTests: XCTestCase {
         }
         XCTAssertEqual(
             SelectionTransformPipeline.supportedCommandSummary,
-            "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and exact replacement"
+            "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and replace … with … (case-insensitive, all matches)"
         )
     }
 }

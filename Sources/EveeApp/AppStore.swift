@@ -695,18 +695,15 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         } catch { statusMessage = error.localizedDescription }
     }
 
-    func observeMeetingApplication(_ snapshot: MeetingApplicationSnapshot?) {
-        guard let snapshot else {
-            meetingSuggestion = nil
-            return
-        }
-        meetingSuggestion = MeetingSuggestionPolicy(settings: meetingSuggestionSettings).evaluate(snapshot)
+    func handleMeetingSuggestion(_ event: MeetingSuggestionEvent) {
+        meetingSuggestion = MeetingSuggestionPolicy(settings: meetingSuggestionSettings)
+            .nextSuggestion(current: meetingSuggestion, event: event)
     }
 
     func dismissMeetingSuggestion(cooldown: TimeInterval = 60 * 60) {
         guard let suggestion = meetingSuggestion else { return }
         settings.meetingSuggestionDismissedUntilByBundleIdentifier[suggestion.bundleIdentifier] = .now.addingTimeInterval(cooldown)
-        meetingSuggestion = nil
+        handleMeetingSuggestion(.dismissed)
         Task {
             do {
                 try await library.save(settings)

@@ -4212,7 +4212,41 @@ private func checkMeetingSuggestion() throws {
         browserTitleTerms: [],
         dismissedUntilByBundleIdentifier: [:]
     )
-    try require(MeetingSuggestionPolicy(settings: nativeSettings).evaluate(native)?.applicationName == "Synthetic Meeting App", "native allowlist did not suggest a meeting")
+    let nativePolicy = MeetingSuggestionPolicy(settings: nativeSettings)
+    let pending = nativePolicy.nextSuggestion(current: nil, event: .observed(native))
+    try require(pending?.applicationName == "Synthetic Meeting App", "native allowlist did not suggest a meeting")
+    try require(
+        nativePolicy.nextSuggestion(current: pending, event: .ownApplicationActivated) == pending,
+        "activating Evee cleared the actionable meeting suggestion"
+    )
+    let externalNonmatch = MeetingApplicationSnapshot(
+        bundleIdentifier: "test.editor",
+        applicationName: "Synthetic Editor",
+        isBrowser: false,
+        permittedWindowTitle: nil,
+        observedAt: now
+    )
+    try require(
+        nativePolicy.nextSuggestion(current: pending, event: .observed(externalNonmatch)) == nil,
+        "an unrelated external application did not clear the meeting suggestion"
+    )
+    try require(
+        nativePolicy.nextSuggestion(current: pending, event: .dismissed) == nil,
+        "dismissing a meeting suggestion did not clear it"
+    )
+    let ownIdentity = MeetingApplicationIdentity(processIdentifier: 42, bundleIdentifier: "test.evee")
+    try require(
+        ownIdentity.matches(processIdentifier: 42, bundleIdentifier: "unexpected.bundle"),
+        "own application process identity was not recognized"
+    )
+    try require(
+        ownIdentity.matches(processIdentifier: 99, bundleIdentifier: "test.evee"),
+        "own application bundle fallback was not recognized"
+    )
+    try require(
+        !ownIdentity.matches(processIdentifier: 99, bundleIdentifier: "test.editor"),
+        "external application was mistaken for Evee"
+    )
 
     let browserSettings = MeetingSuggestionSettings(
         enabled: true,
@@ -4233,9 +4267,14 @@ private func checkMeetingSuggestion() throws {
         throw CoreCheckError.assertionFailed("unrestricted transform was accepted")
     } catch SelectionTransformError.unsupportedInstruction {}
     try require(
-        SelectionTransformPipeline.supportedCommandSummary == "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and exact replacement",
+        SelectionTransformPipeline.supportedCommandSummary == "Concise, clean up, uppercase, lowercase, title case, bullets, numbered list, and replace … with … (case-insensitive, all matches)",
         "transform scope copy drifted from supported deterministic commands"
     )
+    let replaced = try SelectionTransformPipeline().transform(
+        selectedText: "Alice met ALICE",
+        instruction: "replace Alice with Bob"
+    )
+    try require(replaced == "Bob met Bob", "documented replacement semantics did not replace all matches case-insensitively")
     print("meeting-suggestion: passed")
 }
 

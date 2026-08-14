@@ -118,3 +118,40 @@ configuration, recordings, or user data.
   or focused text is collected.
 - Task 10 remains minimal parity polish: no calendar automation, meeting join
   automation, recording auto-start, or visual redesign was introduced.
+
+## Fix round 1 — actionable meeting suggestions and exact transform copy
+
+Review of `365b051` found that activating Evee to use the suggestion banner was
+being treated as an unrelated foreground application. The runtime now classifies
+Evee activation before external metadata extraction, using the current process
+identifier first and a normalized bundle identifier as fallback. A dedicated
+core transition preserves a pending suggestion for that event, while a genuine
+external nonmatch, missing external identity, disabled settings, or Dismiss still
+clears it. Recording remains reachable only through the existing explicit Start
+Meeting action.
+
+The deterministic transform summary and unsupported-instruction error now name
+the exact replacement grammar and behavior:
+`replace … with … (case-insensitive, all matches)`. The executable and mirrored
+XCTest checks exercise two differently cased matches so the copy cannot drift
+from the parser's actual semantics.
+
+TDD evidence:
+
+- RED: `meeting-suggestion` failed because `nextSuggestion` and its self-
+  activation event did not exist. A second RED check failed because the
+  process/bundle identity matcher did not exist.
+- GREEN: the rebuilt executable's `meeting-suggestion` filter passed with self-
+  activation preservation, external nonmatch clearing, Dismiss clearing,
+  process-first/bundle-fallback identity, exact copy, and actual all-match case-
+  insensitive replacement behavior.
+
+Fresh fix verification:
+
+- All 40 current executable core filters passed serially, including
+  `meeting-suggestion` and the concurrently added `resource-seal` check.
+- `swift build --target EveeCore --jobs 2` passed.
+- Direct `swiftc -typecheck` of all current EveeApp sources passed against the
+  built package and FluidAudio C modules.
+- The focused diff, private-path, generated-artifact, secret-signature, full
+  prohibited-tree, commit-metadata, and whitespace scans passed before commit.

@@ -62,4 +62,49 @@ final class MeetingSuggestionPolicyTests: XCTestCase {
         )
         XCTAssertNotNil(MeetingSuggestionPolicy(settings: settings).evaluate(afterCooldown))
     }
+
+    func testSelfActivationPreservesSuggestionWhileExternalNonmatchAndDismissClearIt() {
+        let settings = MeetingSuggestionSettings(
+            enabled: true,
+            nativeBundleIdentifiers: ["test.meeting"],
+            browserBundleIdentifiers: [],
+            browserTitleTerms: [],
+            dismissedUntilByBundleIdentifier: [:]
+        )
+        let policy = MeetingSuggestionPolicy(settings: settings)
+        let matching = MeetingApplicationSnapshot(
+            bundleIdentifier: "test.meeting",
+            applicationName: "Synthetic Meeting App",
+            isBrowser: false,
+            permittedWindowTitle: nil,
+            observedAt: now
+        )
+        let unrelated = MeetingApplicationSnapshot(
+            bundleIdentifier: "test.editor",
+            applicationName: "Synthetic Editor",
+            isBrowser: false,
+            permittedWindowTitle: nil,
+            observedAt: now
+        )
+        let pending = policy.nextSuggestion(current: nil, event: .observed(matching))
+
+        XCTAssertEqual(
+            policy.nextSuggestion(current: pending, event: .ownApplicationActivated),
+            pending
+        )
+        XCTAssertNil(policy.nextSuggestion(current: pending, event: .observed(unrelated)))
+        XCTAssertNil(policy.nextSuggestion(current: pending, event: .dismissed))
+    }
+
+    func testOwnApplicationIdentityUsesProcessFirstAndBundleAsFallback() {
+        let identity = MeetingApplicationIdentity(
+            processIdentifier: 42,
+            bundleIdentifier: "test.evee"
+        )
+
+        XCTAssertTrue(identity.matches(processIdentifier: 42, bundleIdentifier: "unexpected.bundle"))
+        XCTAssertTrue(identity.matches(processIdentifier: 99, bundleIdentifier: "test.evee"))
+        XCTAssertFalse(identity.matches(processIdentifier: 99, bundleIdentifier: "test.editor"))
+        XCTAssertFalse(identity.matches(processIdentifier: 99, bundleIdentifier: nil))
+    }
 }

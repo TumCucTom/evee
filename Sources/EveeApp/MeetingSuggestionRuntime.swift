@@ -30,13 +30,27 @@ final class MeetingSuggestionRuntime {
 
     private func captureCurrentApplication() {
         guard let store, store.settings.meetingSuggestionsEnabled else {
-            store?.observeMeetingApplication(nil)
+            store?.handleMeetingSuggestion(.externalApplicationUnavailable)
             return
         }
-        guard let application = NSWorkspace.shared.frontmostApplication,
-              let bundleIdentifier = application.bundleIdentifier,
+        guard let application = NSWorkspace.shared.frontmostApplication else {
+            store.handleMeetingSuggestion(.externalApplicationUnavailable)
+            return
+        }
+        let ownApplication = MeetingApplicationIdentity(
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            bundleIdentifier: Bundle.main.bundleIdentifier
+        )
+        if ownApplication.matches(
+            processIdentifier: application.processIdentifier,
+            bundleIdentifier: application.bundleIdentifier
+        ) {
+            store.handleMeetingSuggestion(.ownApplicationActivated)
+            return
+        }
+        guard let bundleIdentifier = application.bundleIdentifier,
               let applicationName = application.localizedName else {
-            store.observeMeetingApplication(nil)
+            store.handleMeetingSuggestion(.externalApplicationUnavailable)
             return
         }
 
@@ -56,12 +70,12 @@ final class MeetingSuggestionRuntime {
             title = nil
         }
 
-        store.observeMeetingApplication(MeetingApplicationSnapshot(
+        store.handleMeetingSuggestion(.observed(MeetingApplicationSnapshot(
             bundleIdentifier: bundleIdentifier,
             applicationName: applicationName,
             isBrowser: isBrowser,
             permittedWindowTitle: title,
             observedAt: .now
-        ))
+        )))
     }
 }

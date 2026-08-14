@@ -56,10 +56,58 @@ public struct MeetingSuggestion: Equatable, Sendable {
     }
 }
 
+public struct MeetingApplicationIdentity: Equatable, Sendable {
+    public let processIdentifier: Int32
+    public let bundleIdentifier: String?
+
+    public init(processIdentifier: Int32, bundleIdentifier: String?) {
+        self.processIdentifier = processIdentifier
+        self.bundleIdentifier = bundleIdentifier
+    }
+
+    public func matches(processIdentifier candidateProcessIdentifier: Int32, bundleIdentifier candidateBundleIdentifier: String?) -> Bool {
+        if processIdentifier > 0, candidateProcessIdentifier == processIdentifier {
+            return true
+        }
+        guard let bundleIdentifier = normalized(bundleIdentifier),
+              let candidateBundleIdentifier = normalized(candidateBundleIdentifier) else {
+            return false
+        }
+        return bundleIdentifier == candidateBundleIdentifier
+    }
+
+    private func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
+public enum MeetingSuggestionEvent: Equatable, Sendable {
+    case observed(MeetingApplicationSnapshot)
+    case ownApplicationActivated
+    case externalApplicationUnavailable
+    case dismissed
+}
+
 public struct MeetingSuggestionPolicy: Sendable {
     private let settings: MeetingSuggestionSettings
 
     public init(settings: MeetingSuggestionSettings) { self.settings = settings }
+
+    public func nextSuggestion(
+        current: MeetingSuggestion?,
+        event: MeetingSuggestionEvent
+    ) -> MeetingSuggestion? {
+        switch event {
+        case .ownApplicationActivated:
+            return current
+        case .observed(let snapshot):
+            return evaluate(snapshot)
+        case .externalApplicationUnavailable, .dismissed:
+            return nil
+        }
+    }
 
     public func evaluate(_ snapshot: MeetingApplicationSnapshot) -> MeetingSuggestion? {
         guard settings.enabled,
