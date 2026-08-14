@@ -10,16 +10,45 @@ struct SettingsView: View {
     @State private var newBundleIdentifier = ""
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
+    @State private var writingMessage: String?
     @State private var integrationMessage: String?
     @State private var mcpInspections: [MCPClientRegistrationInspection] = []
     @State private var selectedMCPClientIDs: Set<String> = []
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newLinkPhrase = ""
     @State private var newLinkDestination = ""
+    @State private var selectedCategory = EveeSettingsCategory.voice
+    @StateObject private var workspacePrivacyEditor = WorkspaceIntelligencePrivacyEditor()
 
     var body: some View {
-        Form {
-            Section("Dictation") {
+        HStack(spacing: 0) {
+            EveeSettingsCategoryRail(selection: $selectedCategory)
+                .frame(minWidth: 170, idealWidth: 184, maxWidth: 196)
+
+            Divider()
+
+            VStack(spacing: 0) {
+                HStack(spacing: EveeSpacing.small) {
+                    Image(systemName: selectedCategory.symbolName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(EveeVisual.accent)
+                        .accessibilityHidden(true)
+                    Text(selectedCategory.title)
+                        .font(EveeTypography.pageTitle)
+                        .foregroundStyle(EveeVisual.primaryText)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.vertical, EveeSpacing.large)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isHeader)
+
+                Divider()
+
+                ScrollView {
+                LazyVStack(alignment: .leading, spacing: EveeSpacing.large) {
+            if selectedCategory == .voice {
+            EveeSettingsSection("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
@@ -63,7 +92,7 @@ struct SettingsView: View {
                 }
                 Text(store.settings.textDeliveryMode.detail)
                     .font(.caption)
-                    .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? .orange : .secondary)
+                    .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? EveeVisual.warning : EveeVisual.secondaryText)
                 Text("Selection transform is local and deterministic. Supported commands: \(SelectionTransformPipeline.supportedCommandSummary). Unsupported rewrites leave the selection unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -75,9 +104,21 @@ struct SettingsView: View {
                 Text("The selected input and latency mode take effect on the next capture.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
+                Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
+                    .disabled(store.settings.model != .parakeet)
+                if store.settings.hotMicEnabled {
+                    TextField("Wake phrase", text: $store.settings.wakePhrase)
+                    LabeledContent("Wake listener", value: store.hotMicActive ? "Active" : "Starts after Save")
+                }
+                Text("Audio cues mark recording start, processing, completion and errors. Wake-phrase listening is off by default, keeps audio in memory, uses the selected microphone and releases it before normal dictation begins.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             }
 
-            Section("Writing enhancements") {
+            if selectedCategory == .writing {
+            EveeSettingsSection("Writing enhancements") {
                 Picker("Email formatting", selection: $store.settings.emailFormattingMode) {
                     ForEach(EmailFormattingMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
                 }
@@ -112,7 +153,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Per-app writing") {
+            EveeSettingsSection("Per-app writing") {
                 if store.settings.appStyles.isEmpty {
                     Text("Add an app to give it a different tone, punctuation or paragraph style.")
                         .font(.caption)
@@ -146,20 +187,24 @@ struct SettingsView: View {
                     HStack { newAppStyleFields }
                     VStack(alignment: .leading, spacing: 8) { newAppStyleFields }
                 }
+                if let writingMessage {
+                    Text(writingMessage).font(.caption).foregroundStyle(.secondary)
+                }
+            }
             }
 
-            Section("Privacy and storage") {
+            if selectedCategory == .meetings {
+            EveeSettingsSection("Meeting capture") {
                 Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
                 Toggle("Show a live local transcript while recording", isOn: $store.settings.liveMeetingTranscriptionEnabled)
                     .disabled(store.settings.model != .parakeet)
-                HStack {
+                EveeAdaptiveActionRow {
                     Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
                         .disabled(!store.settings.meetingCaptureEnabled)
-                    Spacer()
                     if store.meetingDiarizationReady {
                         Label("Ready", systemImage: "checkmark.circle.fill")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(EveeVisual.secondaryText)
                     } else {
                         Button(store.isPreparingMeetingDiarization ? "Preparing…" : "Prepare model") {
                             Task { await store.prepareMeetingDiarization() }
@@ -174,6 +219,17 @@ struct SettingsView: View {
                         .accessibilityHint("Downloads and prepares the additional local meeting model.")
                     }
                 }
+                Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Anonymous speaker separation is off by default and uses an additional local model. Prepare it before a meeting to avoid a download while processing. If separation is unavailable, Evee still saves the transcript with honest channel labels; speaker names are never inferred.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            }
+
+            if selectedCategory == .privacyAndStorage {
+            EveeSettingsSection("Privacy and storage") {
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
@@ -189,33 +245,28 @@ struct SettingsView: View {
                 Text("Context is captured only as needed for guarded delivery and optional formatting. Long-term metadata, selected text and visible accessibility text are off by default and controlled separately. Password and protected fields are never read.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Anonymous speaker separation is off by default and uses an additional local model. Prepare it before a meeting to avoid a download while processing. If separation is unavailable, Evee still saves the transcript with honest channel labels; speaker names are never inferred.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack {
+                EveeAdaptiveActionRow {
                     Button("Export JSON") { Task { await store.exportWorkspace(format: .json) } }
                         .accessibilityLabel("Export workspace records as JSON")
                     Button("Export Markdown") { Task { await store.exportWorkspace(format: .markdown) } }
                         .accessibilityLabel("Export workspace records as Markdown")
-                    Spacer()
                     Text("Exports omit retry payload bodies and never include Keychain secrets.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
+            }
 
-            Section("Local API") {
+            if selectedCategory == .integrations {
+            EveeSettingsSection("Local API") {
                 Toggle("Enable loopback API", isOn: $store.settings.localAPIEnabled)
                 if store.settings.localAPIEnabled {
                     TextField("Port", value: $store.settings.localAPIPort, format: .number)
                     LabeledContent("Endpoint", value: store.localAPICredentials?.baseURL.absoluteString ?? "Available after Save")
-                    HStack {
+                    EveeAdaptiveActionRow {
                         SecureField("API token", text: .constant(store.localAPICredentials?.token ?? ""))
                             .textFieldStyle(.roundedBorder)
                             .disabled(true)
@@ -239,11 +290,10 @@ struct SettingsView: View {
                 TextField("Meeting webhook URL", text: $store.settings.webhookURL)
                 SecureField("Webhook signing secret", text: $store.webhookSecret)
                 if store.webhookOutboxCount > 0 {
-                    HStack {
+                    EveeAdaptiveActionRow {
                         Text("\(store.webhookOutboxCount) undelivered webhook \(store.webhookOutboxCount == 1 ? "item" : "items")")
                             .font(.caption)
-                            .foregroundStyle(.orange)
-                        Spacer()
+                            .foregroundStyle(EveeVisual.warning)
                         Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
                             .accessibilityLabel("Retry all undelivered webhook items now")
                         Button("Cancel outbox", role: .destructive) { Task { await store.cancelWebhookOutbox() } }
@@ -256,7 +306,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("MCP") {
+            EveeSettingsSection("MCP") {
                 Text("Local helper access lets the selected apps search your Evee workspace. It is off by default and can be revoked at any time without changing unrelated client settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -266,7 +316,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(mcpInspections) { inspection in
-                        HStack(alignment: .top) {
+                        EveeAdaptiveActionRow {
                             if inspection.disposition == .unregistered || inspection.disposition == .recognizedLegacy {
                                 Toggle(isOn: mcpSelectionBinding(for: inspection.client)) {
                                     mcpClientLabel(inspection)
@@ -275,7 +325,6 @@ struct SettingsView: View {
                             } else {
                                 mcpClientLabel(inspection)
                             }
-                            Spacer()
                             if !store.settings.mcpEnabled, inspection.disposition == .recognizedLegacy {
                                 Button("Adopt") {
                                     Task { await adoptMCP(inspection.client) }
@@ -294,13 +343,12 @@ struct SettingsView: View {
                 if !store.settings.mcpEnabled, !unresolvedMCPRegistrations.isEmpty {
                     Text("Local helper access remains disabled until every existing Evee entry below is explicitly selected and adopted or removed. Manual or ambiguous entries must be reviewed outside Evee.")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(EveeVisual.warning)
                 }
-                HStack {
+                EveeAdaptiveActionRow {
                     if store.settings.mcpEnabled {
                         Label("Local helper access enabled", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Spacer()
+                            .foregroundStyle(EveeVisual.success)
                         Button("Revoke access", role: .destructive) {
                             Task { await revokeMCP() }
                         }
@@ -324,12 +372,16 @@ struct SettingsView: View {
                     Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                 }
             }
-
-            Section("Local activity context") {
-                WorkspaceIntelligencePrivacyView()
             }
 
-            Section("Application") {
+            if selectedCategory == .privacyAndStorage {
+            EveeSettingsSection("Local activity context") {
+                WorkspaceIntelligencePrivacyView(editor: workspacePrivacyEditor)
+            }
+            }
+
+            if selectedCategory == .application {
+            EveeSettingsSection("Application") {
                 LaunchAtLogin.Toggle()
                 Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)
                     .accessibilityLabel(
@@ -338,17 +390,7 @@ struct SettingsView: View {
                 Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
-                Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
-                    .disabled(store.settings.model != .parakeet)
-                if store.settings.hotMicEnabled {
-                    TextField("Wake phrase", text: $store.settings.wakePhrase)
-                    LabeledContent("Wake listener", value: store.hotMicActive ? "Active" : "Starts after Save")
-                }
-                Text("Audio cues mark recording start, processing, completion and errors. Wake-phrase listening is off by default, keeps audio in memory, uses the selected microphone and releases it before normal dictation begins.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                HStack {
+                EveeAdaptiveActionRow {
                     Button(store.isCheckingForUpdates ? "Checking…" : "Check for updates") {
                         Task { await store.checkForUpdates() }
                     }
@@ -362,8 +404,10 @@ struct SettingsView: View {
                         .accessibilityHint("Creates a local diagnostic export without workspace content or secrets.")
                 }
             }
+            }
 
-            Section("Meeting suggestions") {
+            if selectedCategory == .meetings {
+            EveeSettingsSection("Meeting suggestions") {
                 Toggle("Suggest meeting recording", isOn: $store.settings.meetingSuggestionsEnabled)
                 Text("Off by default. Evee only suggests; it never starts recording automatically. Native apps are matched by bundle identifier. Browsers also require an allowed title term and Evee’s existing Accessibility permission. Page content is never read.")
                     .font(.caption)
@@ -371,6 +415,7 @@ struct SettingsView: View {
                 TextField("Native bundle identifiers, comma-separated", text: nativeMeetingApps)
                 TextField("Browser bundle identifiers, comma-separated", text: browserMeetingApps)
                 TextField("Browser title terms, comma-separated", text: browserMeetingTitleTerms)
+            }
             }
 
             HStack {
@@ -380,10 +425,14 @@ struct SettingsView: View {
                     .keyboardShortcut("s", modifiers: .command)
                     .accessibilityLabel("Save Evee settings")
             }
+                }
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.vertical, EveeSpacing.large)
+                }
+                .background(EveeVisual.canvas)
+            }
         }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
-        .background(AnimaTheme.paper)
+        .background(EveeVisual.canvas)
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()
@@ -501,7 +550,7 @@ struct SettingsView: View {
         let identifier = trimmedBundleIdentifier
         guard !identifier.isEmpty,
               !store.settings.appStyles.contains(where: { $0.bundleIdentifier.caseInsensitiveCompare(identifier) == .orderedSame }) else {
-            integrationMessage = "That app already has a style."
+            writingMessage = "That app already has a style."
             return
         }
         store.settings.appStyles.append(AppWritingStyle(
@@ -512,6 +561,7 @@ struct SettingsView: View {
         newAppName = ""
         newBundleIdentifier = ""
         newAppTone = .natural
+        writingMessage = nil
     }
 
     private func removeStyle(id: String) {
@@ -569,15 +619,15 @@ struct SettingsView: View {
             case .ownedCurrent:
                 Text("Owned Evee registration")
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(EveeVisual.success)
             case .recognizedLegacy:
                 Text("Existing Evee entry — adopt it or remove it")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
             case .ambiguous:
                 Text("Manual or ambiguous Evee entry — review this file manually")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
             }
         }
     }

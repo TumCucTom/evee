@@ -1,0 +1,139 @@
+import Foundation
+
+public enum EveeColorRole: CaseIterable, Sendable {
+    case canvas, sidebar, surface, elevatedSurface, hairline
+    case primaryText, secondaryText, tertiaryText, primaryActionForeground
+    case accent, success, warning, destructive
+}
+
+public enum EveeVisualPalette {
+    public static func rgb(_ role: EveeColorRole, appearance: InterfaceAppearance) -> RGBColor {
+        switch (appearance, role) {
+        case (.light, .canvas): RGBColor(red: 0.973, green: 0.973, blue: 0.969)
+        case (.light, .sidebar): RGBColor(red: 0.956, green: 0.951, blue: 0.976)
+        case (.light, .surface), (.light, .elevatedSurface): RGBColor(red: 1, green: 1, blue: 1)
+        case (.light, .hairline): RGBColor(red: 0.82, green: 0.82, blue: 0.80)
+        case (.light, .primaryText): RGBColor(red: 0.12, green: 0.12, blue: 0.12)
+        case (.light, .secondaryText): RGBColor(red: 0.35, green: 0.35, blue: 0.35)
+        case (.light, .tertiaryText): RGBColor(red: 0.40, green: 0.40, blue: 0.39)
+        case (.light, .primaryActionForeground): RGBColor(red: 1, green: 1, blue: 1)
+        case (.light, .accent): RGBColor(red: 0.38, green: 0.16, blue: 0.82)
+        case (.light, .success): RGBColor(red: 0.10, green: 0.45, blue: 0.27)
+        case (.light, .warning): RGBColor(red: 0.65, green: 0.32, blue: 0.02)
+        case (.light, .destructive): RGBColor(red: 0.68, green: 0.08, blue: 0.16)
+        case (.dark, .canvas): RGBColor(red: 0.082, green: 0.082, blue: 0.082)
+        case (.dark, .sidebar): RGBColor(red: 0.094, green: 0.090, blue: 0.106)
+        case (.dark, .surface): RGBColor(red: 0.118, green: 0.118, blue: 0.118)
+        case (.dark, .elevatedSurface): RGBColor(red: 0.149, green: 0.137, blue: 0.157)
+        case (.dark, .hairline): RGBColor(red: 0.231, green: 0.227, blue: 0.239)
+        case (.dark, .primaryText): RGBColor(red: 0.95, green: 0.94, blue: 0.93)
+        case (.dark, .secondaryText): RGBColor(red: 0.72, green: 0.70, blue: 0.68)
+        case (.dark, .tertiaryText): RGBColor(red: 0.60, green: 0.58, blue: 0.56)
+        case (.dark, .primaryActionForeground): RGBColor(red: 0.055, green: 0.055, blue: 0.065)
+        case (.dark, .accent): RGBColor(red: 0.62, green: 0.46, blue: 0.95)
+        case (.dark, .success): RGBColor(red: 0.39, green: 0.82, blue: 0.59)
+        case (.dark, .warning): RGBColor(red: 1, green: 0.67, blue: 0.28)
+        case (.dark, .destructive): RGBColor(red: 1, green: 0.45, blue: 0.52)
+        }
+    }
+}
+
+public enum EveeMotionKind: Sendable {
+    case press, selection, route, voiceSettlement
+}
+
+public struct EveeMotionPolicy: Equatable, Sendable {
+    public let reduceMotion: Bool
+
+    public init(reduceMotion: Bool) {
+        self.reduceMotion = reduceMotion
+    }
+
+    public func duration(for kind: EveeMotionKind) -> TimeInterval {
+        guard !reduceMotion else { return 0 }
+        return switch kind {
+        case .press: 0.12
+        case .selection: 0.2
+        case .route: 0.26
+        case .voiceSettlement: 0.36
+        }
+    }
+}
+
+public struct EveeButtonStatePresentation: Equatable, Sendable {
+    public let opacity: Double
+    public let saturation: Double
+    public let showsDisabledBoundary: Bool
+
+    public static func destructive(isEnabled: Bool) -> Self {
+        Self(
+            opacity: isEnabled ? 1 : 0.55,
+            saturation: isEnabled ? 1 : 0.3,
+            showsDisabledBoundary: !isEnabled
+        )
+    }
+}
+
+public enum VoiceThreadMode: Equatable, Sendable {
+    case idle, listening, processing, resolved, warning
+}
+
+public struct VoiceThreadPresentation: Equatable, Sendable {
+    public let mode: VoiceThreadMode
+    public let level: Double
+
+    public static func make(phase: SystemVoicePhase, level: Double?) -> Self {
+        let mode: VoiceThreadMode = switch phase {
+        case .wakeListening, .recording: .listening
+        case .wakeStarting, .wakeStopping, .captureStarting, .processing, .delivering: .processing
+        case .protected: .resolved
+        case .failed: .warning
+        case .ready: .idle
+        }
+        let measuredLevel = level.flatMap { $0.isFinite ? $0 : nil } ?? 0
+        return Self(mode: mode, level: min(1, max(0, measuredLevel)))
+    }
+}
+
+public struct CaptureOverlaySnapshot: Equatable, Sendable {
+    public let status: SystemVoiceStatus
+    public let level: Double?
+
+    public static func make(status: SystemVoiceStatus, capture: CaptureState) -> Self {
+        let level: Double? = switch capture {
+        case .recording(_, let measuredLevel) where measuredLevel.isFinite:
+            Double(measuredLevel)
+        case .idle, .starting, .recording, .transcribing, .delivering, .checkpointed, .failed:
+            nil
+        }
+        return Self(status: status, level: level)
+    }
+}
+
+public enum EveeSettingsCategory: String, CaseIterable, Identifiable, Sendable {
+    case voice, writing, meetings, privacyAndStorage, integrations, application
+
+    public var id: Self { self }
+
+    public var title: String {
+        switch self {
+        case .voice: "Voice"
+        case .writing: "Writing"
+        case .meetings: "Meetings"
+        case .privacyAndStorage: "Privacy & Storage"
+        case .integrations: "Integrations"
+        case .application: "Application"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .voice: "waveform"
+        case .writing: "textformat"
+        case .meetings: "person.2"
+        case .privacyAndStorage: "lock.doc"
+        case .integrations: "point.3.connected.trianglepath.dotted"
+        case .application: "gearshape"
+        }
+    }
+}

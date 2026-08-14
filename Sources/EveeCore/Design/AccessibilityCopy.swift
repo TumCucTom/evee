@@ -44,6 +44,21 @@ public enum AccessibilityCopy {
         return "Speaker at \(seconds / 60) minutes \(seconds % 60) seconds, \((label?.isEmpty == false ? label : nil) ?? "unlabelled")"
     }
 
+    public static func elapsedRecordingTime(startedAt: Date, now: Date) -> String {
+        let elapsedSeconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        let minutes = elapsedSeconds / 60
+        let seconds = elapsedSeconds % 60
+        var components: [String] = []
+
+        if minutes > 0 {
+            components.append("\(minutes) \(minutes == 1 ? "minute" : "minutes")")
+        }
+        if seconds > 0 || minutes == 0 {
+            components.append("\(seconds) \(seconds == 1 ? "second" : "seconds")")
+        }
+        return "\(components.joined(separator: " ")) elapsed"
+    }
+
     public static func helperRegistration(clientCount: Int) -> String {
         "Enable local helper access for \(clientCount) selected \(clientCount == 1 ? "client" : "clients")"
     }
@@ -63,7 +78,7 @@ public enum AccessibilityCopy {
     public static let cancelWebhookOutbox = "Cancel all undelivered webhook items"
 }
 
-public enum WorkspaceRouteKind: Equatable, Sendable {
+public enum WorkspaceRouteKind: Equatable, Hashable, Sendable {
     case library
     case meetings
     case memos
@@ -79,7 +94,8 @@ public enum RootLayoutMode: Equatable, Sendable {
         switch route {
         case .settings, .dictionary:
             .sidebarAndDetail
-        case .meetings where captureState != .idle:
+        case .meetings where captureState != .idle,
+             .memos where captureState != .idle:
             .sidebarAndDetail
         default:
             .threeColumn

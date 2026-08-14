@@ -122,6 +122,15 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         captureMicrophone: .closed,
         warnings: []
     )
+    @Published private(set) var captureOverlaySnapshot = CaptureOverlaySnapshot.make(
+        status: SystemVoiceStatus.make(
+            capture: .idle,
+            hotMic: .disabled,
+            captureMicrophone: .closed,
+            warnings: []
+        ),
+        capture: .idle
+    )
     @Published private(set) var meetingSuggestion: MeetingSuggestion?
 
     var modelProgress: ModelProgress? {
@@ -2185,8 +2194,13 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             captureMicrophone: captureMicrophoneState,
             warnings: captureHealthWarnings
         )
-        guard status != systemVoiceStatus else { return }
-        systemVoiceStatus = status
+        let snapshot = CaptureOverlaySnapshot.make(status: status, capture: captureState)
+        if status != systemVoiceStatus {
+            systemVoiceStatus = status
+        }
+        if snapshot != captureOverlaySnapshot {
+            captureOverlaySnapshot = snapshot
+        }
     }
 
     private func clearMicrophoneHealthWarning() {

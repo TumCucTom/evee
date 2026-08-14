@@ -23,8 +23,58 @@ public enum AccessibilityStatusEvent: Equatable, Sendable {
     case audioExportFailed(String)
 }
 
+private enum AccessibilityStatusEventKey: Equatable, Sendable {
+    case wakeListeningStarted
+    case wakeListeningStopped
+    case wakeListeningFailed
+    case captureStarted
+    case captureStopped
+    case captureCancelled
+    case captureRecovered
+    case captureFailed
+    case microphoneSilence
+    case microphoneSignalRestored
+    case channelFailed(AudioTrackRole)
+    case modelDownloadStarted
+    case modelDownloadProgress
+    case modelDownloadCancelled
+    case modelDownloadFailed
+    case modelReady
+    case webhookRevoked
+    case helperRevoked
+    case audioExported
+    case audioExportFailed
+}
+
+private extension AccessibilityStatusEvent {
+    var deduplicationKey: AccessibilityStatusEventKey {
+        switch self {
+        case .wakeListeningStarted: .wakeListeningStarted
+        case .wakeListeningStopped: .wakeListeningStopped
+        case .wakeListeningFailed: .wakeListeningFailed
+        case .captureStarted: .captureStarted
+        case .captureStopped: .captureStopped
+        case .captureCancelled: .captureCancelled
+        case .captureRecovered: .captureRecovered
+        case .captureFailed: .captureFailed
+        case .microphoneSilence: .microphoneSilence
+        case .microphoneSignalRestored: .microphoneSignalRestored
+        case .channelFailed(let role, _): .channelFailed(role)
+        case .modelDownloadStarted: .modelDownloadStarted
+        case .modelDownloadProgress: .modelDownloadProgress
+        case .modelDownloadCancelled: .modelDownloadCancelled
+        case .modelDownloadFailed: .modelDownloadFailed
+        case .modelReady: .modelReady
+        case .webhookRevoked: .webhookRevoked
+        case .helperRevoked: .helperRevoked
+        case .audioExported: .audioExported
+        case .audioExportFailed: .audioExportFailed
+        }
+    }
+}
+
 public struct AccessibilityAnnouncementReducer: Sendable {
-    private var lastEvent: AccessibilityStatusEvent?
+    private var lastEventKey: AccessibilityStatusEventKey?
     private var lastProgressBucket = 0
     private var microphoneSilenceActive = false
 
@@ -33,7 +83,7 @@ public struct AccessibilityAnnouncementReducer: Sendable {
     public mutating func receive(_ event: AccessibilityStatusEvent) -> String? {
         if event == .microphoneSignalRestored {
             microphoneSilenceActive = false
-            if lastEvent == .microphoneSilence { lastEvent = nil }
+            if lastEventKey == .microphoneSilence { lastEventKey = nil }
             return nil
         }
 
@@ -51,16 +101,17 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Local model download \(bucket * 10) percent."
         }
 
-        guard event != lastEvent else { return nil }
-        lastEvent = event
+        let eventKey = event.deduplicationKey
+        guard eventKey != lastEventKey else { return nil }
+        lastEventKey = eventKey
 
         switch event {
         case .wakeListeningStarted:
             return "Wake phrase listening started."
         case .wakeListeningStopped:
             return "Wake phrase listening stopped."
-        case .wakeListeningFailed(let message):
-            return "Wake phrase listening failed. \(message)"
+        case .wakeListeningFailed:
+            return "Wake phrase listening needs attention. Open Evee for details."
         case .captureStarted:
             return "Recording started."
         case .captureStopped:
@@ -69,23 +120,23 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Recording discarded."
         case .captureRecovered:
             return "Interrupted capture recovered."
-        case .captureFailed(let message):
-            return "Capture failed. \(message)"
+        case .captureFailed:
+            return "Capture needs attention. Open Evee for recovery options."
         case .microphoneSilence:
             return "No microphone signal has been detected. Check the selected input and mute switch."
         case .microphoneSignalRestored:
             return nil
-        case .channelFailed(let role, let message):
-            return "\(role.rawValue.capitalized) audio warning. \(message)"
+        case .channelFailed(let role, _):
+            return "\(role.rawValue.capitalized) audio needs attention. Open Evee for details."
         case .modelDownloadStarted:
             lastProgressBucket = 0
             return "Local model download started."
         case .modelDownloadCancelled:
             lastProgressBucket = 0
             return "Local model download cancelled."
-        case .modelDownloadFailed(let message):
+        case .modelDownloadFailed:
             lastProgressBucket = 0
-            return "Local model download failed. \(message)"
+            return "Local model download needs attention. Open Evee for details."
         case .modelReady:
             lastProgressBucket = 0
             return "Local model is ready."
@@ -93,10 +144,10 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Meeting webhook access revoked."
         case .helperRevoked:
             return "Local helper access revoked."
-        case .audioExported(let track):
-            return "Exported \(track) audio."
-        case .audioExportFailed(let message):
-            return "Audio export failed. \(message)"
+        case .audioExported:
+            return "Audio exported."
+        case .audioExportFailed:
+            return "Audio export needs attention. Open Evee for details."
         case .modelDownloadProgress:
             return nil
         }

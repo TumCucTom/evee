@@ -24,10 +24,13 @@ struct EveeApplication: App {
         }
         .windowStyle(.hiddenTitleBar)
 
-        MenuBarExtra("Evee", systemImage: menuIcon) {
+        MenuBarExtra {
             MenuBarView()
                 .environmentObject(store)
                 .background(WindowSharingProtectionInstaller())
+        } label: {
+            Image(systemName: menuIcon)
+                .accessibilityLabel(menuBarPresentation.closedAccessibilityLabel)
         }
         .menuBarExtraStyle(.window)
 
@@ -59,6 +62,10 @@ struct EveeApplication: App {
         case .ready: "waveform.circle"
         }
     }
+
+    private var menuBarPresentation: MenuBarVoicePresentation {
+        MenuBarVoicePresentation.make(status: store.systemVoiceStatus)
+    }
 }
 
 @MainActor
@@ -84,7 +91,7 @@ private final class EveeApplicationDelegate: NSObject, NSApplicationDelegate {
             },
             reportFailure: { [weak self] error in
                 store.reportApplicationTerminationCheckpointFailure(error)
-                self?.presentFailure("Evee could not finish its recovery checkpoint. The app stayed open and retained completed audio and notes. Check available disk space and permissions, then quit again.\n\n\(error.localizedDescription)")
+                self?.presentFailure("Evee could not finish its recovery checkpoint. The app stayed open and retained completed audio and notes. Check available disk space and permissions, then open Evee for details before quitting again.")
             }
         )
         switch decision {
@@ -119,40 +126,68 @@ private struct CaptureOverlayInstaller: View {
 /// Owns a non-activating panel so capture feedback remains visible over every
 /// application without stealing keyboard focus from the dictation target.
 @MainActor
-private final class CaptureOverlayController {
+private final class CaptureOverlayController: CaptureOverlayRendering {
     static let shared = CaptureOverlayController()
 
     private weak var store: AppStore?
     private var observation: AnyCancellable?
     private var panel: CaptureHUDPanel?
+    private var hostingView: NSHostingView<RecordingPill>?
+    private var presentationModel: CaptureOverlayPresentationModel?
+    private lazy var updateDriver = CaptureOverlayUpdateDriver(renderer: self)
 
     func install(store: AppStore) {
         guard self.store !== store else { return }
         self.store = store
-        observation = store.$systemVoiceStatus
+        observation = store.$captureOverlaySnapshot
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] status in self?.render(status) }
+            .sink { [weak self] snapshot in
+                self?.updateDriver.receive(snapshot, at: ProcessInfo.processInfo.systemUptime)
+            }
     }
 
-    private func render(_ status: SystemVoiceStatus) {
-        guard status.phase != .ready else {
-            panel?.orderOut(nil)
-            return
-        }
+    func createOverlay() {
+        guard panel == nil else { return }
+        let initialStatus = SystemVoiceStatus.make(capture: .idle, hotMic: .disabled, warnings: [])
+        let initialSnapshot = CaptureOverlaySnapshot.make(status: initialStatus, capture: .idle)
+        let model = CaptureOverlayPresentationModel(
+            presentation: CaptureOverlayPresentation.make(snapshot: initialSnapshot)
+        )
+        let hostingView = NSHostingView(rootView: RecordingPill(model: model))
+        let panel = makePanel()
+        panel.contentView = hostingView
+        panel.setContentSize(NSSize(width: 376, height: 52))
+        self.presentationModel = model
+        self.hostingView = hostingView
+        self.panel = panel
+    }
 
-        let content = RecordingPill(status: status)
+    func apply(_ presentation: CaptureOverlayPresentation) {
+        guard let model = presentationModel, let hostingView, let panel else { return }
+        let needsIntrinsicResize = !model.presentation.hasSameSemantics(as: presentation)
+        model.update(presentation)
+        guard needsIntrinsicResize else { return }
+        hostingView.invalidateIntrinsicContentSize()
+        hostingView.layoutSubtreeIfNeeded()
+        let intrinsicHeight = hostingView.fittingSize.height
+        let semanticMinimumHeight: CGFloat = presentation.phase == .failed || presentation.hasWarning ? 76 : 52
+        panel.setContentSize(NSSize(width: 376, height: max(semanticMinimumHeight, intrinsicHeight)))
+    }
 
-        let panel = panel ?? makePanel()
-        panel.contentView = NSHostingView(rootView: content)
-        panel.setContentSize(NSSize(width: 410, height: 54))
-        position(panel)
+    func presentOverlay(reposition: Bool) {
+        guard let panel else { return }
+        if reposition { position(panel) }
         panel.orderFrontRegardless()
+    }
+
+    func hideOverlay() {
+        panel?.orderOut(nil)
     }
 
     private func makePanel() -> CaptureHUDPanel {
         let panel = CaptureHUDPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 410, height: 54),
+            contentRect: NSRect(x: 0, y: 0, width: 376, height: 52),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -165,7 +200,6 @@ private final class CaptureOverlayController {
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.sharingType = .none
-        self.panel = panel
         return panel
     }
 
@@ -178,6 +212,20 @@ private final class CaptureOverlayController {
             y: visibleFrame.maxY - panel.frame.height - 10
         )
         panel.setFrameOrigin(origin)
+    }
+}
+
+@MainActor
+final class CaptureOverlayPresentationModel: ObservableObject {
+    @Published private(set) var presentation: CaptureOverlayPresentation
+
+    init(presentation: CaptureOverlayPresentation) {
+        self.presentation = presentation
+    }
+
+    func update(_ presentation: CaptureOverlayPresentation) {
+        guard self.presentation != presentation else { return }
+        self.presentation = presentation
     }
 }
 

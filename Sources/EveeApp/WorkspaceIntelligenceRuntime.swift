@@ -85,60 +85,120 @@ final class WorkspaceIntelligenceRuntime {
     }
 }
 
+@MainActor
+final class WorkspaceIntelligencePrivacyEditor: ObservableObject {
+    @Published private(set) var draft = WorkspaceIntelligencePrivacyDraft()
+    @Published private(set) var status: String?
+    @Published var showingPurgeConfirmation = false
+
+    var preferences: WorkspaceIntelligencePreferences { draft.preferences }
+
+    func binding<Value>(for keyPath: WritableKeyPath<WorkspaceIntelligencePreferences, Value>) -> Binding<Value> {
+        Binding(
+            get: { self.draft.preferences[keyPath: keyPath] },
+            set: { value in
+                var updated = self.draft.preferences
+                updated[keyPath: keyPath] = value
+                self.draft.update(updated)
+            }
+        )
+    }
+
+    func draftUpdate(_ updated: WorkspaceIntelligencePreferences) {
+        draft.update(updated)
+    }
+
+    func loadIfNeeded() async {
+        guard draft.beginInitialLoad() else { return }
+        do {
+            draft.receiveLoaded(try await WorkspaceIntelligenceStore.shared.preferences())
+        } catch {
+            status = "Activity privacy settings could not be loaded. Your current draft was kept."
+        }
+    }
+
+    func save() async {
+        let savedPreferences = draft.preferences
+        do {
+            try await WorkspaceIntelligenceStore.shared.savePreferences(savedPreferences)
+            let savedCurrentDraft = draft.markSaved(ifMatching: savedPreferences)
+            WorkspaceIntelligenceRuntime.shared.preferencesChanged()
+            status = savedCurrentDraft ? "Saved" : "Saved earlier changes. Newer edits remain unsaved."
+        } catch {
+            status = "Activity privacy settings could not be saved. Your draft was kept."
+        }
+    }
+
+    func purge() async {
+        do {
+            try await WorkspaceIntelligenceStore.shared.purge()
+            status = "Activity data deleted"
+        } catch {
+            status = "Activity data could not be deleted."
+        }
+    }
+}
+
 struct WorkspaceIntelligencePrivacyView: View {
-    @State private var preferences = WorkspaceIntelligencePreferences()
-    @State private var status: String?
-    @State private var showingPurgeConfirmation = false
+    @ObservedObject var editor: WorkspaceIntelligencePrivacyEditor
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Toggle("Track application dwell time", isOn: $preferences.isEnabled)
+            Toggle("Track application dwell time", isOn: editor.binding(for: \.isEnabled))
             Text("Off by default. When enabled, Evee stores app switches and dwell time locally. It never reads field contents, keystrokes, or screen pixels.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Toggle("Include window titles", isOn: $preferences.includeWindowTitles)
-                .disabled(!preferences.isEnabled)
+            Toggle("Include window titles", isOn: editor.binding(for: \.includeWindowTitles))
+                .disabled(!editor.preferences.isEnabled)
             Text("Window titles can contain document names or private details. Turning this off removes previously stored titles.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             Toggle("Include current web address", isOn: Binding(
-                get: { preferences.includeWebAddresses == true },
-                set: { preferences.includeWebAddresses = $0 }
+                get: { editor.preferences.includeWebAddresses == true },
+                set: { value in
+                    var updated = editor.preferences
+                    updated.includeWebAddresses = value
+                    editor.draftUpdate(updated)
+                }
             ))
-            .disabled(!preferences.isEnabled)
+            .disabled(!editor.preferences.isEnabled)
             Text("Web addresses require Accessibility permission. Query strings, fragments and credentials are removed before storage; turning this off removes the current stored address.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             Toggle("Include selected and visible accessibility text", isOn: Binding(
-                get: { preferences.includeFocusedText == true },
-                set: { preferences.includeFocusedText = $0 }
+                get: { editor.preferences.includeFocusedText == true },
+                set: { value in
+                    var updated = editor.preferences
+                    updated.includeFocusedText = value
+                    editor.draftUpdate(updated)
+                }
             ))
-            .disabled(!preferences.isEnabled)
+            .disabled(!editor.preferences.isEnabled)
             Text("Highly sensitive and off by default. When enabled, Evee stores bounded text exposed by the focused window for local context tools. Secure and protected fields are excluded. Turning this off removes the current stored text snapshot.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Toggle("Build a daily activity journal", isOn: $preferences.journalEnabled)
-                .disabled(!preferences.isEnabled)
-            Picker("Delete activity after", selection: $preferences.retentionDays) {
+            Toggle("Build a daily activity journal", isOn: editor.binding(for: \.journalEnabled))
+                .disabled(!editor.preferences.isEnabled)
+            Picker("Delete activity after", selection: editor.binding(for: \.retentionDays)) {
                 Text("1 day").tag(1)
                 Text("7 days").tag(7)
                 Text("30 days").tag(30)
                 Text("90 days").tag(90)
             }
-            .disabled(!preferences.isEnabled)
+            .disabled(!editor.preferences.isEnabled)
 
             ViewThatFits(in: .horizontal) {
                 HStack { activityActions }
                 VStack(alignment: .leading, spacing: 8) { activityActions }
             }
         }
-        .task { await load() }
-        .confirmationDialog("Delete all stored activity and journal data?", isPresented: $showingPurgeConfirmation) {
-            Button("Delete activity data", role: .destructive) { Task { await purge() } }
+        .task { await editor.loadIfNeeded() }
+        .confirmationDialog("Delete all stored activity and journal data?", isPresented: $editor.showingPurgeConfirmation) {
+            Button("Delete activity data", role: .destructive) { Task { await editor.purge() } }
                 .accessibilityLabel(AccessibilityCopy.deleteActivityData)
                 .accessibilityHint("Permanently deletes all locally stored activity observations and generated journal entries.")
             Button("Cancel", role: .cancel) {}
@@ -148,12 +208,12 @@ struct WorkspaceIntelligencePrivacyView: View {
 
     @ViewBuilder
     private var activityActions: some View {
-        Button("Save activity privacy settings") { Task { await save() } }
+        Button("Save activity privacy settings") { Task { await editor.save() } }
             .accessibilityLabel("Save local activity privacy settings")
-        Button("Delete activity data", role: .destructive) { showingPurgeConfirmation = true }
+        Button("Delete activity data", role: .destructive) { editor.showingPurgeConfirmation = true }
             .accessibilityLabel(AccessibilityCopy.deleteActivityData)
             .accessibilityHint("Shows a confirmation before permanently deleting local activity data.")
-        if let status {
+        if let status = editor.status {
             Text(status)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -161,23 +221,4 @@ struct WorkspaceIntelligencePrivacyView: View {
         }
     }
 
-    private func load() async {
-        do { preferences = try await WorkspaceIntelligenceStore.shared.preferences() }
-        catch { status = error.localizedDescription }
-    }
-
-    private func save() async {
-        do {
-            try await WorkspaceIntelligenceStore.shared.savePreferences(preferences)
-            WorkspaceIntelligenceRuntime.shared.preferencesChanged()
-            status = "Saved"
-        } catch { status = error.localizedDescription }
-    }
-
-    private func purge() async {
-        do {
-            try await WorkspaceIntelligenceStore.shared.purge()
-            status = "Activity data deleted"
-        } catch { status = error.localizedDescription }
-    }
 }

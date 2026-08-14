@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import EveeCore
 
@@ -41,11 +42,48 @@ final class AccessibilityCopyTests: XCTestCase {
         XCTAssertEqual(AccessibilityCopy.deleteActivityData, "Delete all stored activity and journal data")
     }
 
-    func testLayoutUsesTwoColumnsForDenseRoutesAndActiveMeeting() {
+    func testElapsedRecordingTimeStartsAtZero() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt),
+            "0 seconds elapsed"
+        )
+    }
+
+    func testElapsedRecordingTimeSpeaksMinuteAndSecondBoundaries() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(59)),
+            "59 seconds elapsed"
+        )
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(60)),
+            "1 minute elapsed"
+        )
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(61)),
+            "1 minute 1 second elapsed"
+        )
+    }
+
+    func testElapsedRecordingTimeClampsNegativeClockSkew() {
+        let startedAt = Date(timeIntervalSince1970: 1_786_616_100)
+
+        XCTAssertEqual(
+            AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: startedAt.addingTimeInterval(-30)),
+            "0 seconds elapsed"
+        )
+    }
+
+    func testLayoutUsesTwoColumnsForDenseRoutesAndActiveCapture() {
         XCTAssertEqual(RootLayoutMode.route(.settings, captureState: .idle), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.dictionary, captureState: .idle), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.meetings, captureState: .recording(startedAt: .distantPast, level: 0)), .sidebarAndDetail)
+        XCTAssertEqual(RootLayoutMode.route(.memos, captureState: .recording(startedAt: .distantPast, level: 0)), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.library, captureState: .idle), .threeColumn)
         XCTAssertEqual(RootLayoutMode.route(.meetings, captureState: .idle), .threeColumn)
+        XCTAssertEqual(RootLayoutMode.route(.memos, captureState: .idle), .threeColumn)
     }
 }

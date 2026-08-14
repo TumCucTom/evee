@@ -41,7 +41,7 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
 
         XCTAssertEqual(store.systemVoiceStatus.phase, .captureStarting)
         XCTAssertTrue(store.systemVoiceStatus.isMicrophoneOpen)
-        XCTAssertTrue(store.systemVoiceStatus.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(store.systemVoiceStatus.hudTitle, "Starting capture")
         XCTAssertEqual(store.systemVoiceStatus.availableActions, [.discard])
 
         systemStart.succeed()
