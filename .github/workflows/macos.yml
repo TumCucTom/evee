@@ -18,49 +18,9 @@ jobs:
         run: swift package resolve
       - name: Build
         run: swift build
-      - name: Test core
-        timeout-minutes: 5
-        run: swift test --enable-code-coverage --filter EveeCoreTests
-      - name: Test app model availability
-        id: app_model_availability
-        continue-on-error: true
-        timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --filter SpeechModelAvailabilityAppTests
-      - name: Test app hot mic
-        id: app_hot_mic
-        continue-on-error: true
-        timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --filter HotMicLifecycleTests
-      - name: Test app model download
-        id: app_model_download
-        continue-on-error: true
-        timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --filter ModelDownloadLifecycleTests
-      - name: Test app accessible capture
-        id: app_accessible_capture
-        continue-on-error: true
-        timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --parallel --num-workers 2 --filter AccessibleSystemVoiceLifecycleTests
-      - name: Test app termination
-        id: app_termination
-        if: steps.app_accessible_capture.outcome == 'success'
-        continue-on-error: true
-        timeout-minutes: 2
-        run: swift test --enable-code-coverage --skip-build --filter ApplicationTerminationCoordinatorTests
-      - name: Require all app tests
-        if: always()
-        env:
-          MODEL_AVAILABILITY: ${{ steps.app_model_availability.outcome }}
-          HOT_MIC: ${{ steps.app_hot_mic.outcome }}
-          MODEL_DOWNLOAD: ${{ steps.app_model_download.outcome }}
-          ACCESSIBLE_CAPTURE: ${{ steps.app_accessible_capture.outcome }}
-          TERMINATION: ${{ steps.app_termination.outcome }}
-        run: |
-          test "$MODEL_AVAILABILITY" = success
-          test "$HOT_MIC" = success
-          test "$MODEL_DOWNLOAD" = success
-          test "$ACCESSIBLE_CAPTURE" = success
-          test "$TERMINATION" = success
+      - name: Test
+        timeout-minutes: 10
+        run: swift test --enable-code-coverage
       - name: Smoke test MCP protocol and tools
         run: bash scripts/smoke_mcp.sh
       - name: Package app
