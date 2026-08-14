@@ -18,8 +18,12 @@ jobs:
         run: swift package resolve
       - name: Build
         run: swift build
-      - name: Test
-        run: swift test --enable-code-coverage
+      - name: Test core
+        timeout-minutes: 5
+        run: swift test --enable-code-coverage --filter EveeCoreTests
+      - name: Test app
+        timeout-minutes: 5
+        run: swift test --enable-code-coverage --skip-build --filter EveeAppTests
       - name: Smoke test MCP protocol and tools
         run: bash scripts/smoke_mcp.sh
       - name: Package app
