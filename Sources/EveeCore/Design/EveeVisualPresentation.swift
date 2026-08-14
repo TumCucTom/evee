@@ -90,8 +90,23 @@ public struct VoiceThreadPresentation: Equatable, Sendable {
         case .failed: .warning
         case .ready: .idle
         }
-        let fallback = mode == .listening ? 0.08 : 0
-        return Self(mode: mode, level: min(1, max(0, level ?? fallback)))
+        let measuredLevel = level.flatMap { $0.isFinite ? $0 : nil } ?? 0
+        return Self(mode: mode, level: min(1, max(0, measuredLevel)))
+    }
+}
+
+public struct CaptureOverlaySnapshot: Equatable, Sendable {
+    public let status: SystemVoiceStatus
+    public let level: Double?
+
+    public static func make(status: SystemVoiceStatus, capture: CaptureState) -> Self {
+        let level: Double? = switch capture {
+        case .recording(_, let measuredLevel) where measuredLevel.isFinite:
+            Double(measuredLevel)
+        case .idle, .starting, .recording, .transcribing, .delivering, .checkpointed, .failed:
+            nil
+        }
+        return Self(status: status, level: level)
     }
 }
 

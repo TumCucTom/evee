@@ -406,9 +406,34 @@ private func checkVisualPresentation() throws {
 
     try require(VoiceThreadPresentation.make(phase: .recording, level: -1).level == 0, "voice level was not clamped low")
     try require(VoiceThreadPresentation.make(phase: .recording, level: 2).level == 1, "voice level was not clamped high")
-    try require(VoiceThreadPresentation.make(phase: .recording, level: nil).level == 0.08, "missing listening level was not quiet")
+    try require(VoiceThreadPresentation.make(phase: .recording, level: nil).level == 0, "missing recording level fabricated signal")
+    try require(VoiceThreadPresentation.make(phase: .wakeListening, level: nil).level == 0, "missing wake level fabricated signal")
+    try require(VoiceThreadPresentation.make(phase: .recording, level: .nan).level == 0, "non-finite voice level survived")
+    try require(VoiceThreadPresentation.make(phase: .recording, level: .infinity).level == 0, "infinite voice level survived")
     try require(VoiceThreadPresentation.make(phase: .processing, level: 1).mode == .processing, "processing phase had the wrong voice mode")
     try require(VoiceThreadPresentation.make(phase: .protected, level: nil).mode == .resolved, "protected phase had the wrong voice mode")
+
+    let startedAt = Date(timeIntervalSince1970: 1_786_617_000)
+    let recordingStatus = SystemVoiceStatus.make(
+        capture: .recording(startedAt: startedAt, level: 0.2),
+        hotMic: .disabled,
+        warnings: []
+    )
+    let quietSnapshot = CaptureOverlaySnapshot.make(
+        status: recordingStatus,
+        capture: .recording(startedAt: startedAt, level: 0.2)
+    )
+    let louderSnapshot = CaptureOverlaySnapshot.make(
+        status: recordingStatus,
+        capture: .recording(startedAt: startedAt, level: 0.8)
+    )
+    let wakeSnapshot = CaptureOverlaySnapshot.make(
+        status: SystemVoiceStatus.make(capture: .idle, hotMic: .active, warnings: []),
+        capture: .idle
+    )
+    try require(quietSnapshot.level == Double(Float(0.2)), "overlay snapshot omitted real recording level")
+    try require(quietSnapshot != louderSnapshot, "same-phase recording level change was deduplicated")
+    try require(wakeSnapshot.level == nil, "wake snapshot fabricated a level")
 
     let reducedMotion = EveeMotionPolicy(reduceMotion: true)
     let standardMotion = EveeMotionPolicy(reduceMotion: false)
@@ -572,6 +597,68 @@ private func checkMenuWindowRecovery() throws {
         "the menu-bar action cannot recreate a closed main window"
     )
     print("menu-window-recovery: passed")
+}
+
+private func checkSettingsFeedbackOwnership() throws {
+    let settingsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Sources/EveeApp/UI/SettingsView.swift")
+    let source = try String(contentsOf: settingsURL, encoding: .utf8)
+
+    guard let writingStart = source.range(of: "if selectedCategory == .writing {")?.lowerBound,
+          let meetingsStart = source.range(of: "if selectedCategory == .meetings {")?.lowerBound,
+          let addStyleStart = source.range(of: "private func addStyle()")?.lowerBound,
+          let removeStyleStart = source.range(of: "private func removeStyle")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("settings feedback ownership boundaries were missing")
+    }
+    let writingSource = String(source[writingStart..<meetingsStart])
+    let addStyleSource = String(source[addStyleStart..<removeStyleStart])
+
+    try require(writingSource.contains("if let writingMessage"), "Writing does not render its owned feedback")
+    try require(
+        addStyleSource.contains("writingMessage = \"That app already has a style.\"") &&
+            !addStyleSource.contains("integrationMessage = \"That app already has a style.\""),
+        "duplicate app-style feedback is not owned by Writing"
+    )
+    try require(
+        source.contains("if let integrationMessage") &&
+            source.contains("integrationMessage = \"Client registration scan failed without changing any configuration:"),
+        "integration feedback paths were not preserved"
+    )
+    print("settings-feedback-ownership: passed")
+}
+
+private func checkCaptureOverlayPublication() throws {
+    let repositoryRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let appStoreSource = try String(
+        contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/AppStore.swift"),
+        encoding: .utf8
+    )
+    let appSource = try String(
+        contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/EveeApp.swift"),
+        encoding: .utf8
+    )
+    guard let controllerStart = appSource.range(of: "private final class CaptureOverlayController")?.lowerBound,
+          let panelStart = appSource.range(of: "private final class CaptureHUDPanel")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("capture overlay controller boundaries were missing")
+    }
+    let controllerSource = String(appSource[controllerStart..<panelStart])
+
+    try require(
+        appStoreSource.contains("@Published private(set) var captureOverlaySnapshot = CaptureOverlaySnapshot.make(") &&
+            appStoreSource.contains("let snapshot = CaptureOverlaySnapshot.make(status: status, capture: captureState)") &&
+            appStoreSource.contains("captureOverlaySnapshot = snapshot"),
+        "AppStore does not publish the coherent overlay snapshot from its status path"
+    )
+    try require(
+        controllerSource.contains("store.$captureOverlaySnapshot") &&
+            controllerSource.contains(".removeDuplicates()") &&
+            controllerSource.contains("self?.render(snapshot)") &&
+            controllerSource.contains("RecordingPill(status: snapshot.status, level: snapshot.level)") &&
+            !controllerSource.contains("Publishers.CombineLatest") &&
+            !controllerSource.contains("store.$captureState"),
+        "capture overlay does not render from exactly one coherent snapshot publisher"
+    )
+    print("capture-overlay-publication: passed")
 }
 
 private func checkAccessibilityCopy() throws {
@@ -4555,6 +4642,10 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkShortcutDefaults()
 } else if arguments == ["--filter", "menu-window-recovery"] {
     try checkMenuWindowRecovery()
+} else if arguments == ["--filter", "settings-feedback-ownership"] {
+    try checkSettingsFeedbackOwnership()
+} else if arguments == ["--filter", "capture-overlay-publication"] {
+    try checkCaptureOverlayPublication()
 } else if arguments == ["--filter", "accessibility-copy"] {
     try checkAccessibilityCopy()
 } else if arguments == ["--filter", "context-policy"] {
@@ -4628,6 +4719,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "resource-seal"] {
     try checkResourceSeal()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|visual-presentation|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|visual-presentation|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|settings-feedback-ownership|capture-overlay-publication|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
     exit(EXIT_FAILURE)
 }

@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var newBundleIdentifier = ""
     @State private var newAppTone: WritingTone = .natural
     @State private var selectedModelReady = false
+    @State private var writingMessage: String?
     @State private var integrationMessage: String?
     @State private var mcpInspections: [MCPClientRegistrationInspection] = []
     @State private var selectedMCPClientIDs: Set<String> = []
@@ -183,6 +184,9 @@ struct SettingsView: View {
                 ViewThatFits(in: .horizontal) {
                     HStack { newAppStyleFields }
                     VStack(alignment: .leading, spacing: 8) { newAppStyleFields }
+                }
+                if let writingMessage {
+                    Text(writingMessage).font(.caption).foregroundStyle(.secondary)
                 }
             }
             }
@@ -548,7 +552,7 @@ struct SettingsView: View {
         let identifier = trimmedBundleIdentifier
         guard !identifier.isEmpty,
               !store.settings.appStyles.contains(where: { $0.bundleIdentifier.caseInsensitiveCompare(identifier) == .orderedSame }) else {
-            integrationMessage = "That app already has a style."
+            writingMessage = "That app already has a style."
             return
         }
         store.settings.appStyles.append(AppWritingStyle(
@@ -559,6 +563,7 @@ struct SettingsView: View {
         newAppName = ""
         newBundleIdentifier = ""
         newAppTone = .natural
+        writingMessage = nil
     }
 
     private func removeStyle(id: String) {

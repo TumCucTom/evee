@@ -129,34 +129,27 @@ private final class CaptureOverlayController {
     func install(store: AppStore) {
         guard self.store !== store else { return }
         self.store = store
-        observation = Publishers.CombineLatest(
-            store.$systemVoiceStatus.removeDuplicates(),
-            store.$captureState.removeDuplicates()
-        )
+        observation = store.$captureOverlaySnapshot
+            .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] status, captureState in
-                self?.render(status, captureState: captureState)
+            .sink { [weak self] snapshot in
+                self?.render(snapshot)
             }
     }
 
-    private func render(_ status: SystemVoiceStatus, captureState: CaptureState) {
-        guard status.phase != .ready else {
+    private func render(_ snapshot: CaptureOverlaySnapshot) {
+        guard snapshot.status.phase != .ready else {
             panel?.orderOut(nil)
             return
         }
 
-        let content = RecordingPill(status: status, level: captureLevel(from: captureState))
+        let content = RecordingPill(status: snapshot.status, level: snapshot.level)
 
         let panel = panel ?? makePanel()
         panel.contentView = NSHostingView(rootView: content)
         panel.setContentSize(NSSize(width: 376, height: 52))
         position(panel)
         panel.orderFrontRegardless()
-    }
-
-    private func captureLevel(from state: CaptureState) -> Double? {
-        guard case .recording(_, let level) = state else { return nil }
-        return Double(level)
     }
 
     private func makePanel() -> CaptureHUDPanel {
