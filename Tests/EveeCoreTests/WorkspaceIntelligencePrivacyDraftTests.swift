@@ -32,7 +32,23 @@ final class WorkspaceIntelligencePrivacyDraftTests: XCTestCase {
         edited.journalEnabled = true
         draft.update(edited)
         XCTAssertTrue(draft.isDirty)
-        draft.markSaved()
+        XCTAssertTrue(draft.markSaved(ifMatching: edited))
         XCTAssertFalse(draft.isDirty)
+    }
+
+    func testCompletingOlderSaveCannotMarkNewerDraftClean() {
+        var draft = WorkspaceIntelligencePrivacyDraft()
+        var firstEdit = draft.preferences
+        firstEdit.isEnabled = true
+        draft.update(firstEdit)
+        let savedSnapshot = draft.preferences
+
+        var newerEdit = firstEdit
+        newerEdit.includeWindowTitles = true
+        draft.update(newerEdit)
+
+        XCTAssertFalse(draft.markSaved(ifMatching: savedSnapshot))
+        XCTAssertEqual(draft.preferences, newerEdit)
+        XCTAssertTrue(draft.isDirty)
     }
 }

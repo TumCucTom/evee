@@ -143,6 +143,7 @@ final class SystemVoiceStatusTests: XCTestCase {
             XCTAssertFalse(globalCopy.joined(separator: " ").contains(privateDetail))
             XCTAssertFalse(globalCopy.joined(separator: " ").contains("/Users/"))
             XCTAssertFalse(globalCopy.joined(separator: " ").contains("123E4567"))
+            XCTAssertFalse(String(reflecting: status.warnings).contains(privateDetail))
         }
     }
 }

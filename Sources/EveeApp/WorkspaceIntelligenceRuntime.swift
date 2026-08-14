@@ -118,11 +118,12 @@ final class WorkspaceIntelligencePrivacyEditor: ObservableObject {
     }
 
     func save() async {
+        let savedPreferences = draft.preferences
         do {
-            try await WorkspaceIntelligenceStore.shared.savePreferences(draft.preferences)
-            draft.markSaved()
+            try await WorkspaceIntelligenceStore.shared.savePreferences(savedPreferences)
+            let savedCurrentDraft = draft.markSaved(ifMatching: savedPreferences)
             WorkspaceIntelligenceRuntime.shared.preferencesChanged()
-            status = "Saved"
+            status = savedCurrentDraft ? "Saved" : "Saved earlier changes. Newer edits remain unsaved."
         } catch {
             status = "Activity privacy settings could not be saved. Your draft was kept."
         }

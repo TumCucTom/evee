@@ -33,7 +33,10 @@ public struct WorkspaceIntelligencePrivacyDraft: Equatable, Sendable {
         isDirty = true
     }
 
-    public mutating func markSaved() {
+    @discardableResult
+    public mutating func markSaved(ifMatching savedPreferences: WorkspaceIntelligencePreferences) -> Bool {
+        guard preferences == savedPreferences else { return false }
         isDirty = false
+        return true
     }
 }

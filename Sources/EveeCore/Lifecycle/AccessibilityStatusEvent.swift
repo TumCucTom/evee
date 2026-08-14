@@ -23,8 +23,58 @@ public enum AccessibilityStatusEvent: Equatable, Sendable {
     case audioExportFailed(String)
 }
 
+private enum AccessibilityStatusEventKey: Equatable, Sendable {
+    case wakeListeningStarted
+    case wakeListeningStopped
+    case wakeListeningFailed
+    case captureStarted
+    case captureStopped
+    case captureCancelled
+    case captureRecovered
+    case captureFailed
+    case microphoneSilence
+    case microphoneSignalRestored
+    case channelFailed(AudioTrackRole)
+    case modelDownloadStarted
+    case modelDownloadProgress
+    case modelDownloadCancelled
+    case modelDownloadFailed
+    case modelReady
+    case webhookRevoked
+    case helperRevoked
+    case audioExported
+    case audioExportFailed
+}
+
+private extension AccessibilityStatusEvent {
+    var deduplicationKey: AccessibilityStatusEventKey {
+        switch self {
+        case .wakeListeningStarted: .wakeListeningStarted
+        case .wakeListeningStopped: .wakeListeningStopped
+        case .wakeListeningFailed: .wakeListeningFailed
+        case .captureStarted: .captureStarted
+        case .captureStopped: .captureStopped
+        case .captureCancelled: .captureCancelled
+        case .captureRecovered: .captureRecovered
+        case .captureFailed: .captureFailed
+        case .microphoneSilence: .microphoneSilence
+        case .microphoneSignalRestored: .microphoneSignalRestored
+        case .channelFailed(let role, _): .channelFailed(role)
+        case .modelDownloadStarted: .modelDownloadStarted
+        case .modelDownloadProgress: .modelDownloadProgress
+        case .modelDownloadCancelled: .modelDownloadCancelled
+        case .modelDownloadFailed: .modelDownloadFailed
+        case .modelReady: .modelReady
+        case .webhookRevoked: .webhookRevoked
+        case .helperRevoked: .helperRevoked
+        case .audioExported: .audioExported
+        case .audioExportFailed: .audioExportFailed
+        }
+    }
+}
+
 public struct AccessibilityAnnouncementReducer: Sendable {
-    private var lastEvent: AccessibilityStatusEvent?
+    private var lastEventKey: AccessibilityStatusEventKey?
     private var lastProgressBucket = 0
     private var microphoneSilenceActive = false
 
@@ -33,7 +83,7 @@ public struct AccessibilityAnnouncementReducer: Sendable {
     public mutating func receive(_ event: AccessibilityStatusEvent) -> String? {
         if event == .microphoneSignalRestored {
             microphoneSilenceActive = false
-            if lastEvent == .microphoneSilence { lastEvent = nil }
+            if lastEventKey == .microphoneSilence { lastEventKey = nil }
             return nil
         }
 
@@ -51,8 +101,9 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Local model download \(bucket * 10) percent."
         }
 
-        guard event != lastEvent else { return nil }
-        lastEvent = event
+        let eventKey = event.deduplicationKey
+        guard eventKey != lastEventKey else { return nil }
+        lastEventKey = eventKey
 
         switch event {
         case .wakeListeningStarted:

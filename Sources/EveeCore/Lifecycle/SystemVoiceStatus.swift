@@ -55,6 +55,11 @@ public struct CaptureHealthWarning: Equatable, Sendable {
             "\(channelName) needs attention. Open Evee for details."
         }
     }
+
+    fileprivate var redactedForGlobalPresentation: Self {
+        guard case .failed = reason else { return self }
+        return Self(channel: channel, reason: .failed(""))
+    }
 }
 
 public struct SystemVoiceStatus: Equatable, Sendable {
@@ -76,6 +81,7 @@ public struct SystemVoiceStatus: Equatable, Sendable {
         captureMicrophone suppliedCaptureMicrophone: CaptureMicrophoneState? = nil,
         warnings: [CaptureHealthWarning]
     ) -> SystemVoiceStatus {
+        let warnings = warnings.map(\.redactedForGlobalPresentation)
         let captureMicrophone = suppliedCaptureMicrophone ?? defaultCaptureMicrophone(for: capture)
         let warningSuffix = warnings.isEmpty ? "" : " · warning"
         let warningDetail = warnings.map(\.message).joined(separator: " ")

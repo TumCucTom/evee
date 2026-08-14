@@ -63,4 +63,13 @@ final class AccessibilityStatusEventTests: XCTestCase {
 
         XCTAssertTrue(messages.allSatisfy { !$0.contains(privateDetail) && !$0.contains("/Users/") })
     }
+
+    func testFailureDeduplicationDoesNotRetainOrComparePrivateDetails() {
+        var reducer = AccessibilityAnnouncementReducer()
+
+        XCTAssertNotNil(reducer.receive(.captureFailed("/Users/alice/one.wav")))
+        XCTAssertNil(reducer.receive(.captureFailed("/Users/alice/two.wav")))
+        XCTAssertNotNil(reducer.receive(.channelFailed(.system, "/Users/alice/three.wav")))
+        XCTAssertNil(reducer.receive(.channelFailed(.system, "/Users/alice/four.wav")))
+    }
 }
