@@ -344,6 +344,15 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     guard condition() else { throw CoreCheckError.assertionFailed(message) }
 }
 
+private func requireThrows(_ message: String, _ operation: () throws -> Void) throws {
+    do {
+        try operation()
+    } catch {
+        return
+    }
+    throw CoreCheckError.assertionFailed(message)
+}
+
 private func unwrapped<Value>(_ value: Value?, _ message: String) throws -> Value {
     guard let value else { throw CoreCheckError.assertionFailed(message) }
     return value
@@ -4278,6 +4287,49 @@ private func checkMeetingSuggestion() throws {
     print("meeting-suggestion: passed")
 }
 
+private func checkResourceSeal() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent("evee-resource-seal-\(UUID().uuidString)", isDirectory: true)
+    defer { try? fileManager.removeItem(at: root) }
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+
+    func write(_ relativePath: String, _ text: String) throws {
+        let url = root.appendingPathComponent(relativePath)
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: url)
+    }
+    func seal(_ entries: [(String, String)]) throws {
+        let text = entries.map { "\($0.0)  \($0.1)" }.joined(separator: "\n") + "\n"
+        try Data(text.utf8).write(to: root.appendingPathComponent(".evee-resource-seal.sha256"))
+    }
+    let safeDigest = "8b3369944dd2a3fab39e32d1aeb1f763946a458ae3e6368a46432adc8f3a0860"
+    try write("Model.bundle/config.json", "safe")
+    try seal([(safeDigest, "Model.bundle/config.json")])
+    try ResourceSealVerifier.verify(resourcesURL: root)
+
+    try write("Model.bundle/config.json", "changed")
+    try requireThrows("seal accepted changed bytes") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try write("Model.bundle/config.json", "safe")
+    try seal([])
+    try requireThrows("seal accepted unsealed file") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try seal([(safeDigest, "../outside")])
+    try requireThrows("seal accepted traversal") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try seal([(safeDigest, "/absolute")])
+    try requireThrows("seal accepted absolute path") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try seal([("NOT-A-DIGEST", "Model.bundle/config.json")])
+    try requireThrows("seal accepted malformed digest") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try seal([(safeDigest, "Model.bundle/config.json"), (safeDigest, "Model.bundle/config.json")])
+    try requireThrows("seal accepted duplicate entry") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try fileManager.removeItem(at: root.appendingPathComponent("Model.bundle/config.json"))
+    try seal([(safeDigest, "Model.bundle/config.json")])
+    try requireThrows("seal accepted missing file") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    try write("Model.bundle/config.json", "safe")
+    try seal([(safeDigest, "Model.bundle/config.json")])
+    try fileManager.createSymbolicLink(at: root.appendingPathComponent("link"), withDestinationURL: root.appendingPathComponent("Model.bundle/config.json"))
+    try requireThrows("seal accepted symbolic link") { try ResourceSealVerifier.verify(resourcesURL: root) }
+    print("resource-seal: passed")
+}
+
 let arguments = CommandLine.arguments.dropFirst()
 if arguments == ["--filter", "accessibility-events"] {
     try checkAccessibilityEvents()
@@ -4357,6 +4409,8 @@ if arguments == ["--filter", "accessibility-events"] {
     try await checkAtomicExport()
 } else if arguments == ["--filter", "meeting-suggestion"] {
     try checkMeetingSuggestion()
+} else if arguments == ["--filter", "resource-seal"] {
+    try checkResourceSeal()
 } else {
     fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion>\n", stderr)
     exit(EXIT_FAILURE)

@@ -2,14 +2,17 @@ import EveeCore
 import Foundation
 
 enum InstallationSelfTest {
-    static func run() async throws {
+    enum ResultStatus: String {
+        case passed
+        case failed
+    }
+
+    static func run(rootURL: URL) async throws {
         guard Bundle.main.bundleIdentifier == "com.tumcuctom.evee" else {
             throw failure("The packaged bundle identifier is invalid.")
         }
-        guard let helper = Bundle.main.sharedSupportURL?
-            .deletingLastPathComponent()
-            .appendingPathComponent("Helpers/evee-mcp"),
-              FileManager.default.isExecutableFile(atPath: helper.path) else {
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/evee-mcp")
+        guard FileManager.default.isExecutableFile(atPath: helper.path) else {
             throw failure("The packaged MCP helper is missing or not executable.")
         }
         let resourceBundles = ((try? FileManager.default.contentsOfDirectory(
@@ -19,17 +22,12 @@ enum InstallationSelfTest {
         guard !resourceBundles.isEmpty else {
             throw failure("Packaged dependency resource bundles are unavailable.")
         }
-        guard let resources = Bundle.main.resourceURL,
-              FileManager.default.fileExists(
-                  atPath: resources.appendingPathComponent(".evee-resource-seal.sha256").path
-              ) else {
+        guard let resources = Bundle.main.resourceURL else {
             throw failure("The packaged resource seal is unavailable.")
         }
+        try ResourceSealVerifier.verify(resourcesURL: resources)
 
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("evee-installation-self-test-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let store = LibraryStore(rootURL: root)
+        let store = LibraryStore(rootURL: rootURL)
         let record = WorkspaceRecord(kind: .memo, title: "Installation check", text: "searchable self test")
         try await store.upsert(record)
         let matches = try await store.search("searchable")
@@ -43,6 +41,30 @@ enum InstallationSelfTest {
         guard !encoded.contains(Data("must-not-persist".utf8)) else {
             throw failure("The packaged settings encoder exposed a protected secret.")
         }
+    }
+
+    static func prepareResultReporting() throws {
+        guard let path = ProcessInfo.processInfo.environment["EVEE_SELF_TEST_RESULT_PATH"] else { return }
+        let url = URL(fileURLWithPath: path)
+        guard url.path == path, url.path.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path) else {
+            throw failure("The self-test result location is invalid.")
+        }
+    }
+
+    static func reportResult(status: ResultStatus) throws {
+        guard let path = ProcessInfo.processInfo.environment["EVEE_SELF_TEST_RESULT_PATH"] else { return }
+        let url = URL(fileURLWithPath: path)
+        guard url.path == path, url.path.hasPrefix("/"),
+              FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path) else {
+            throw failure("The self-test result location is invalid.")
+        }
+        let result: String
+        switch status {
+        case .passed: result = #"{"status":"passed"}"#
+        case .failed: result = #"{"status":"failed","category":"installation-self-test"}"#
+        }
+        try Data(result.utf8).write(to: url, options: .atomic)
     }
 
     private static func failure(_ message: String) -> NSError {

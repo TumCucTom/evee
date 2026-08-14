@@ -63,7 +63,7 @@ resource_seal="$contents/Resources/.evee-resource-seal.sha256"
   while IFS= read -r resource; do
     shasum -a 256 "$resource"
   done < <(find . -type f ! -name '.evee-resource-seal.sha256' -print | LC_ALL=C sort)
-) >"$resource_seal"
+) | sed 's#  \./#  #' >"$resource_seal"
 test -s "$resource_seal"
 
 cp /dev/stdin "$contents/Info.plist" <<'PLIST'
