@@ -221,7 +221,7 @@ struct EveePrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(EveeTypography.button)
-            .foregroundStyle(.white)
+            .foregroundStyle(EveeVisual.primaryActionForeground)
             .padding(.horizontal, EveeSpacing.large)
             .frame(minHeight: 36)
             .background(EveeVisual.spectralGradient)
@@ -263,16 +263,26 @@ struct EveeSecondaryButtonStyle: ButtonStyle {
 
 struct EveeDestructiveButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let presentation = EveeButtonStatePresentation.destructive(isEnabled: isEnabled)
+        return configuration.label
             .font(EveeTypography.button)
             .foregroundStyle(EveeVisual.destructive)
             .padding(.horizontal, EveeSpacing.medium)
             .frame(minHeight: 34)
             .background(EveeVisual.destructive.opacity(configuration.isPressed ? 0.14 : 0.08))
             .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
-            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .overlay {
+                if presentation.showsDisabledBoundary {
+                    RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous)
+                        .stroke(EveeVisual.hairline, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+                }
+            }
+            .saturation(presentation.saturation)
+            .opacity(presentation.opacity)
+            .scaleEffect(configuration.isPressed && isEnabled && !reduceMotion ? 0.985 : 1)
             .animation(EveeVisual.animation(.press, reduceMotion: reduceMotion), value: configuration.isPressed)
     }
 }

@@ -371,8 +371,9 @@ private func unwrapped<Value>(_ value: Value?, _ message: String) throws -> Valu
 private func checkActionContrast() throws {
     var minimumEnabledContrast = Double.greatestFiniteMagnitude
     for appearance in InterfaceAppearance.allCases {
+        let foreground = EveeVisualPalette.rgb(.primaryActionForeground, appearance: appearance)
         for stop in AccessibleActionPalette.gradientStops(for: appearance) {
-            let ratio = AccessibleActionPalette.foreground.contrastRatio(with: stop)
+            let ratio = foreground.contrastRatio(with: stop)
             try require(ratio >= 4.5, "\(appearance) action stop contrast was \(ratio)")
             minimumEnabledContrast = min(minimumEnabledContrast, ratio)
         }
@@ -415,6 +416,13 @@ private func checkVisualPresentation() throws {
     try require(reducedMotion.duration(for: .voiceSettlement) == 0, "reduced motion retained voice-settlement duration")
     try require(standardMotion.duration(for: .selection) == 0.2, "selection duration changed")
     try require(standardMotion.duration(for: .route) == 0.26, "route duration changed")
+
+    let enabledDestructiveButton = EveeButtonStatePresentation.destructive(isEnabled: true)
+    let disabledDestructiveButton = EveeButtonStatePresentation.destructive(isEnabled: false)
+    try require(!enabledDestructiveButton.showsDisabledBoundary, "enabled destructive button showed disabled boundary")
+    try require(disabledDestructiveButton.showsDisabledBoundary, "disabled destructive button lacked redundant boundary")
+    try require(disabledDestructiveButton.opacity < enabledDestructiveButton.opacity, "disabled destructive button opacity did not change")
+    try require(disabledDestructiveButton.saturation < enabledDestructiveButton.saturation, "disabled destructive button saturation did not change")
 
     try require(
         EveeSettingsCategory.allCases == [.voice, .writing, .meetings, .privacyAndStorage, .integrations, .application],

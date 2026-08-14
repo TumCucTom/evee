@@ -33,12 +33,22 @@ public enum InterfaceAppearance: CaseIterable, Sendable {
 }
 
 public enum AccessibleActionPalette {
-    private static let magenta = RGBColor(red: 0.714, green: 0.102, blue: 0.835)
-    private static let violet = RGBColor(red: 0.486, green: 0.141, blue: 0.882)
-    private static let electric = RGBColor(red: 0.098, green: 0.220, blue: 0.953)
+    private static let lightStops = [
+        RGBColor(red: 0.098, green: 0.220, blue: 0.953),
+        RGBColor(red: 0.486, green: 0.141, blue: 0.882),
+        RGBColor(red: 0.714, green: 0.102, blue: 0.835),
+    ]
+    private static let darkStops = [
+        RGBColor(red: 0.40, green: 0.55, blue: 1),
+        RGBColor(red: 0.68, green: 0.48, blue: 1),
+        RGBColor(red: 0.86, green: 0.39, blue: 0.96),
+    ]
+
     public static func gradientStops(for appearance: InterfaceAppearance) -> [RGBColor] {
-        _ = appearance
-        return [magenta, violet, electric]
+        switch appearance {
+        case .light: lightStops
+        case .dark: darkStops
+        }
     }
 
     public static func paper(for appearance: InterfaceAppearance) -> RGBColor {

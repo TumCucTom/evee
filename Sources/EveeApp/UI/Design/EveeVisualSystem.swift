@@ -11,25 +11,18 @@ enum EveeColors {
     static let primaryText = adaptive(.primaryText)
     static let secondaryText = adaptive(.secondaryText)
     static let tertiaryText = adaptive(.tertiaryText)
+    static let primaryActionForeground = adaptive(.primaryActionForeground)
     static let accent = adaptive(.accent)
     static let success = adaptive(.success)
     static let warning = adaptive(.warning)
     static let destructive = adaptive(.destructive)
 
-    static let spectralColors = [
-        adaptive(
-            light: NSColor(red: 0.098, green: 0.220, blue: 0.953, alpha: 1),
-            dark: NSColor(red: 0.40, green: 0.55, blue: 1, alpha: 1)
-        ),
-        adaptive(
-            light: NSColor(red: 0.486, green: 0.141, blue: 0.882, alpha: 1),
-            dark: NSColor(red: 0.68, green: 0.48, blue: 1, alpha: 1)
-        ),
-        adaptive(
-            light: NSColor(red: 0.714, green: 0.102, blue: 0.835, alpha: 1),
-            dark: NSColor(red: 0.86, green: 0.39, blue: 0.96, alpha: 1)
-        ),
-    ]
+    static let spectralColors = zip(
+        AccessibleActionPalette.gradientStops(for: .light),
+        AccessibleActionPalette.gradientStops(for: .dark)
+    ).map { light, dark in
+        adaptive(light: nsColor(light), dark: nsColor(dark))
+    }
 
     private static func adaptive(_ role: EveeColorRole) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
@@ -84,6 +77,7 @@ enum EveeVisual {
     static let primaryText = EveeColors.primaryText
     static let secondaryText = EveeColors.secondaryText
     static let tertiaryText = EveeColors.tertiaryText
+    static let primaryActionForeground = EveeColors.primaryActionForeground
     static let accent = EveeColors.accent
     static let success = EveeColors.success
     static let warning = EveeColors.warning

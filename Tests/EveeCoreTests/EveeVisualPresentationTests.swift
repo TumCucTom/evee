@@ -36,6 +36,16 @@ final class EveeVisualPresentationTests: XCTestCase {
         XCTAssertEqual(EveeMotionPolicy(reduceMotion: false).duration(for: .route), 0.26)
     }
 
+    func testDisabledDestructiveButtonUsesRedundantVisualCues() {
+        let enabled = EveeButtonStatePresentation.destructive(isEnabled: true)
+        let disabled = EveeButtonStatePresentation.destructive(isEnabled: false)
+
+        XCTAssertFalse(enabled.showsDisabledBoundary)
+        XCTAssertTrue(disabled.showsDisabledBoundary)
+        XCTAssertLessThan(disabled.opacity, enabled.opacity)
+        XCTAssertLessThan(disabled.saturation, enabled.saturation)
+    }
+
     func testSettingsCategoriesAreStableAndComplete() {
         XCTAssertEqual(
             EveeSettingsCategory.allCases,

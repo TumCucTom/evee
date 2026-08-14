@@ -2,13 +2,10 @@ import AppKit
 import SwiftUI
 
 public enum AnimaTheme {
-    public static let electric = adaptive(
-        light: NSColor(red: 0.098, green: 0.220, blue: 0.953, alpha: 1),
-        dark: NSColor(red: 0.40, green: 0.55, blue: 1, alpha: 1)
-    )
+    public static let electric = spectralColor(at: 0)
     public static let indigo = semantic(.accent)
-    public static let violet = adaptive(light: NSColor(red: 0.486, green: 0.141, blue: 0.882, alpha: 1), dark: NSColor(red: 0.68, green: 0.48, blue: 1, alpha: 1))
-    public static let magenta = adaptive(light: NSColor(red: 0.714, green: 0.102, blue: 0.835, alpha: 1), dark: NSColor(red: 0.86, green: 0.39, blue: 0.96, alpha: 1))
+    public static let violet = spectralColor(at: 1)
+    public static let magenta = spectralColor(at: 2)
     public static let periwinkle = adaptive(light: NSColor(red: 0.365, green: 0.373, blue: 0.937, alpha: 1), dark: NSColor(red: 0.58, green: 0.61, blue: 1, alpha: 1))
     public static let lilac = adaptive(light: NSColor(red: 0.612, green: 0.624, blue: 0.980, alpha: 1), dark: NSColor(red: 0.71, green: 0.72, blue: 1, alpha: 1))
     public static let aubergine = semantic(.primaryText)
@@ -25,7 +22,7 @@ public enum AnimaTheme {
         endPoint: .trailing
     )
 
-    public static let actionForeground = swiftUIColor(AccessibleActionPalette.foreground)
+    public static let actionForeground = semantic(.primaryActionForeground)
     public static let disabledActionBorder = swiftUIColor(AccessibleActionPalette.disabledBorder)
 
     private static func adaptive(light: NSColor, dark: NSColor) -> Color {
@@ -33,6 +30,13 @@ public enum AnimaTheme {
             let match = appearance.bestMatch(from: [.darkAqua, .aqua])
             return match == .darkAqua ? dark : light
         })
+    }
+
+    private static func spectralColor(at index: Int) -> Color {
+        adaptive(
+            light: nsColor(AccessibleActionPalette.gradientStops(for: .light)[index]),
+            dark: nsColor(AccessibleActionPalette.gradientStops(for: .dark)[index])
+        )
     }
 
     private static func semantic(_ role: EveeColorRole) -> Color {
