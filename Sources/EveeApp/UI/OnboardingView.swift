@@ -147,25 +147,31 @@ struct OnboardingView: View {
     }
 
     private var modelActionButton: some View {
-        Button {
-            switch presentation.modelAction {
-            case .download, .retry:
-                store.startModelDownload()
-            case .cancel:
-                store.cancelModelDownload()
-            case .none:
-                break
-            }
-        } label: {
-            Text(presentation.modelActionTitle ?? "Download")
-                .accessibilityLabel(presentation.modelAccessibilityLabel)
-        }
+        Button(presentation.modelActionTitle ?? "Download", action: activateModelAction)
         .buttonStyle(AlphaButtonStyle())
         .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
         .focused($focusedTarget, equals: .modelAction)
-        .accessibilityLabel(presentation.modelAccessibilityLabel)
-        .accessibilityValue(presentation.modelAccessibilityValue ?? "")
-        .accessibilityHint(presentation.modelAccessibilityHint)
+        .accessibilityRepresentation {
+            VStack(alignment: .leading, spacing: 0) {
+                Button(presentation.modelActionTitle ?? "Download", action: activateModelAction)
+                    .buttonStyle(.plain)
+                    .disabled(!store.microphonePermissionGranted || !store.accessibilityPermissionGranted)
+                    .accessibilityHint(presentation.modelAccessibilityHint)
+                Text(presentation.modelAccessibilityValue ?? "")
+                    .accessibilityLabel("Local model download status")
+            }
+        }
+    }
+
+    private func activateModelAction() {
+        switch presentation.modelAction {
+        case .download, .retry:
+            store.startModelDownload()
+        case .cancel:
+            store.cancelModelDownload()
+        case .none:
+            break
+        }
     }
 
     private var onboardingModelState: OnboardingModelState {

@@ -439,10 +439,14 @@ private func checkOnboardingActionAccessibility() throws {
     }
 
     let actionSource = String(source[actionStart..<actionEnd])
-    guard let visibleLabel = actionSource.range(of: "Text(presentation.modelActionTitle ?? \"Download\")"),
-          let accessibleName = actionSource.range(of: ".accessibilityLabel(presentation.modelAccessibilityLabel)"),
-          visibleLabel.lowerBound < accessibleName.lowerBound else {
-        throw CoreCheckError.assertionFailed("model action button does not apply its accessible name to the visible label")
+    guard actionSource.contains(".accessibilityRepresentation {"),
+          actionSource.contains("Button(presentation.modelActionTitle ?? \"Download\", action: activateModelAction)"),
+          actionSource.contains("Text(presentation.modelAccessibilityValue ?? \"\")"),
+          actionSource.contains(".accessibilityLabel(\"Local model download status\")"),
+          !actionSource.contains(".accessibilityValue(") else {
+        throw CoreCheckError.assertionFailed(
+            "model action does not preserve a native button name and separate download status"
+        )
     }
     print("onboarding-action-accessibility: passed")
 }
