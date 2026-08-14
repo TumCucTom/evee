@@ -15,7 +15,7 @@ enum GlobalShortcutDefaults {
 }
 
 extension KeyboardShortcuts.Name {
-    static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .option]))
+    static let pushToTalk = Self("pushToTalk", default: .init(.space, modifiers: [.command, .shift]))
     static let transformSelection = Self("transformSelection", default: .init(.space, modifiers: [.command, .option, .shift]))
     static let toggleHandsFree = Self("toggleHandsFree")
     static let cancelCapture = Self("cancelCapture", default: GlobalShortcutDefaults.cancelCapture)

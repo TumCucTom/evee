@@ -485,6 +485,22 @@ private func checkOnboardingActionAccessibility() throws {
     print("onboarding-action-accessibility: passed")
 }
 
+private func checkShortcutDefaults() throws {
+    let appStoreURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent("Sources/EveeApp/AppStore.swift")
+    let source = try String(contentsOf: appStoreURL, encoding: .utf8)
+
+    try require(
+        source.contains("static let pushToTalk = Self(\"pushToTalk\", default: .init(.space, modifiers: [.command, .shift]))"),
+        "push-to-talk does not use the non-reserved default"
+    )
+    try require(
+        !source.contains("static let pushToTalk = Self(\"pushToTalk\", default: .init(.space, modifiers: [.command, .option]))"),
+        "push-to-talk still collides with the macOS Finder search shortcut"
+    )
+    print("shortcut-defaults: passed")
+}
+
 private func checkAccessibilityCopy() throws {
     let syntheticMeeting = WorkspaceRecord(
         kind: .meeting,
@@ -4415,6 +4431,8 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkOnboardingPresentation()
 } else if arguments == ["--filter", "onboarding-action-accessibility"] {
     try checkOnboardingActionAccessibility()
+} else if arguments == ["--filter", "shortcut-defaults"] {
+    try checkShortcutDefaults()
 } else if arguments == ["--filter", "accessibility-copy"] {
     try checkAccessibilityCopy()
 } else if arguments == ["--filter", "context-policy"] {
@@ -4488,6 +4506,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "resource-seal"] {
     try checkResourceSeal()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
     exit(EXIT_FAILURE)
 }

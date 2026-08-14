@@ -180,6 +180,20 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
         XCTAssertNotEqual(KeyboardShortcuts.Name.transformSelection.defaultShortcut, expected)
         XCTAssertEqual(GlobalShortcutDefaults.cancelCaptureDescription, "Control–Option–Command–Escape")
     }
+
+    func testPushToTalkDefaultDoesNotCollideWithFinderSearch() {
+        let expected = KeyboardShortcuts.Shortcut(
+            .space,
+            modifiers: [.command, .shift]
+        )
+        let finderSearch = KeyboardShortcuts.Shortcut(
+            .space,
+            modifiers: [.command, .option]
+        )
+
+        XCTAssertEqual(KeyboardShortcuts.Name.pushToTalk.defaultShortcut, expected)
+        XCTAssertNotEqual(KeyboardShortcuts.Name.pushToTalk.defaultShortcut, finderSearch)
+    }
 }
 
 @MainActor
