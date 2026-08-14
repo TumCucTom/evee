@@ -22,6 +22,34 @@ final class EveeVisualPresentationTests: XCTestCase {
         }
     }
 
+    func testLightTertiaryTextMeetsAAAgainstEveryRealSurface() {
+        let tertiary = EveeVisualPalette.rgb(.tertiaryText, appearance: .light)
+        for backgroundRole in [EveeColorRole.canvas, .sidebar, .surface] {
+            let background = EveeVisualPalette.rgb(backgroundRole, appearance: .light)
+            XCTAssertGreaterThanOrEqual(
+                tertiary.contrastRatio(with: background),
+                4.5,
+                "light tertiary text must meet AA against \(backgroundRole)"
+            )
+        }
+    }
+
+    func testSmallSemanticStateTextMeetsAAOnChangedSurfaces() {
+        for appearance in InterfaceAppearance.allCases {
+            for foregroundRole in [EveeColorRole.success, .warning, .destructive] {
+                let foreground = EveeVisualPalette.rgb(foregroundRole, appearance: appearance)
+                for backgroundRole in [EveeColorRole.canvas, .surface, .elevatedSurface] {
+                    let background = EveeVisualPalette.rgb(backgroundRole, appearance: appearance)
+                    XCTAssertGreaterThanOrEqual(
+                        foreground.contrastRatio(with: background),
+                        4.5,
+                        "\(foregroundRole) text must meet AA against \(backgroundRole) in \(appearance)"
+                    )
+                }
+            }
+        }
+    }
+
     func testVoiceLevelUsesOnlyFiniteMeasuredSignal() {
         XCTAssertEqual(VoiceThreadPresentation.make(phase: .recording, level: -1).level, 0)
         XCTAssertEqual(VoiceThreadPresentation.make(phase: .recording, level: 2).level, 1)
@@ -90,6 +118,15 @@ final class EveeVisualPresentationTests: XCTestCase {
         XCTAssertEqual(EveeMotionPolicy(reduceMotion: true).duration(for: .voiceSettlement), 0)
         XCTAssertEqual(EveeMotionPolicy(reduceMotion: false).duration(for: .selection), 0.2)
         XCTAssertEqual(EveeMotionPolicy(reduceMotion: false).duration(for: .route), 0.26)
+    }
+
+    func testReadyIsNeutralAndSuccessIsReservedForProtectedState() {
+        XCTAssertEqual(VoiceStatusTone.make(phase: .ready, hasWarning: false), .neutral)
+        XCTAssertEqual(VoiceStatusTone.make(phase: .protected, hasWarning: false), .success)
+        XCTAssertEqual(VoiceStatusTone.make(phase: .recording, hasWarning: false), .accent)
+        XCTAssertEqual(VoiceStatusTone.make(phase: .processing, hasWarning: false), .neutral)
+        XCTAssertEqual(VoiceStatusTone.make(phase: .failed, hasWarning: false), .destructive)
+        XCTAssertEqual(VoiceStatusTone.make(phase: .ready, hasWarning: true), .warning)
     }
 
     func testDisabledDestructiveButtonUsesRedundantVisualCues() {

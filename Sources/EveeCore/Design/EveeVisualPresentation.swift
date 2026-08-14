@@ -15,7 +15,7 @@ public enum EveeVisualPalette {
         case (.light, .hairline): RGBColor(red: 0.82, green: 0.82, blue: 0.80)
         case (.light, .primaryText): RGBColor(red: 0.12, green: 0.12, blue: 0.12)
         case (.light, .secondaryText): RGBColor(red: 0.35, green: 0.35, blue: 0.35)
-        case (.light, .tertiaryText): RGBColor(red: 0.48, green: 0.48, blue: 0.47)
+        case (.light, .tertiaryText): RGBColor(red: 0.40, green: 0.40, blue: 0.39)
         case (.light, .primaryActionForeground): RGBColor(red: 1, green: 1, blue: 1)
         case (.light, .accent): RGBColor(red: 0.38, green: 0.16, blue: 0.82)
         case (.light, .success): RGBColor(red: 0.10, green: 0.45, blue: 0.27)

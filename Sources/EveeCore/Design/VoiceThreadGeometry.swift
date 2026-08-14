@@ -1,30 +1,29 @@
 public enum VoiceThreadGeometry {
-    private static let fixedHalfEnvelope = [0.0, -0.34, 0.58, -0.78, 1.0]
+    public static let sampleCount = 9
 
-    public static func points(level: Double, count: Int) -> [Double] {
-        let sampleCount = normalizedSampleCount(count)
-        guard sampleCount > 1 else { return [0] }
+    private static let idle = [0.0, 0, 0.04, 0.08, 0.10, 0.08, 0.04, 0, 0]
+    private static let listeningEnvelope = [0.0, -0.34, 0.58, -0.78, 1.0, -0.78, 0.58, -0.34, 0]
+    private static let processing = [0.0, 0.18, -0.26, 0.34, 0, -0.34, 0.26, -0.18, 0]
+    private static let resolved = [0.0, 0, -0.08, -0.28, 0.48, 0.20, 0.05, 0, 0]
+    private static let warning = [0.0, -0.08, 0.10, -0.36, 0.72, -0.36, 0.10, -0.08, 0]
 
-        let clampedLevel = level.isFinite ? min(1, max(0, level)) : 0
-        let halfCount = sampleCount / 2
-        let leadingHalf = (0...halfCount).map { index in
-            interpolatedEnvelope(at: Double(index) / Double(halfCount)) * clampedLevel
+    public static func points(mode: VoiceThreadMode, level: Double) -> [Double] {
+        switch mode {
+        case .idle:
+            idle
+        case .listening:
+            listeningEnvelope.map { $0 * bounded(level) }
+        case .processing:
+            processing
+        case .resolved:
+            resolved
+        case .warning:
+            warning
         }
-
-        return leadingHalf + leadingHalf.dropLast().reversed()
     }
 
-    private static func normalizedSampleCount(_ count: Int) -> Int {
-        let positiveCount = max(1, count)
-        return positiveCount.isMultiple(of: 2) ? positiveCount + 1 : positiveCount
-    }
-
-    private static func interpolatedEnvelope(at position: Double) -> Double {
-        let scaledPosition = position * Double(fixedHalfEnvelope.count - 1)
-        let lowerIndex = Int(scaledPosition.rounded(.down))
-        let upperIndex = min(lowerIndex + 1, fixedHalfEnvelope.count - 1)
-        let fraction = scaledPosition - Double(lowerIndex)
-        return fixedHalfEnvelope[lowerIndex]
-            + (fixedHalfEnvelope[upperIndex] - fixedHalfEnvelope[lowerIndex]) * fraction
+    private static func bounded(_ level: Double) -> Double {
+        guard level.isFinite else { return 0 }
+        return min(1, max(0, level))
     }
 }

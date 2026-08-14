@@ -18,6 +18,7 @@ struct SettingsView: View {
     @State private var newLinkPhrase = ""
     @State private var newLinkDestination = ""
     @State private var selectedCategory = EveeSettingsCategory.voice
+    @StateObject private var workspacePrivacyEditor = WorkspaceIntelligencePrivacyEditor()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -44,9 +45,10 @@ struct SettingsView: View {
 
                 Divider()
 
-                Form {
+                ScrollView {
+                LazyVStack(alignment: .leading, spacing: EveeSpacing.large) {
             if selectedCategory == .voice {
-            Section("Dictation") {
+            EveeSettingsSection("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
@@ -90,7 +92,7 @@ struct SettingsView: View {
                 }
                 Text(store.settings.textDeliveryMode.detail)
                     .font(.caption)
-                    .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? .orange : .secondary)
+                    .foregroundStyle(store.settings.textDeliveryMode == .pasteAndSend ? EveeVisual.warning : EveeVisual.secondaryText)
                 Text("Selection transform is local and deterministic. Supported commands: \(SelectionTransformPipeline.supportedCommandSummary). Unsupported rewrites leave the selection unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -116,7 +118,7 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .writing {
-            Section("Writing enhancements") {
+            EveeSettingsSection("Writing enhancements") {
                 Picker("Email formatting", selection: $store.settings.emailFormattingMode) {
                     ForEach(EmailFormattingMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
                 }
@@ -151,7 +153,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Per-app writing") {
+            EveeSettingsSection("Per-app writing") {
                 if store.settings.appStyles.isEmpty {
                     Text("Add an app to give it a different tone, punctuation or paragraph style.")
                         .font(.caption)
@@ -192,18 +194,17 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .meetings {
-            Section("Meeting capture") {
+            EveeSettingsSection("Meeting capture") {
                 Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
                 Toggle("Show a live local transcript while recording", isOn: $store.settings.liveMeetingTranscriptionEnabled)
                     .disabled(store.settings.model != .parakeet)
-                HStack {
+                EveeAdaptiveActionRow {
                     Toggle("Separate anonymous meeting speakers", isOn: $store.settings.meetingDiarizationEnabled)
                         .disabled(!store.settings.meetingCaptureEnabled)
-                    Spacer()
                     if store.meetingDiarizationReady {
                         Label("Ready", systemImage: "checkmark.circle.fill")
                             .font(.caption)
-                            .foregroundStyle(.green)
+                            .foregroundStyle(EveeVisual.secondaryText)
                     } else {
                         Button(store.isPreparingMeetingDiarization ? "Preparing…" : "Prepare model") {
                             Task { await store.prepareMeetingDiarization() }
@@ -228,7 +229,7 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .privacyAndStorage {
-            Section("Privacy and storage") {
+            EveeSettingsSection("Privacy and storage") {
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
@@ -247,12 +248,11 @@ struct SettingsView: View {
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack {
+                EveeAdaptiveActionRow {
                     Button("Export JSON") { Task { await store.exportWorkspace(format: .json) } }
                         .accessibilityLabel("Export workspace records as JSON")
                     Button("Export Markdown") { Task { await store.exportWorkspace(format: .markdown) } }
                         .accessibilityLabel("Export workspace records as Markdown")
-                    Spacer()
                     Text("Exports omit retry payload bodies and never include Keychain secrets.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -261,12 +261,12 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .integrations {
-            Section("Local API") {
+            EveeSettingsSection("Local API") {
                 Toggle("Enable loopback API", isOn: $store.settings.localAPIEnabled)
                 if store.settings.localAPIEnabled {
                     TextField("Port", value: $store.settings.localAPIPort, format: .number)
                     LabeledContent("Endpoint", value: store.localAPICredentials?.baseURL.absoluteString ?? "Available after Save")
-                    HStack {
+                    EveeAdaptiveActionRow {
                         SecureField("API token", text: .constant(store.localAPICredentials?.token ?? ""))
                             .textFieldStyle(.roundedBorder)
                             .disabled(true)
@@ -290,11 +290,10 @@ struct SettingsView: View {
                 TextField("Meeting webhook URL", text: $store.settings.webhookURL)
                 SecureField("Webhook signing secret", text: $store.webhookSecret)
                 if store.webhookOutboxCount > 0 {
-                    HStack {
+                    EveeAdaptiveActionRow {
                         Text("\(store.webhookOutboxCount) undelivered webhook \(store.webhookOutboxCount == 1 ? "item" : "items")")
                             .font(.caption)
-                            .foregroundStyle(.orange)
-                        Spacer()
+                            .foregroundStyle(EveeVisual.warning)
                         Button("Retry now") { Task { await store.retryWebhookDeliveriesNow() } }
                             .accessibilityLabel("Retry all undelivered webhook items now")
                         Button("Cancel outbox", role: .destructive) { Task { await store.cancelWebhookOutbox() } }
@@ -307,7 +306,7 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("MCP") {
+            EveeSettingsSection("MCP") {
                 Text("Local helper access lets the selected apps search your Evee workspace. It is off by default and can be revoked at any time without changing unrelated client settings.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -317,7 +316,7 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(mcpInspections) { inspection in
-                        HStack(alignment: .top) {
+                        EveeAdaptiveActionRow {
                             if inspection.disposition == .unregistered || inspection.disposition == .recognizedLegacy {
                                 Toggle(isOn: mcpSelectionBinding(for: inspection.client)) {
                                     mcpClientLabel(inspection)
@@ -326,7 +325,6 @@ struct SettingsView: View {
                             } else {
                                 mcpClientLabel(inspection)
                             }
-                            Spacer()
                             if !store.settings.mcpEnabled, inspection.disposition == .recognizedLegacy {
                                 Button("Adopt") {
                                     Task { await adoptMCP(inspection.client) }
@@ -345,13 +343,12 @@ struct SettingsView: View {
                 if !store.settings.mcpEnabled, !unresolvedMCPRegistrations.isEmpty {
                     Text("Local helper access remains disabled until every existing Evee entry below is explicitly selected and adopted or removed. Manual or ambiguous entries must be reviewed outside Evee.")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(EveeVisual.warning)
                 }
-                HStack {
+                EveeAdaptiveActionRow {
                     if store.settings.mcpEnabled {
                         Label("Local helper access enabled", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Spacer()
+                            .foregroundStyle(EveeVisual.success)
                         Button("Revoke access", role: .destructive) {
                             Task { await revokeMCP() }
                         }
@@ -378,13 +375,13 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .privacyAndStorage {
-            Section("Local activity context") {
-                WorkspaceIntelligencePrivacyView()
+            EveeSettingsSection("Local activity context") {
+                WorkspaceIntelligencePrivacyView(editor: workspacePrivacyEditor)
             }
             }
 
             if selectedCategory == .application {
-            Section("Application") {
+            EveeSettingsSection("Application") {
                 LaunchAtLogin.Toggle()
                 Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)
                     .accessibilityLabel(
@@ -393,7 +390,7 @@ struct SettingsView: View {
                 Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack {
+                EveeAdaptiveActionRow {
                     Button(store.isCheckingForUpdates ? "Checking…" : "Check for updates") {
                         Task { await store.checkForUpdates() }
                     }
@@ -410,7 +407,7 @@ struct SettingsView: View {
             }
 
             if selectedCategory == .meetings {
-            Section("Meeting suggestions") {
+            EveeSettingsSection("Meeting suggestions") {
                 Toggle("Suggest meeting recording", isOn: $store.settings.meetingSuggestionsEnabled)
                 Text("Off by default. Evee only suggests; it never starts recording automatically. Native apps are matched by bundle identifier. Browsers also require an allowed title term and Evee’s existing Accessibility permission. Page content is never read.")
                     .font(.caption)
@@ -429,8 +426,9 @@ struct SettingsView: View {
                     .accessibilityLabel("Save Evee settings")
             }
                 }
-                .formStyle(.grouped)
-                .scrollContentBackground(.hidden)
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.vertical, EveeSpacing.large)
+                }
                 .background(EveeVisual.canvas)
             }
         }
@@ -621,15 +619,15 @@ struct SettingsView: View {
             case .ownedCurrent:
                 Text("Owned Evee registration")
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(EveeVisual.success)
             case .recognizedLegacy:
                 Text("Existing Evee entry — adopt it or remove it")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
             case .ambiguous:
                 Text("Manual or ambiguous Evee entry — review this file manually")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
             }
         }
     }

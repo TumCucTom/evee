@@ -78,7 +78,7 @@ public enum AccessibilityCopy {
     public static let cancelWebhookOutbox = "Cancel all undelivered webhook items"
 }
 
-public enum WorkspaceRouteKind: Equatable, Sendable {
+public enum WorkspaceRouteKind: Equatable, Hashable, Sendable {
     case library
     case meetings
     case memos
@@ -94,7 +94,8 @@ public enum RootLayoutMode: Equatable, Sendable {
         switch route {
         case .settings, .dictionary:
             .sidebarAndDetail
-        case .meetings where captureState != .idle:
+        case .meetings where captureState != .idle,
+             .memos where captureState != .idle:
             .sidebarAndDetail
         default:
             .threeColumn

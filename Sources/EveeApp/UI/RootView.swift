@@ -3,7 +3,9 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
-    @State private var showingMetadataResetConfirmation = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var sidebarFocusRequest: Int?
+    @State private var hasTransferredOnboardingFocus = false
 
     var body: some View {
         Group {
@@ -14,6 +16,11 @@ struct RootView: View {
             }
         }
         .tint(AnimaTheme.indigo)
+        .onChange(of: store.modelReady) { wasReady, isReady in
+            guard !wasReady, isReady, !hasTransferredOnboardingFocus, !store.privacyModeEnabled else { return }
+            hasTransferredOnboardingFocus = true
+            sidebarFocusRequest = 1
+        }
     }
 
     private var workspaceContent: some View {
@@ -46,39 +53,6 @@ struct RootView: View {
         }
         .tint(AnimaTheme.indigo)
         .safeAreaInset(edge: .top, spacing: 0) {
-            if let warning = store.libraryRecoveryWarning {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "externaldrive.badge.exclamationmark")
-                        .foregroundStyle(.orange)
-                        .accessibilityHidden(true)
-                    Text(warning)
-                        .font(.caption)
-                        .textSelection(.enabled)
-                    Spacer(minLength: 12)
-                    Button("Show in Finder") { store.revealPreservedLibraryFiles() }
-                        .controlSize(.small)
-                        .accessibilityLabel("Show preserved library data in Finder")
-                        .accessibilityHint("Opens the private folder containing files Evee preserved for manual review.")
-                    Button("Keep preserved data") { store.dismissLibraryRecoveryWarning() }
-                        .controlSize(.small)
-                        .accessibilityLabel("Dismiss preserved library data warning")
-                        .accessibilityHint("Keeps the preserved data and hides this warning.")
-                    if store.recordsQuarantineActive {
-                        Button("Reset library metadata", role: .destructive) {
-                            showingMetadataResetConfirmation = true
-                        }
-                        .controlSize(.small)
-                        .accessibilityLabel("Reset library metadata protection")
-                        .accessibilityHint("Shows a confirmation before allowing future cleanup of unreferenced audio.")
-                    }
-                }
-                .padding(10)
-                .background(AnimaTheme.raisedSurface)
-                .overlay(alignment: .bottom) { Divider() }
-                .accessibilityElement(children: .contain)
-            }
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
             if let suggestion = store.meetingSuggestion {
                 HStack(spacing: 10) {
                     Image(systemName: "person.2.wave.2")
@@ -91,7 +65,7 @@ struct RootView: View {
                         .accessibilityLabel("Dismiss meeting suggestion for \(suggestion.applicationName)")
                         .accessibilityHint("Hides suggestions for this application for one hour.")
                     Button("Start Meeting") { Task { await store.startSuggestedMeeting() } }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(EveeCaptureButtonStyle())
                         .accessibilityLabel("Start meeting recording for \(suggestion.applicationName)")
                         .accessibilityHint("Starts recording only after you activate this button.")
                 }
@@ -100,20 +74,6 @@ struct RootView: View {
                 .overlay(alignment: .bottom) { Divider() }
                 .accessibilityElement(children: .contain)
             }
-        }
-        .confirmationDialog(
-            "Reset library metadata protection?",
-            isPresented: $showingMetadataResetConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Reset metadata protection", role: .destructive) {
-                Task { await store.resetLibraryMetadataProtection() }
-            }
-            .accessibilityLabel("Confirm reset of library metadata protection")
-            Button("Cancel", role: .cancel) {}
-                .accessibilityLabel("Cancel library metadata protection reset")
-        } message: {
-            Text("The preserved corrupt copy will remain, and no audio will be deleted by this action. Future maintenance may then remove audio that current library metadata does not reference.")
         }
         .alert(alertTitle, isPresented: Binding(
             get: { store.statusMessage != nil },
@@ -143,18 +103,29 @@ struct RootView: View {
     private var sidebar: some View {
         EveeSidebar(
             selection: $store.route,
-            status: WorkspaceNavigationPresentation.status(for: store.systemVoiceStatus)
+            status: WorkspaceNavigationPresentation.status(for: store.systemVoiceStatus),
+            focusRequest: $sidebarFocusRequest
         )
     }
 
     @ViewBuilder private var routeContent: some View {
-        switch store.route {
-        case .library: LibraryView(title: "Workspace", kind: nil)
-        case .meetings: MeetingWorkspaceView()
-        case .memos: LibraryView(title: "Memos", kind: .memo)
-        case .dictionary: DictionaryView()
-        case .settings: SettingsView()
+        Group {
+            switch store.route {
+            case .library: LibraryView(title: "Workspace", kind: nil)
+            case .meetings: MeetingWorkspaceView()
+            case .memos: LibraryView(title: "Memos", kind: .memo)
+            case .dictionary: DictionaryView()
+            case .settings: SettingsView()
+            }
         }
+        .id(routeKind)
+        .transition(routeTransition)
+        .animation(EveeVisual.animation(.route, reduceMotion: reduceMotion), value: routeKind)
+    }
+
+    private var routeTransition: AnyTransition {
+        guard !reduceMotion else { return .opacity }
+        return .opacity.combined(with: .offset(y: 3))
     }
 
     @ViewBuilder private var detail: some View {

@@ -42,7 +42,7 @@ final class SystemVoiceStatusTests: XCTestCase {
 
         XCTAssertEqual(status.phase, .captureStarting)
         XCTAssertTrue(status.isMicrophoneOpen)
-        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(status.hudTitle, "Starting capture")
     }
 
     func testCaptureStartupKeepsRecorderOpenWhileSystemAudioStarts() {
@@ -55,7 +55,7 @@ final class SystemVoiceStatusTests: XCTestCase {
 
         XCTAssertEqual(status.phase, .captureStarting)
         XCTAssertTrue(status.isMicrophoneOpen)
-        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(status.hudTitle, "Starting capture")
         XCTAssertEqual(status.availableActions, [.discard])
     }
 
@@ -68,7 +68,7 @@ final class SystemVoiceStatusTests: XCTestCase {
         )
 
         XCTAssertTrue(status.isMicrophoneOpen)
-        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(status.hudTitle, "Recording")
     }
 
     func testProcessingPresentationHidesActionsBeforeRecorderStopCompletes() {
@@ -96,7 +96,7 @@ final class SystemVoiceStatusTests: XCTestCase {
         XCTAssertFalse(delivering.isMicrophoneOpen)
         XCTAssertEqual(failed.phase, .failed)
         XCTAssertFalse(failed.isMicrophoneOpen)
-        XCTAssertTrue(failed.hudDetail.contains("Capture error"))
+        XCTAssertEqual(failed.hudDetail, "Open Evee to review the capture and recovery options.")
     }
 
     func testCheckpointRetainsProtectedRecoveryPresentation() {
@@ -121,6 +121,28 @@ final class SystemVoiceStatusTests: XCTestCase {
 
         XCTAssertEqual(status.phase, .failed)
         XCTAssertTrue(status.isMicrophoneOpen)
-        XCTAssertTrue(status.hudTitle.contains("Microphone open"))
+        XCTAssertEqual(status.hudTitle, "Capture needs attention")
+    }
+
+    func testGlobalVoiceCopyDoesNotExposeArbitraryFailureDetailsOrPaths() {
+        let privateDetail = "/Users/alice/Library/Application Support/Evee/Recoveries/123E4567-E89B-12D3-A456-426614174000/audio.wav"
+        let statuses = [
+            SystemVoiceStatus.make(capture: .failed(privateDetail), hotMic: .disabled, warnings: []),
+            SystemVoiceStatus.make(capture: .checkpointed(privateDetail), hotMic: .disabled, warnings: []),
+            SystemVoiceStatus.make(capture: .idle, hotMic: .failed(privateDetail), warnings: []),
+            SystemVoiceStatus.make(
+                capture: .recording(startedAt: .now, level: 0),
+                hotMic: .disabled,
+                warnings: [CaptureHealthWarning(channel: .system, reason: .failed(privateDetail))]
+            ),
+        ]
+
+        for status in statuses {
+            let globalCopy = [status.menuTitle, status.hudTitle, status.hudDetail]
+                + status.warnings.map(\.message)
+            XCTAssertFalse(globalCopy.joined(separator: " ").contains(privateDetail))
+            XCTAssertFalse(globalCopy.joined(separator: " ").contains("/Users/"))
+            XCTAssertFalse(globalCopy.joined(separator: " ").contains("123E4567"))
+        }
     }
 }

@@ -4,6 +4,7 @@ import SwiftUI
 struct EveeSidebar: View {
     @Binding var selection: AppStore.Route
     let status: WorkspaceNavigationPresentation.Status
+    @Binding var focusRequest: Int?
 
     @FocusState private var focusedRoute: AppStore.Route?
 
@@ -17,6 +18,22 @@ struct EveeSidebar: View {
         .padding(.horizontal, EveeSpacing.medium)
         .padding(.bottom, EveeSpacing.medium)
         .background(EveeVisual.sidebar)
+        .onAppear {
+            applyPendingFocusRequest(focusRequest)
+        }
+        .onChange(of: focusRequest) { _, request in
+            applyPendingFocusRequest(request)
+        }
+        .onChange(of: selection) { _, selectedRoute in
+            guard focusedRoute != nil else { return }
+            focusedRoute = selectedRoute
+        }
+    }
+
+    private func applyPendingFocusRequest(_ request: Int?) {
+        guard request != nil else { return }
+        focusedRoute = selection
+        focusRequest = nil
     }
 
     private var brand: some View {
@@ -109,13 +126,9 @@ struct EveeSidebar: View {
     }
 
     private var statusTone: EveeStatusTone {
-        if status.hasWarning { return .warning }
-        return switch status.phase {
-        case .recording, .captureStarting, .wakeListening: .accent
-        case .protected: .success
-        case .failed: .destructive
-        default: .neutral
-        }
+        EveeStatusTone(
+            VoiceStatusTone.make(phase: status.phase, hasWarning: status.hasWarning)
+        )
     }
 
     private func route(for route: WorkspaceRouteKind) -> AppStore.Route {

@@ -17,6 +17,8 @@ struct MenuBarView: View {
                     tone: statusTone
                 )
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(menuBarPresentation.openAccessibilityLabel)
             VoiceThread(
                 presentation: VoiceThreadPresentation.make(
                     phase: store.systemVoiceStatus.phase,
@@ -38,7 +40,7 @@ struct MenuBarView: View {
             ForEach(Array(store.systemVoiceStatus.warnings.enumerated()), id: \.offset) { _, warning in
                 Label(warning.message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
                     .lineLimit(3)
                     .accessibilityLabel("Capture warning: \(warning.message)")
             }
@@ -65,8 +67,7 @@ struct MenuBarView: View {
                     }
                     if store.systemVoiceStatus.availableActions.contains(.stopAndTranscribe) {
                         Button("Stop and transcribe") { Task { await store.finishCapture() } }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.red)
+                            .buttonStyle(EveeCaptureButtonStyle())
                             .accessibilityLabel("Stop and transcribe \(captureName)")
                     }
                 }
@@ -76,17 +77,17 @@ struct MenuBarView: View {
                     Text(store.captureState == .transcribing ? "Transcribing locally…" : "Inserting text…")
                         .font(.caption)
                 }
-            case .failed(let message):
-                Label(message, systemImage: "exclamationmark.triangle.fill")
+            case .failed:
+                Label("Capture needs attention. Open Evee for details.", systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(EveeVisual.warning)
                     .lineLimit(3)
                 Button("Open Evee", action: showMainWindow)
                     .accessibilityLabel("Open Evee to review the capture error")
-            case .checkpointed(let message):
-                Label(message, systemImage: "checkmark.shield.fill")
+            case .checkpointed:
+                Label("Capture protected. Open Recovery in Evee to review it.", systemImage: "checkmark.shield.fill")
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(EveeVisual.success)
                     .lineLimit(3)
                 HStack {
                     Button("Open Recovery") {
@@ -98,8 +99,7 @@ struct MenuBarView: View {
                 }
             case .idle:
                 Button("Start dictation") { Task { await store.beginDictation() } }
-                    .buttonStyle(.borderedProminent)
-                    .tint(AnimaTheme.indigo)
+                    .buttonStyle(EveeCaptureButtonStyle())
                     .accessibilityLabel("Start a new dictation")
                 Button("Transform selected text") { Task { await store.beginSelectionTransform() } }
                     .accessibilityLabel("Start a selected-text transform instruction")
@@ -131,12 +131,16 @@ struct MenuBarView: View {
         }
     }
 
+    private var menuBarPresentation: MenuBarVoicePresentation {
+        MenuBarVoicePresentation.make(status: store.systemVoiceStatus)
+    }
+
     private var statusIcon: String {
         if !store.systemVoiceStatus.warnings.isEmpty {
             return "exclamationmark.triangle.fill"
         }
         return switch store.systemVoiceStatus.phase {
-        case .ready: "checkmark.circle.fill"
+        case .ready: "circle"
         case .wakeStarting, .captureStarting: "waveform.circle"
         case .wakeListening, .wakeStopping: "mic.circle.fill"
         case .recording: "record.circle"
@@ -147,15 +151,12 @@ struct MenuBarView: View {
     }
 
     private var statusTone: EveeStatusTone {
-        if !store.systemVoiceStatus.warnings.isEmpty {
-            return .warning
-        }
-        return switch store.systemVoiceStatus.phase {
-        case .ready, .protected: .success
-        case .wakeListening, .wakeStopping, .recording: .accent
-        case .failed: .destructive
-        case .wakeStarting, .captureStarting, .processing, .delivering: .neutral
-        }
+        EveeStatusTone(
+            VoiceStatusTone.make(
+                phase: store.systemVoiceStatus.phase,
+                hasWarning: !store.systemVoiceStatus.warnings.isEmpty
+            )
+        )
     }
 
     private var captureLevel: Double? {

@@ -20,7 +20,7 @@ struct MeetingWorkspaceView: View {
                     if let warning = store.meetingRecoveryWarning {
                         Label(warning, systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(EveeVisual.warning)
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(AnimaTheme.raisedSurface)
@@ -43,25 +43,21 @@ struct MeetingWorkspaceView: View {
             subtitle: "Capture your microphone and call audio locally — no meeting bot"
         ) {
             if isRecordingMeeting {
-                compactRecordingStatus(label: "Meeting recording")
-            }
-        } actions: {
-            if isRecordingMeeting {
-                HStack(spacing: EveeSpacing.small) {
+                EveeAdaptiveActionRow {
                     Button("Discard", role: .destructive) { Task { await store.cancelCapture() } }
                         .buttonStyle(EveeDestructiveButtonStyle())
                         .help("Stop and permanently discard this meeting capture")
                         .accessibilityLabel("Discard the current meeting capture")
                         .accessibilityHint("Stops recording and permanently deletes the current local meeting audio.")
                     Button("Stop and transcribe") { Task { await store.finishCapture() } }
-                        .buttonStyle(EveePrimaryButtonStyle())
+                        .buttonStyle(EveeCaptureButtonStyle())
                         .accessibilityLabel("Stop and transcribe the current meeting")
                 }
             } else {
                 Button { Task { await store.beginMeeting() } } label: {
                     Label(isProcessingMeeting ? "Processing meeting" : "Record meeting", systemImage: isProcessingMeeting ? "ellipsis" : "record.circle")
                 }
-                .buttonStyle(EveePrimaryButtonStyle())
+                .buttonStyle(EveeCaptureButtonStyle())
                 .disabled(store.captureState != .idle)
                 .help(store.captureState == .idle ? "Start a local meeting capture" : "Finish the current capture first")
                 .accessibilityLabel(isProcessingMeeting ? "Meeting transcription is in progress" : "Record a new meeting")
@@ -74,10 +70,10 @@ struct MeetingWorkspaceView: View {
 
     private var recordingWorkspace: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+            VStack(alignment: .leading, spacing: EveeSpacing.large) {
                 activeSessionAnchor
 
-                EveePanel {
+                VStack(alignment: .leading, spacing: EveeSpacing.large) {
                     HStack(alignment: .top, spacing: EveeSpacing.medium) {
                         Image(systemName: store.isSystemAudioActive ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                             .foregroundStyle(store.isSystemAudioActive ? EveeVisual.success : EveeVisual.warning)
@@ -114,11 +110,19 @@ struct MeetingWorkspaceView: View {
                         Label(warning, systemImage: "mic.slash.fill")
                             .font(EveeTypography.metadata)
                             .foregroundStyle(EveeVisual.warning)
+                            .padding(EveeSpacing.medium)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(EveeVisual.warning.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous)
+                                    .stroke(EveeVisual.warning.opacity(0.4), lineWidth: 1)
+                            }
                             .accessibilityLabel("Microphone warning: \(warning)")
                     }
-                }
 
-                EveePanel {
+                    Divider()
+
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Live transcript")
                             .font(EveeTypography.sectionTitle)
@@ -146,9 +150,9 @@ struct MeetingWorkspaceView: View {
                         }
                     }
                     .accessibilityElement(children: .contain)
-                }
 
-                EveePanel {
+                    Divider()
+
                     VStack(alignment: .leading, spacing: EveeSpacing.medium) {
                         TextField("Meeting title", text: $store.meetingTitle)
                             .textFieldStyle(.roundedBorder)
@@ -197,7 +201,7 @@ struct MeetingWorkspaceView: View {
                             .monospacedDigit()
                             .foregroundStyle(EveeVisual.secondaryText)
                             .accessibilityLabel("Elapsed meeting recording time")
-                            .accessibilityValue(AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now))
+                            .accessibilityValue(Text(startedAt, style: .timer))
                     }
                 }
                 VoiceThread(
@@ -211,29 +215,6 @@ struct MeetingWorkspaceView: View {
             }
             .accessibilityElement(children: .contain)
         }
-    }
-
-    private func compactRecordingStatus(label: String) -> some View {
-        HStack(spacing: EveeSpacing.small) {
-            VoiceThread(
-                presentation: VoiceThreadPresentation.make(
-                    phase: store.systemVoiceStatus.phase,
-                    level: captureLevel
-                ),
-                lineWidth: 1.5
-            )
-            .frame(width: 72, height: 20)
-            EveeStatusChip(label: label, systemImage: "record.circle.fill", tone: .accent)
-            if let startedAt = recordingStartedAt {
-                Text(startedAt, style: .timer)
-                    .font(EveeTypography.timestamp)
-                    .monospacedDigit()
-                    .foregroundStyle(EveeVisual.secondaryText)
-                    .accessibilityLabel("Elapsed recording time")
-                    .accessibilityValue(AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now))
-            }
-        }
-        .accessibilityElement(children: .contain)
     }
 
     private var startingCard: some View {

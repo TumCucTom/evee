@@ -6,40 +6,119 @@ struct VoiceThread: View {
     var lineWidth: CGFloat = 2
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var processingProgress: CGFloat = 0
 
     var body: some View {
-        Canvas { context, size in
-            let samples = VoiceThreadGeometry.points(level: presentation.level, count: nineSampleCount)
-            let path = VoiceThreadPath.path(samples: samples, size: size, lineWidth: lineWidth)
-            context.stroke(path, with: .color(EveeVisual.hairline), lineWidth: lineWidth)
+        let samples = VoiceThreadSampleVector(
+            VoiceThreadGeometry.points(mode: presentation.mode, level: presentation.level)
+        )
+        let shape = VoiceThreadShape(samples: samples, lineWidth: lineWidth)
+
+        ZStack {
+            shape.stroke(EveeVisual.hairline, lineWidth: lineWidth)
 
             switch presentation.mode {
-            case .listening, .processing:
-                context.stroke(
-                    path,
-                    with: .linearGradient(
-                        Gradient(colors: EveeVisual.spectralColors),
-                        startPoint: .zero,
-                        endPoint: CGPoint(x: size.width, y: 0)
-                    ),
-                    lineWidth: lineWidth
-                )
+            case .listening:
+                shape.stroke(EveeVisual.spectralGradient, lineWidth: lineWidth)
+            case .processing:
+                shape.stroke(EveeVisual.accent.opacity(0.28), lineWidth: lineWidth)
+                processingHighlight(shape)
             case .resolved:
-                context.stroke(path, with: .color(EveeVisual.success), lineWidth: lineWidth)
+                shape.stroke(EveeVisual.success, lineWidth: lineWidth)
             case .warning:
-                context.stroke(path, with: .color(EveeVisual.warning), lineWidth: lineWidth)
+                shape.stroke(EveeVisual.warning, lineWidth: lineWidth)
             case .idle:
-                break
+                EmptyView()
             }
         }
         .animation(
             EveeVisual.animation(.voiceSettlement, reduceMotion: reduceMotion),
             value: presentation
         )
+        .onAppear(perform: updateProcessingMotion)
+        .onChange(of: presentation.mode) { _, _ in updateProcessingMotion() }
+        .onChange(of: reduceMotion) { _, _ in updateProcessingMotion() }
         .accessibilityHidden(true)
     }
 
-    private var nineSampleCount: Int { 9 }
+    @ViewBuilder
+    private func processingHighlight(_ shape: VoiceThreadShape) -> some View {
+        let start = max(0, processingProgress - 0.16)
+        let end = min(1, processingProgress + 0.16)
+        shape
+            .trim(from: start, to: end)
+            .stroke(EveeVisual.spectralGradient, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+    }
+
+    private func updateProcessingMotion() {
+        let motion = VoiceThreadProcessingMotion.make(
+            mode: presentation.mode,
+            reduceMotion: reduceMotion
+        )
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            processingProgress = CGFloat(motion.startProgress)
+        }
+        guard motion.animatesHighlight else { return }
+        withAnimation(.linear(duration: 1.35).repeatForever(autoreverses: false)) {
+            processingProgress = CGFloat(motion.endProgress)
+        }
+    }
+}
+
+struct VoiceThreadSampleVector: VectorArithmetic {
+    var values: [Double]
+
+    init(_ values: [Double]) {
+        self.values = Array(values.prefix(VoiceThreadGeometry.sampleCount))
+        if self.values.count < VoiceThreadGeometry.sampleCount {
+            self.values.append(
+                contentsOf: repeatElement(
+                    0,
+                    count: VoiceThreadGeometry.sampleCount - self.values.count
+                )
+            )
+        }
+    }
+
+    static var zero: Self {
+        Self(Array(repeating: 0, count: VoiceThreadGeometry.sampleCount))
+    }
+
+    static func + (lhs: Self, rhs: Self) -> Self {
+        Self(zip(lhs.values, rhs.values).map(+))
+    }
+
+    static func - (lhs: Self, rhs: Self) -> Self {
+        Self(zip(lhs.values, rhs.values).map(-))
+    }
+
+    mutating func scale(by rhs: Double) {
+        values = values.map { $0 * rhs }
+    }
+
+    var magnitudeSquared: Double {
+        values.reduce(0) { $0 + $1 * $1 }
+    }
+}
+
+struct VoiceThreadShape: Shape {
+    var samples: VoiceThreadSampleVector
+    let lineWidth: CGFloat
+
+    var animatableData: VoiceThreadSampleVector {
+        get { samples }
+        set { samples = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        VoiceThreadPath.path(
+            samples: samples.values,
+            size: rect.size,
+            lineWidth: lineWidth
+        )
+    }
 }
 
 enum VoiceThreadPath {

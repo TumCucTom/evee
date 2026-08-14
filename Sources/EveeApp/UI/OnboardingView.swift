@@ -312,8 +312,6 @@ private struct NativeOnboardingActionButton: NSViewRepresentable {
         button.bezelStyle = .rounded
         button.controlSize = .large
         button.font = .systemFont(ofSize: 13, weight: .semibold)
-        button.bezelColor = Self.actionBezelColor
-        button.contentTintColor = .white
         button.refusesFirstResponder = false
         configure(button, coordinator: context.coordinator)
         return button
@@ -329,18 +327,35 @@ private struct NativeOnboardingActionButton: NSViewRepresentable {
         button.setAccessibilityHelp(accessibilityHelp)
         button.toolTip = accessibilityHelp
         button.isEnabled = isEnabled
+        button.bezelColor = Self.actionBezelColor
+        button.contentTintColor = Self.actionForegroundColor
         coordinator.action = action
     }
 
-    private static let actionBezelColor: NSColor = {
-        let color = AccessibleActionPalette.gradientStops(for: .light)[1]
+    private static let actionBezelColor = NSColor(name: nil) { effectiveAppearance in
+        let appearance = interfaceAppearance(for: effectiveAppearance)
+        return nsColor(AccessibleActionPalette.gradientStops(for: appearance)[1])
+    }
+
+    private static let actionForegroundColor = NSColor(name: nil) { effectiveAppearance in
+        nsColor(EveeVisualPalette.rgb(
+            .primaryActionForeground,
+            appearance: interfaceAppearance(for: effectiveAppearance)
+        ))
+    }
+
+    private static func interfaceAppearance(for effectiveAppearance: NSAppearance) -> InterfaceAppearance {
+        effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .dark : .light
+    }
+
+    private static func nsColor(_ color: EveeCore.RGBColor) -> NSColor {
         return NSColor(
             srgbRed: CGFloat(color.red),
             green: CGFloat(color.green),
             blue: CGFloat(color.blue),
             alpha: 1
         )
-    }()
+    }
 
     @MainActor
     final class Coordinator: NSObject {

@@ -45,13 +45,13 @@ enum EveeColors {
 }
 
 enum EveeTypography {
-    static let display = Font.system(size: 32, weight: .bold, design: .rounded)
-    static let pageTitle = Font.system(size: 22, weight: .bold)
-    static let sectionTitle = Font.system(size: 14, weight: .semibold)
-    static let body = Font.system(size: 13)
-    static let metadata = Font.system(size: 11, weight: .medium)
-    static let timestamp = Font.system(size: 10, weight: .semibold, design: .monospaced)
-    static let button = Font.system(size: 13, weight: .semibold)
+    static let display = Font.largeTitle.bold()
+    static let pageTitle = Font.title2.bold()
+    static let sectionTitle = Font.headline
+    static let body = Font.body
+    static let metadata = Font.caption.weight(.medium)
+    static let timestamp = Font.caption2.monospaced().weight(.semibold)
+    static let button = Font.body.weight(.semibold)
 }
 
 enum EveeSpacing {

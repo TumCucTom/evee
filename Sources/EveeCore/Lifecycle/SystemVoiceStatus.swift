@@ -51,8 +51,8 @@ public struct CaptureHealthWarning: Equatable, Sendable {
             "No microphone signal has been detected. Check the selected input and mute switch."
         case .unavailable:
             "\(channelName) is unavailable."
-        case .failed(let detail):
-            "\(channelName) failed. \(detail)"
+        case .failed:
+            "\(channelName) needs attention. Open Evee for details."
         }
     }
 }
@@ -87,8 +87,8 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .captureStarting,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Starting capture\(warningSuffix)",
-                hudTitle: microphoneIsOpen ? "Microphone open · Starting capture" : "Starting capture",
-                hudDetail: detail("Preparing local audio. Use Discard in the Evee menu or your cancel shortcut.", warning: warningDetail),
+                hudTitle: "Starting capture",
+                hudDetail: detail("Preparing local audio.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: [.discard]
             )
@@ -98,8 +98,8 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .recording,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Recording\(warningSuffix)",
-                hudTitle: microphoneIsOpen ? "Microphone open · Recording" : "Recording",
-                hudDetail: detail("Use Stop and transcribe or Discard in the Evee menu and configured shortcuts.", warning: warningDetail),
+                hudTitle: "Recording",
+                hudDetail: detail("Use Evee controls to stop or discard.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: [.stopAndTranscribe, .discard]
             )
@@ -109,9 +109,9 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .processing,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: microphoneIsOpen ? "Stopping capture\(warningSuffix)" : "Transcribing locally\(warningSuffix)",
-                hudTitle: microphoneIsOpen ? "Microphone open · Stopping capture" : "Transcribing locally",
+                hudTitle: microphoneIsOpen ? "Stopping capture" : "Transcribing locally",
                 hudDetail: detail(
-                    microphoneIsOpen ? "Closing the microphone before local transcription." : "The microphone is closed. You can keep working.",
+                    microphoneIsOpen ? "Closing audio input before local transcription." : "You can keep working while transcription finishes locally.",
                     warning: warningDetail
                 ),
                 warnings: warnings,
@@ -123,33 +123,30 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .delivering,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Delivering text\(warningSuffix)",
-                hudTitle: microphoneIsOpen ? "Microphone open · Delivering text" : "Delivering text",
-                hudDetail: detail(
-                    microphoneIsOpen ? "The microphone has not closed. Evee is finishing the requested delivery." : "The microphone is closed. Evee is finishing the requested delivery.",
-                    warning: warningDetail
-                ),
+                hudTitle: "Delivering text",
+                hudDetail: detail("Finishing the requested text delivery.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: []
             )
-        case .checkpointed(let message):
+        case .checkpointed:
             let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .protected,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Capture protected",
-                hudTitle: microphoneIsOpen ? "Microphone open · Capture protected" : "Capture protected",
-                hudDetail: microphoneIsOpen ? "The microphone has not closed. \(message)" : message,
+                hudTitle: "Capture protected",
+                hudDetail: "Open Evee to review the protected recovery.",
                 warnings: warnings,
                 availableActions: []
             )
-        case .failed(let message):
+        case .failed:
             let microphoneIsOpen = captureMicrophone.isOpen
             return Self(
                 phase: .failed,
                 isMicrophoneOpen: microphoneIsOpen,
                 menuTitle: "Capture needs attention",
-                hudTitle: microphoneIsOpen ? "Microphone open · Capture needs attention" : "Capture needs attention",
-                hudDetail: microphoneIsOpen ? "The microphone has not closed. \(message)" : message,
+                hudTitle: "Capture needs attention",
+                hudDetail: "Open Evee to review the capture and recovery options.",
                 warnings: warnings,
                 availableActions: []
             )
@@ -162,8 +159,8 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .failed,
                 isMicrophoneOpen: true,
                 menuTitle: "Microphone needs attention",
-                hudTitle: "Microphone open · Capture needs attention",
-                hudDetail: "The capture microphone has not closed.",
+                hudTitle: "Capture needs attention",
+                hudDetail: "Open Evee to finish closing audio input.",
                 warnings: warnings,
                 availableActions: []
             )
@@ -195,8 +192,8 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .wakeListening,
                 isMicrophoneOpen: true,
                 menuTitle: "Wake phrase listening\(warningSuffix)",
-                hudTitle: "Microphone open · Wake phrase listening",
-                hudDetail: detail("Evee is listening locally for your configured wake phrase.", warning: warningDetail),
+                hudTitle: "Wake phrase listening",
+                hudDetail: detail("Listening locally for your configured wake phrase.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: []
             )
@@ -205,18 +202,18 @@ public struct SystemVoiceStatus: Equatable, Sendable {
                 phase: .wakeStopping,
                 isMicrophoneOpen: true,
                 menuTitle: "Stopping wake phrase listening\(warningSuffix)",
-                hudTitle: "Microphone open · Stopping wake listener",
-                hudDetail: detail("Closing the selected microphone.", warning: warningDetail),
+                hudTitle: "Stopping wake listener",
+                hudDetail: detail("Closing the wake listener.", warning: warningDetail),
                 warnings: warnings,
                 availableActions: []
             )
-        case .failed(let message):
+        case .failed:
             return Self(
                 phase: .failed,
                 isMicrophoneOpen: false,
                 menuTitle: "Wake listening failed",
                 hudTitle: "Wake listening failed",
-                hudDetail: message,
+                hudDetail: "Open Evee to review wake-listener settings.",
                 warnings: warnings,
                 availableActions: []
             )

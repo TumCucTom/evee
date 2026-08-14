@@ -15,6 +15,17 @@ final class AccessibleColorTokensTests: XCTestCase {
         }
     }
 
+    func testOrdinarySolidAccentMeetsTextContrastInEveryAppearance() {
+        for appearance in InterfaceAppearance.allCases {
+            XCTAssertGreaterThanOrEqual(
+                EveeVisualPalette.rgb(.primaryActionForeground, appearance: appearance)
+                    .contrastRatio(with: EveeVisualPalette.rgb(.accent, appearance: appearance)),
+                4.5,
+                "\(appearance) solid accent button must meet WCAG AA text contrast"
+            )
+        }
+    }
+
     func testDisabledBorderMeetsNonTextContrastInEveryAppearance() {
         for appearance in InterfaceAppearance.allCases {
             XCTAssertGreaterThanOrEqual(

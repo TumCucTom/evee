@@ -13,12 +13,12 @@ struct EveeMark: View {
                 height: max(0, canvasSize.height - inset * 2)
             )
             let path = VoiceThreadPath.path(
-                samples: VoiceThreadGeometry.points(level: 0.72, count: 9),
+                samples: VoiceThreadGeometry.points(mode: .listening, level: 0.72),
                 size: glyphSize,
                 lineWidth: 1.8
             )
             context.translateBy(x: inset, y: inset)
-            context.stroke(path, with: .color(.white), lineWidth: 1.8)
+            context.stroke(path, with: .color(EveeVisual.primaryActionForeground), lineWidth: 1.8)
         }
         .frame(width: size, height: size)
         .background(EveeVisual.spectralGradient)
@@ -46,24 +46,36 @@ struct EveePageHeader<Status: View, Actions: View>: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: EveeSpacing.large) {
-            VStack(alignment: .leading, spacing: EveeSpacing.xSmall) {
-                Text(title)
-                    .font(EveeTypography.pageTitle)
-                    .foregroundStyle(EveeVisual.primaryText)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(EveeTypography.body)
-                        .foregroundStyle(EveeVisual.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                status
-                    .padding(.top, EveeSpacing.xSmall)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: EveeSpacing.large) {
+                heading
+                Spacer(minLength: EveeSpacing.large)
+                actions
             }
-            Spacer(minLength: EveeSpacing.large)
-            actions
+
+            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+                heading
+                actions
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(.bottom, EveeSpacing.medium)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: EveeSpacing.xSmall) {
+            Text(title)
+                .font(EveeTypography.pageTitle)
+                .foregroundStyle(EveeVisual.primaryText)
+            if let subtitle {
+                Text(subtitle)
+                    .font(EveeTypography.body)
+                    .foregroundStyle(EveeVisual.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            status
+                .padding(.top, EveeSpacing.xSmall)
+        }
     }
 }
 
@@ -76,6 +88,52 @@ extension EveePageHeader where Status == EmptyView, Actions == EmptyView {
 extension EveePageHeader where Status == EmptyView {
     init(_ title: String, subtitle: String? = nil, @ViewBuilder actions: () -> Actions) {
         self.init(title, subtitle: subtitle, status: { EmptyView() }, actions: actions)
+    }
+}
+
+struct EveeAdaptiveActionRow<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: EveeSpacing.small) { content }
+            VStack(alignment: .leading, spacing: EveeSpacing.small) { content }
+        }
+    }
+}
+
+struct EveeSettingsSection<Content: View>: View {
+    let title: String
+    private let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+            Text(title)
+                .font(EveeTypography.sectionTitle)
+                .foregroundStyle(EveeVisual.primaryText)
+                .accessibilityAddTraits(.isHeader)
+            VStack(alignment: .leading, spacing: EveeSpacing.medium) {
+                content
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(EveeSpacing.large)
+        .background(EveeVisual.surface)
+        .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
+                .stroke(EveeVisual.hairline, lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -111,6 +169,16 @@ enum EveeStatusTone {
     case success
     case warning
     case destructive
+
+    init(_ tone: VoiceStatusTone) {
+        self = switch tone {
+        case .neutral: .neutral
+        case .accent: .accent
+        case .success: .success
+        case .warning: .warning
+        case .destructive: .destructive
+        }
+    }
 
     var color: Color {
         switch self {
@@ -215,6 +283,31 @@ struct EveeSearchField: View {
 }
 
 struct EveePrimaryButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(EveeTypography.button)
+            .foregroundStyle(EveeVisual.primaryActionForeground)
+            .padding(.horizontal, EveeSpacing.large)
+            .frame(minHeight: 36)
+            .background(EveeVisual.accent)
+            .clipShape(RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous))
+            .overlay {
+                if !isEnabled {
+                    RoundedRectangle(cornerRadius: EveeShape.compactCornerRadius, style: .continuous)
+                        .stroke(EveeVisual.hairline, style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+                }
+            }
+            .saturation(isEnabled ? 1 : 0.25)
+            .opacity(isEnabled ? (configuration.isPressed ? 0.84 : 1) : 0.62)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .animation(EveeVisual.animation(.press, reduceMotion: reduceMotion), value: configuration.isPressed)
+    }
+}
+
+struct EveeCaptureButtonStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.isEnabled) private var isEnabled
 

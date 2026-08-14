@@ -55,6 +55,6 @@ final class WorkspaceNavigationPresentationTests: XCTestCase {
 
         XCTAssertTrue(presentation.hasWarning)
         XCTAssertEqual(presentation.warningTitle, "Audio warning")
-        XCTAssertEqual(presentation.detail, "Recovery is available")
+        XCTAssertEqual(presentation.detail, "Open Evee to review the protected recovery.")
     }
 }

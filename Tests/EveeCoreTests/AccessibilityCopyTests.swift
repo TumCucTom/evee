@@ -77,11 +77,13 @@ final class AccessibilityCopyTests: XCTestCase {
         )
     }
 
-    func testLayoutUsesTwoColumnsForDenseRoutesAndActiveMeeting() {
+    func testLayoutUsesTwoColumnsForDenseRoutesAndActiveCapture() {
         XCTAssertEqual(RootLayoutMode.route(.settings, captureState: .idle), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.dictionary, captureState: .idle), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.meetings, captureState: .recording(startedAt: .distantPast, level: 0)), .sidebarAndDetail)
+        XCTAssertEqual(RootLayoutMode.route(.memos, captureState: .recording(startedAt: .distantPast, level: 0)), .sidebarAndDetail)
         XCTAssertEqual(RootLayoutMode.route(.library, captureState: .idle), .threeColumn)
         XCTAssertEqual(RootLayoutMode.route(.meetings, captureState: .idle), .threeColumn)
+        XCTAssertEqual(RootLayoutMode.route(.memos, captureState: .idle), .threeColumn)
     }
 }

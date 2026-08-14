@@ -456,6 +456,230 @@ private func checkVisualPresentation() throws {
     print("visual-presentation: passed")
 }
 
+private func checkVoiceThreadGeometry() throws {
+    let samples: [(VoiceThreadMode, Double, [Double])] = [
+        (.idle, 0, VoiceThreadGeometry.points(mode: .idle, level: 0)),
+        (.listening, 0.7, VoiceThreadGeometry.points(mode: .listening, level: 0.7)),
+        (.processing, 0, VoiceThreadGeometry.points(mode: .processing, level: 0)),
+        (.resolved, 0, VoiceThreadGeometry.points(mode: .resolved, level: 0)),
+        (.warning, 0, VoiceThreadGeometry.points(mode: .warning, level: 0)),
+    ]
+    for (mode, level, points) in samples {
+        try require(points.count == 9, "\(mode) exceeded the fixed voice-thread sample budget")
+        try require(points.allSatisfy { (-1.0...1.0).contains($0) }, "\(mode) geometry escaped its bounds")
+        try require(points == VoiceThreadGeometry.points(mode: mode, level: level), "\(mode) geometry was not deterministic")
+    }
+    for firstIndex in samples.indices {
+        for secondIndex in samples.indices where secondIndex > firstIndex {
+            try require(samples[firstIndex].2 != samples[secondIndex].2, "voice-thread modes shared the same geometry")
+        }
+    }
+    let silent = VoiceThreadGeometry.points(mode: .listening, level: 0)
+    try require(silent.allSatisfy { $0 == 0 }, "zero microphone level fabricated listening geometry")
+    try require(
+        VoiceThreadGeometry.points(mode: .listening, level: .nan) == silent,
+        "non-finite microphone level fabricated listening geometry"
+    )
+    try require(
+        VoiceThreadGeometry.points(mode: .listening, level: 1).map(abs).max()! >
+            VoiceThreadGeometry.points(mode: .listening, level: 0.2).map(abs).max()!,
+        "listening geometry did not follow measured amplitude"
+    )
+    print("voice-thread-geometry: passed")
+}
+
+@MainActor
+private final class FinalReviewOverlayRenderer: CaptureOverlayRendering {
+    private(set) var creationCount = 0
+    private(set) var applied: [CaptureOverlayPresentation] = []
+    private(set) var presentations: [Bool] = []
+    private(set) var hideCount = 0
+
+    func createOverlay() { creationCount += 1 }
+    func apply(_ presentation: CaptureOverlayPresentation) { applied.append(presentation) }
+    func presentOverlay(reposition: Bool) { presentations.append(reposition) }
+    func hideOverlay() { hideCount += 1 }
+}
+
+@MainActor
+private func checkFinalVisualReview() throws {
+    for appearance in InterfaceAppearance.allCases {
+        let foreground = EveeVisualPalette.rgb(.primaryActionForeground, appearance: appearance)
+        try require(
+            foreground.contrastRatio(with: EveeVisualPalette.rgb(.accent, appearance: appearance)) >= 4.5,
+            "ordinary action foreground missed AA in \(appearance)"
+        )
+        for semanticRole in [EveeColorRole.success, .warning, .destructive] {
+            for surfaceRole in [EveeColorRole.canvas, .surface, .elevatedSurface] {
+                try require(
+                    EveeVisualPalette.rgb(semanticRole, appearance: appearance)
+                        .contrastRatio(with: EveeVisualPalette.rgb(surfaceRole, appearance: appearance)) >= 4.5,
+                    "\(semanticRole) missed AA on \(surfaceRole) in \(appearance)"
+                )
+            }
+        }
+    }
+    let lightTertiary = EveeVisualPalette.rgb(.tertiaryText, appearance: .light)
+    for surfaceRole in [EveeColorRole.canvas, .sidebar, .surface] {
+        try require(
+            lightTertiary.contrastRatio(with: EveeVisualPalette.rgb(surfaceRole, appearance: .light)) >= 4.5,
+            "light tertiary missed AA on \(surfaceRole)"
+        )
+    }
+
+    try require(VoiceThreadProcessingMotion.make(mode: .processing, reduceMotion: false).animatesHighlight, "processing highlight did not animate")
+    try require(!VoiceThreadProcessingMotion.make(mode: .listening, reduceMotion: false).animatesHighlight, "non-processing voice state animated")
+    let reducedProcessing = VoiceThreadProcessingMotion.make(mode: .processing, reduceMotion: true)
+    try require(
+        reducedProcessing.showsHighlight && !reducedProcessing.animatesHighlight && reducedProcessing.startProgress == reducedProcessing.endProgress,
+        "Reduce Motion did not make processing highlight static"
+    )
+    try require(VoiceStatusTone.make(phase: .ready, hasWarning: false) == .neutral, "Ready was not neutral")
+    try require(VoiceStatusTone.make(phase: .protected, hasWarning: false) == .success, "protected state lost success")
+    try require(
+        RootLayoutMode.route(.memos, captureState: .recording(startedAt: .distantPast, level: 0)) == .sidebarAndDetail &&
+            RootLayoutMode.route(.memos, captureState: .idle) == .threeColumn,
+        "active memo did not use focused layout"
+    )
+
+    var privacyDraft = WorkspaceIntelligencePrivacyDraft()
+    try require(privacyDraft.beginInitialLoad(), "privacy editor did not begin its initial load")
+    var editedPreferences = privacyDraft.preferences
+    editedPreferences.isEnabled = true
+    editedPreferences.includeWindowTitles = true
+    privacyDraft.update(editedPreferences)
+    privacyDraft.receiveLoaded(WorkspaceIntelligencePreferences(retentionDays: 30))
+    try require(privacyDraft.preferences == editedPreferences && privacyDraft.isDirty, "late load replaced the unsaved privacy draft")
+    try require(!privacyDraft.beginInitialLoad(), "privacy editor repeated its initial load")
+
+    let renderer = FinalReviewOverlayRenderer()
+    let driver = CaptureOverlayUpdateDriver(renderer: renderer, minimumMeterInterval: 0.05)
+    let startedAt = Date(timeIntervalSince1970: 1_786_617_000)
+    func overlaySnapshot(_ capture: CaptureState) -> CaptureOverlaySnapshot {
+        CaptureOverlaySnapshot.make(
+            status: SystemVoiceStatus.make(capture: capture, hotMic: .disabled, warnings: []),
+            capture: capture
+        )
+    }
+    driver.receive(overlaySnapshot(.recording(startedAt: startedAt, level: 0.1)), at: 1)
+    driver.receive(overlaySnapshot(.recording(startedAt: startedAt, level: 0.2)), at: 1.01)
+    driver.receive(overlaySnapshot(.recording(startedAt: startedAt, level: 0.3)), at: 1.02)
+    driver.receive(overlaySnapshot(.recording(startedAt: startedAt, level: 0.4)), at: 1.06)
+    try require(renderer.creationCount == 1, "overlay renderer was created more than once")
+    try require(renderer.applied.map(\.level) == [Double(Float(0.1)), Double(Float(0.4))], "meter updates were not bounded")
+    driver.receive(overlaySnapshot(.transcribing), at: 1.061)
+    try require(renderer.applied.count == 3 && renderer.applied.last?.phase == .processing, "phase update waited for meter cadence")
+    try require(renderer.presentations == [true, true], "overlay reordered outside meaningful display transitions")
+    driver.receive(overlaySnapshot(.idle), at: 1.062)
+    try require(renderer.hideCount == 1, "ready transition did not hide the overlay")
+
+    let privateDetail = "/Users/private-account/Library/Application Support/Evee/Recoveries/123E4567/audio.wav"
+    let privateStatuses = [
+        SystemVoiceStatus.make(capture: .failed(privateDetail), hotMic: .disabled, warnings: []),
+        SystemVoiceStatus.make(capture: .checkpointed(privateDetail), hotMic: .disabled, warnings: []),
+        SystemVoiceStatus.make(capture: .idle, hotMic: .failed(message: privateDetail), warnings: []),
+        SystemVoiceStatus.make(
+            capture: .recording(startedAt: startedAt, level: 0),
+            hotMic: .disabled,
+            warnings: [CaptureHealthWarning(channel: .system, reason: .failed(privateDetail))]
+        ),
+    ]
+    for status in privateStatuses {
+        let globalCopy = ([status.menuTitle, status.hudTitle, status.hudDetail] + status.warnings.map(\.message))
+            .joined(separator: " ")
+        try require(!globalCopy.contains(privateDetail) && !globalCopy.contains("/Users/"), "global voice copy exposed private detail")
+    }
+    let recordingStatus = privateStatuses[3]
+    let menuPresentation = MenuBarVoicePresentation.make(status: recordingStatus)
+    try require(
+        menuPresentation.closedAccessibilityLabel.contains("Recording") &&
+            menuPresentation.closedAccessibilityLabel.contains("Microphone open") &&
+            menuPresentation.closedAccessibilityLabel.contains("Audio warning") &&
+            !menuPresentation.closedAccessibilityLabel.contains(privateDetail),
+        "closed menu accessibility did not expose safe explicit state"
+    )
+    let hudPresentation = CaptureOverlayPresentation.make(
+        snapshot: CaptureOverlaySnapshot.make(status: recordingStatus, capture: .recording(startedAt: startedAt, level: 0))
+    )
+    try require(
+        hudPresentation.accessibilityLabel.components(separatedBy: "Microphone open").count - 1 == 1,
+        "HUD did not speak microphone-open exactly once"
+    )
+    var announcements = AccessibilityAnnouncementReducer()
+    let globalAnnouncements = [
+        announcements.receive(.captureFailed(privateDetail)),
+        announcements.receive(.wakeListeningFailed(privateDetail)),
+        announcements.receive(.channelFailed(.microphone, privateDetail)),
+        announcements.receive(.modelDownloadFailed(privateDetail)),
+        announcements.receive(.audioExportFailed(privateDetail)),
+    ].compactMap { $0 }.joined(separator: " ")
+    try require(!globalAnnouncements.contains(privateDetail) && !globalAnnouncements.contains("/Users/"), "global announcement exposed private detail")
+
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    func source(_ relativePath: String) throws -> String {
+        try String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
+    }
+    let components = try source("Sources/EveeApp/UI/Design/EveeComponents.swift")
+    let voiceThread = try source("Sources/EveeApp/UI/Design/VoiceThread.swift")
+    let rootView = try source("Sources/EveeApp/UI/RootView.swift")
+    let library = try source("Sources/EveeApp/UI/LibraryView.swift")
+    let meeting = try source("Sources/EveeApp/UI/MeetingWorkspaceView.swift")
+    let settings = try source("Sources/EveeApp/UI/SettingsView.swift")
+    let privacyEditor = try source("Sources/EveeApp/WorkspaceIntelligenceRuntime.swift")
+    let app = try source("Sources/EveeApp/EveeApp.swift")
+    let pill = try source("Sources/EveeApp/UI/RecordingPill.swift")
+    let menu = try source("Sources/EveeApp/UI/MenuBarView.swift")
+    let onboarding = try source("Sources/EveeApp/UI/OnboardingView.swift")
+    let sidebar = try source("Sources/EveeApp/UI/Design/EveeSidebar.swift")
+
+    try require(
+        voiceThread.contains("VoiceThreadSampleVector: VectorArithmetic") &&
+            voiceThread.contains("var animatableData: VoiceThreadSampleVector") &&
+            voiceThread.contains("repeatForever(autoreverses: false)") &&
+            !voiceThread.contains("Timer") && !voiceThread.contains("TimelineView") && !voiceThread.contains("Task {") && !voiceThread.contains("random"),
+        "voice thread motion was not bounded SwiftUI-native state"
+    )
+    guard let primaryStart = components.range(of: "struct EveePrimaryButtonStyle")?.lowerBound,
+          let captureStart = components.range(of: "struct EveeCaptureButtonStyle")?.lowerBound,
+          let secondaryStart = components.range(of: "struct EveeSecondaryButtonStyle")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("button-style boundaries were missing")
+    }
+    let primaryStyle = String(components[primaryStart..<captureStart])
+    let captureStyle = String(components[captureStart..<secondaryStart])
+    try require(primaryStyle.contains("background(EveeVisual.accent)") && !primaryStyle.contains("spectralGradient"), "ordinary primary action retained spectral emphasis")
+    try require(captureStyle.contains("spectralGradient"), "capture action lost spectral emphasis")
+    try require(components.contains("struct EveePageHeader") && components.contains("ViewThatFits(in: .horizontal)"), "page header lacked adaptive fallback")
+    try require(rootView.contains(".id(routeKind)") && rootView.contains(".offset(y: 3)") && rootView.contains("guard !reduceMotion"), "route transition was not bounded or Reduce Motion aware")
+    try require(!rootView.contains("libraryRecoveryWarning") && library.contains("List(selection:") && library.contains("libraryMetadataRecoveryPanel") && library.contains("EveeAdaptiveActionRow"), "recovery content was not in the adaptive library scroll hierarchy")
+    try require(settings.contains("ScrollView {") && settings.contains("EveeSettingsSection") && !settings.contains("Form {") && !settings.contains(".formStyle(.grouped)"), "settings retained stock grouped Form hierarchy")
+    try require(settings.contains("@StateObject private var workspacePrivacyEditor") && settings.contains("WorkspaceIntelligencePrivacyView(editor: workspacePrivacyEditor)"), "settings did not retain a stable privacy editor")
+    try require(privacyEditor.contains("guard draft.beginInitialLoad()") && !privacyEditor.contains("@State private var preferences"), "privacy editor could destructively reload a transient draft")
+    guard let recordingStart = meeting.range(of: "private var recordingWorkspace")?.lowerBound,
+          let anchorStart = meeting.range(of: "private var activeSessionAnchor")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("meeting recording hierarchy boundaries were missing")
+    }
+    let healthyMeetingSections = String(meeting[recordingStart..<anchorStart])
+    try require(!healthyMeetingSections.contains("EveePanel") && healthyMeetingSections.components(separatedBy: "Divider()").count - 1 >= 2, "healthy meeting sections retained card soup")
+    try require(!meeting.contains("compactRecordingStatus") && meeting.contains("EveePanel(isElevated: true)"), "meeting capture anchor was duplicated or lost")
+    try require(app.components(separatedBy: "NSHostingView(rootView:").count - 1 == 1 && app.components(separatedBy: "panel.contentView =").count - 1 == 1, "HUD host was recreated")
+    try require(app.contains("CaptureOverlayUpdateDriver(renderer: self)") && app.contains("styleMask: [.borderless, .nonactivatingPanel]") && app.contains("panel.sharingType = .none") && app.contains("override var canBecomeKey: Bool { false }"), "HUD panel ownership or nonactivation regressed")
+    guard let applyStart = app.range(of: "func apply(_ presentation:")?.lowerBound,
+          let presentStart = app.range(of: "func presentOverlay")?.lowerBound else {
+        throw CoreCheckError.assertionFailed("HUD apply/present boundaries were missing")
+    }
+    let applySource = String(app[applyStart..<presentStart])
+    try require(!applySource.contains("orderFrontRegardless") && !applySource.contains("position("), "meter application reordered or repositioned the HUD")
+    try require(pill.contains("ViewThatFits(in: .horizontal)") && pill.contains(".frame(minHeight: 52)") && !pill.contains("height: 52") && pill.contains("presentation.accessibilityLabel"), "HUD did not retain intrinsic large-text fallback")
+    try require(app.contains("closedAccessibilityLabel") && menu.contains("openAccessibilityLabel") && !menu.contains("case .failed(let message)") && !menu.contains("case .checkpointed(let message)"), "menu surfaces lacked private explicit state")
+    try require(library.contains("keyboardShortcut(.return, modifiers: .command)") && !library.contains("keyboardShortcut(.return, modifiers: [])"), "memo retained bare Return shortcut")
+    let dynamicTimerValue = "accessibilityValue(Text(startedAt, style: .timer))"
+    try require(meeting.components(separatedBy: dynamicTimerValue).count - 1 == 1 && library.components(separatedBy: dynamicTimerValue).count - 1 == 1, "recording timers did not expose native dynamic accessibility values")
+    try require(sidebar.contains(".onChange(of: selection)") && rootView.contains("hasTransferredOnboardingFocus"), "sidebar focus origin or one-time onboarding transfer was missing")
+    try require(!onboarding.contains("contentTintColor = .white") && !onboarding.contains("gradientStops(for: .light)") && components.contains(".color(EveeVisual.primaryActionForeground)"), "brand/native actions did not resolve effective appearance")
+
+    print("final-visual-review: passed")
+}
+
 private func checkOnboardingPresentation() throws {
     let denied = OnboardingPresentation(
         microphone: .denied,
@@ -652,11 +876,14 @@ private func checkCaptureOverlayPublication() throws {
     try require(
         controllerSource.contains("store.$captureOverlaySnapshot") &&
             controllerSource.contains(".removeDuplicates()") &&
-            controllerSource.contains("self?.render(snapshot)") &&
-            controllerSource.contains("RecordingPill(status: snapshot.status, level: snapshot.level)") &&
+            controllerSource.contains("updateDriver.receive(snapshot") &&
+            controllerSource.contains("NSHostingView(rootView: RecordingPill(model: model))") &&
+            controllerSource.components(separatedBy: "NSHostingView(rootView:").count - 1 == 1 &&
+            controllerSource.components(separatedBy: "panel.contentView =").count - 1 == 1 &&
+            controllerSource.contains("model.update(presentation)") &&
             !controllerSource.contains("Publishers.CombineLatest") &&
             !controllerSource.contains("store.$captureState"),
-        "capture overlay does not render from exactly one coherent snapshot publisher"
+        "capture overlay does not use one stable host driven by coherent snapshots"
     )
     print("capture-overlay-publication: passed")
 }
@@ -699,10 +926,10 @@ private func checkAccessibilityCopy() throws {
         contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/UI/LibraryView.swift"),
         encoding: .utf8
     )
-    let elapsedValueCall = "AccessibilityCopy.elapsedRecordingTime(startedAt: startedAt, now: .now)"
+    let elapsedValueCall = "accessibilityValue(Text(startedAt, style: .timer))"
     try require(
-        meetingSource.components(separatedBy: elapsedValueCall).count - 1 == 2,
-        "meeting elapsed timers do not both expose authoritative accessibility values"
+        meetingSource.components(separatedBy: elapsedValueCall).count - 1 == 1,
+        "meeting elapsed timer does not expose an authoritative accessibility value"
     )
     try require(
         librarySource.components(separatedBy: elapsedValueCall).count - 1 == 1,
@@ -4293,13 +4520,13 @@ private func checkAccessibilityEvents() throws {
     try require(reducer.receive(.wakeListeningStarted) == "Wake phrase listening started.", "wake start was not announced")
     try require(reducer.receive(.wakeListeningStarted) == nil, "repeated wake start was announced")
     try require(reducer.receive(.wakeListeningStopped) == "Wake phrase listening stopped.", "wake stop was not announced")
-    try require(reducer.receive(.wakeListeningFailed("Synthetic wake failure")) == "Wake phrase listening failed. Synthetic wake failure", "wake failure was not announced")
+    try require(reducer.receive(.wakeListeningFailed("Synthetic wake failure")) == "Wake phrase listening needs attention. Open Evee for details.", "wake failure was not announced privately")
 
     try require(reducer.receive(.captureStarted) == "Recording started.", "capture start was not announced")
     try require(reducer.receive(.captureStarted) == nil, "audio-level publication repeated capture start")
     try require(reducer.receive(.captureStopped) == "Recording stopped. Transcribing locally.", "capture stop was not announced")
     try require(reducer.receive(.captureCancelled) == "Recording discarded.", "capture cancellation was not announced")
-    try require(reducer.receive(.captureFailed("Synthetic capture failure")) == "Capture failed. Synthetic capture failure", "capture failure was not announced")
+    try require(reducer.receive(.captureFailed("Synthetic capture failure")) == "Capture needs attention. Open Evee for recovery options.", "capture failure was not announced privately")
     try require(reducer.receive(.captureRecovered) == "Interrupted capture recovered.", "capture recovery was not announced")
 
     try require(reducer.receive(.modelDownloadStarted) == "Local model download started.", "model download start was not announced")
@@ -4311,11 +4538,11 @@ private func checkAccessibilityEvents() throws {
     try require(reducer.receive(.modelDownloadCancelled) == "Local model download cancelled.", "model cancellation was not announced")
     try require(reducer.receive(.modelDownloadStarted) == "Local model download started.", "a new download was deduplicated against an earlier operation")
     try require(reducer.receive(.modelDownloadProgress(0.10)) == "Local model download 10 percent.", "a new download did not reset milestone tracking")
-    try require(reducer.receive(.modelDownloadFailed("Synthetic download failure")) == "Local model download failed. Synthetic download failure", "model failure was not announced")
+    try require(reducer.receive(.modelDownloadFailed("Synthetic download failure")) == "Local model download needs attention. Open Evee for details.", "model failure was not announced privately")
     try require(reducer.receive(.modelReady) == "Local model is ready.", "model readiness was not announced")
 
     try require(reducer.receive(.microphoneSilence) == "No microphone signal has been detected. Check the selected input and mute switch.", "microphone silence was not announced")
-    try require(reducer.receive(.channelFailed(.system, "Synthetic unrelated warning")) == "System audio warning. Synthetic unrelated warning", "unrelated warning was not announced")
+    try require(reducer.receive(.channelFailed(.system, "Synthetic unrelated warning")) == "System audio needs attention. Open Evee for details.", "unrelated warning was not announced privately")
     try require(reducer.receive(.microphoneSilence) == nil, "one silence incident was announced more than once")
     try require(reducer.receive(.microphoneSignalRestored) == nil, "microphone recovery emitted an announcement")
     try require(reducer.receive(.microphoneSilence) == "No microphone signal has been detected. Check the selected input and mute switch.", "a later silence incident was suppressed")
@@ -4323,7 +4550,7 @@ private func checkAccessibilityEvents() throws {
     _ = simpleSilenceReducer.receive(.microphoneSilence)
     _ = simpleSilenceReducer.receive(.microphoneSignalRestored)
     try require(simpleSilenceReducer.receive(.microphoneSilence) != nil, "silence-clear-silence did not begin a new incident")
-    try require(reducer.receive(.channelFailed(.system, "Synthetic channel failure")) == "System audio warning. Synthetic channel failure", "channel failure was not announced")
+    try require(reducer.receive(.channelFailed(.system, "Synthetic channel failure")) == "System audio needs attention. Open Evee for details.", "channel failure was not announced privately")
     try require(reducer.receive(.webhookRevoked) == "Meeting webhook access revoked.", "webhook revocation was not announced")
     try require(reducer.receive(.helperRevoked) == "Local helper access revoked.", "helper revocation was not announced")
 
@@ -4344,7 +4571,7 @@ private func checkSystemVoiceStatus() throws {
     let wakeStopping = SystemVoiceStatus.make(capture: .idle, hotMic: .stopping, warnings: [])
     try require(wakeStopping.phase == .wakeStopping && wakeStopping.isMicrophoneOpen, "wake cleanup did not remain visibly open")
     let wakeFailed = SystemVoiceStatus.make(capture: .idle, hotMic: .failed(message: "Synthetic wake failure"), warnings: [])
-    try require(wakeFailed.phase == .failed && wakeFailed.hudDetail.contains("Synthetic wake failure"), "wake failure was hidden")
+    try require(wakeFailed.phase == .failed && !wakeFailed.hudDetail.contains("Synthetic wake failure"), "wake failure exposed arbitrary detail")
 
     let starting = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .disabled, warnings: [])
     try require(starting.phase == .captureStarting && starting.availableActions == [.discard], "capture startup did not expose discard")
@@ -4355,7 +4582,7 @@ private func checkSystemVoiceStatus() throws {
         warnings: []
     )
     try require(startingWithOpenCaptureMicrophone.isMicrophoneOpen, "capture startup hid the microphone while system audio was starting")
-    try require(startingWithOpenCaptureMicrophone.hudTitle.contains("Microphone open"), "capture startup HUD did not expose the open microphone")
+    try require(startingWithOpenCaptureMicrophone.hudTitle == "Starting capture", "capture startup title duplicated microphone state")
     let startingDuringWakeCleanup = SystemVoiceStatus.make(capture: .starting(kind: .dictation), hotMic: .stopping, warnings: [])
     try require(startingDuringWakeCleanup.isMicrophoneOpen, "capture startup hid a wake microphone that was still closing")
 
@@ -4392,7 +4619,7 @@ private func checkSystemVoiceStatus() throws {
     try require(delivering.phase == .delivering && !delivering.isMicrophoneOpen, "delivery status was inaccurate")
     let failed = SystemVoiceStatus.make(capture: .failed("Synthetic capture failure"), hotMic: .active, warnings: [])
     try require(failed.phase == .failed && !failed.isMicrophoneOpen, "capture failure did not override stale wake state")
-    try require(failed.hudDetail.contains("Synthetic capture failure"), "capture failure detail was hidden")
+    try require(!failed.hudDetail.contains("Synthetic capture failure"), "capture failure exposed arbitrary detail")
     let failedWithOpenMicrophone = SystemVoiceStatus.make(
         capture: .failed("Synthetic stop failure"),
         hotMic: .disabled,
@@ -4400,7 +4627,7 @@ private func checkSystemVoiceStatus() throws {
         warnings: []
     )
     try require(failedWithOpenMicrophone.isMicrophoneOpen, "capture failure hid a recorder that did not stop")
-    try require(failedWithOpenMicrophone.hudTitle.contains("Microphone open"), "capture failure did not visibly warn that the microphone remained open")
+    try require(failedWithOpenMicrophone.hudTitle == "Capture needs attention", "capture failure title duplicated microphone state")
     let protected = SystemVoiceStatus.make(capture: .checkpointed("Synthetic recovery checkpoint"), hotMic: .disabled, warnings: [])
     try require(protected.phase == .protected && !protected.isMicrophoneOpen, "recovery checkpoint was presented as a live or failed capture")
     try require(protected.menuTitle == "Capture protected", "recovery checkpoint lost its protected status")
@@ -4634,6 +4861,10 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkActionContrast()
 } else if arguments == ["--filter", "visual-presentation"] {
     try checkVisualPresentation()
+} else if arguments == ["--filter", "voice-thread-geometry"] {
+    try checkVoiceThreadGeometry()
+} else if arguments == ["--filter", "final-visual-review"] {
+    try await checkFinalVisualReview()
 } else if arguments == ["--filter", "onboarding-presentation"] {
     try checkOnboardingPresentation()
 } else if arguments == ["--filter", "onboarding-action-accessibility"] {
@@ -4719,6 +4950,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "resource-seal"] {
     try checkResourceSeal()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|visual-presentation|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|settings-feedback-ownership|capture-overlay-publication|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|visual-presentation|voice-thread-geometry|final-visual-review|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|settings-feedback-ownership|capture-overlay-publication|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
     exit(EXIT_FAILURE)
 }

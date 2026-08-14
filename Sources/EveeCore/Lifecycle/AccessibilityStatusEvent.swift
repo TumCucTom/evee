@@ -59,8 +59,8 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Wake phrase listening started."
         case .wakeListeningStopped:
             return "Wake phrase listening stopped."
-        case .wakeListeningFailed(let message):
-            return "Wake phrase listening failed. \(message)"
+        case .wakeListeningFailed:
+            return "Wake phrase listening needs attention. Open Evee for details."
         case .captureStarted:
             return "Recording started."
         case .captureStopped:
@@ -69,23 +69,23 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Recording discarded."
         case .captureRecovered:
             return "Interrupted capture recovered."
-        case .captureFailed(let message):
-            return "Capture failed. \(message)"
+        case .captureFailed:
+            return "Capture needs attention. Open Evee for recovery options."
         case .microphoneSilence:
             return "No microphone signal has been detected. Check the selected input and mute switch."
         case .microphoneSignalRestored:
             return nil
-        case .channelFailed(let role, let message):
-            return "\(role.rawValue.capitalized) audio warning. \(message)"
+        case .channelFailed(let role, _):
+            return "\(role.rawValue.capitalized) audio needs attention. Open Evee for details."
         case .modelDownloadStarted:
             lastProgressBucket = 0
             return "Local model download started."
         case .modelDownloadCancelled:
             lastProgressBucket = 0
             return "Local model download cancelled."
-        case .modelDownloadFailed(let message):
+        case .modelDownloadFailed:
             lastProgressBucket = 0
-            return "Local model download failed. \(message)"
+            return "Local model download needs attention. Open Evee for details."
         case .modelReady:
             lastProgressBucket = 0
             return "Local model is ready."
@@ -93,10 +93,10 @@ public struct AccessibilityAnnouncementReducer: Sendable {
             return "Meeting webhook access revoked."
         case .helperRevoked:
             return "Local helper access revoked."
-        case .audioExported(let track):
-            return "Exported \(track) audio."
-        case .audioExportFailed(let message):
-            return "Audio export failed. \(message)"
+        case .audioExported:
+            return "Audio exported."
+        case .audioExportFailed:
+            return "Audio export needs attention. Open Evee for details."
         case .modelDownloadProgress:
             return nil
         }
