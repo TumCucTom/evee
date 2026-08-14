@@ -501,6 +501,23 @@ private func checkShortcutDefaults() throws {
     print("shortcut-defaults: passed")
 }
 
+private func checkMenuWindowRecovery() throws {
+    let repositoryRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let menuSource = try String(
+        contentsOf: repositoryRoot.appendingPathComponent("Sources/EveeApp/UI/MenuBarView.swift"),
+        encoding: .utf8
+    )
+
+    try require(
+        menuSource.contains("$0.title == \"Evee\" && $0.styleMask.contains(.titled)") &&
+            menuSource.contains("NSApp.mainMenu") &&
+            menuSource.contains("item.keyEquivalent.lowercased() == \"n\"") &&
+            menuSource.contains("menu.performActionForItem(at: index)"),
+        "the menu-bar action cannot recreate a closed main window"
+    )
+    print("menu-window-recovery: passed")
+}
+
 private func checkAccessibilityCopy() throws {
     let syntheticMeeting = WorkspaceRecord(
         kind: .meeting,
@@ -4433,6 +4450,8 @@ if arguments == ["--filter", "accessibility-events"] {
     try checkOnboardingActionAccessibility()
 } else if arguments == ["--filter", "shortcut-defaults"] {
     try checkShortcutDefaults()
+} else if arguments == ["--filter", "menu-window-recovery"] {
+    try checkMenuWindowRecovery()
 } else if arguments == ["--filter", "accessibility-copy"] {
     try checkAccessibilityCopy()
 } else if arguments == ["--filter", "context-policy"] {
@@ -4506,6 +4525,6 @@ if arguments == ["--filter", "accessibility-events"] {
 } else if arguments == ["--filter", "resource-seal"] {
     try checkResourceSeal()
 } else {
-    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
+    fputs("usage: evee-core-checks --filter <accessibility-events|system-voice-status|action-contrast|onboarding-presentation|onboarding-action-accessibility|shortcut-defaults|menu-window-recovery|accessibility-copy|context-policy|public-record|meeting-relabel|api-revoke|api-rotate|api-limits|api-start-races|api-revoke-persistence|api-public-errors|mcp-public-output|mcp-revocation|mcp-legacy|webhook-generation|webhook-signature|webhook-payload|webhook-legacy|webhook-transactions|termination-checkpoint|lifecycle-state|model-download|model-readiness|microphone-meter|quit-track-independence|model-availability|hot-mic-race|bounded-mailbox|audio-pipeline|audio-relay|recovery-tracks|corrupt-library-recovery|privacy-presentation|search-projection|atomic-export|meeting-suggestion|resource-seal>\n", stderr)
     exit(EXIT_FAILURE)
 }

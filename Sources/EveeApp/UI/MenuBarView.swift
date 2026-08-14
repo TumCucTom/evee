@@ -152,6 +152,24 @@ struct MenuBarView: View {
 
     private func showMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.windows.first(where: { !($0 is NSPanel) })?.makeKeyAndOrderFront(nil)
+        if let window = NSApp.windows.first(where: {
+            $0.title == "Evee" && $0.styleMask.contains(.titled)
+        }) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openNewMainWindow()
+        }
+    }
+
+    private func openNewMainWindow() {
+        let menus = NSApp.mainMenu?.items.compactMap(\.submenu) ?? []
+        for menu in menus {
+            guard let index = menu.items.firstIndex(where: { item in
+                item.keyEquivalent.lowercased() == "n" &&
+                    item.keyEquivalentModifierMask.contains(.command)
+            }) else { continue }
+            menu.performActionForItem(at: index)
+            return
+        }
     }
 }
