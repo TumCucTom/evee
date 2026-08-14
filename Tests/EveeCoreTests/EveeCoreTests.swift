@@ -364,7 +364,7 @@ final class EveeCoreTests: XCTestCase {
     func testRecoveredRecordCommitOwnsAudioBeforeRecoveryIsRemoved() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let input = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).caf")
-        try Data("audio".utf8).write(to: input)
+        try coreTestsSilentWAV().write(to: input)
         let store = LibraryStore(rootURL: root)
         let capture = try await store.beginRecoveryCapture(kind: .memo)
         _ = try await store.addRecoveryTrack(captureID: capture.id, kind: .memo, role: .microphone, sourceURL: input)
