@@ -11,10 +11,20 @@ struct MenuBarView: View {
                 EveeMark(size: 24)
                 Text("Evee").font(.headline)
                 Spacer()
-                Label(store.systemVoiceStatus.menuTitle, systemImage: statusIcon)
-                    .font(.caption)
-                    .foregroundStyle(statusColour)
+                EveeStatusChip(
+                    label: store.systemVoiceStatus.menuTitle,
+                    systemImage: statusIcon,
+                    tone: statusTone
+                )
             }
+            VoiceThread(
+                presentation: VoiceThreadPresentation.make(
+                    phase: store.systemVoiceStatus.phase,
+                    level: captureLevel
+                ),
+                lineWidth: 1.5
+            )
+            .frame(height: 22)
             Divider()
             Toggle("Privacy mode", isOn: $store.privacyModeEnabled)
                 .accessibilityLabel(
@@ -136,18 +146,21 @@ struct MenuBarView: View {
         }
     }
 
-    private var statusColour: Color {
+    private var statusTone: EveeStatusTone {
         if !store.systemVoiceStatus.warnings.isEmpty {
-            return .orange
+            return .warning
         }
         return switch store.systemVoiceStatus.phase {
-        case .ready: .green
-        case .wakeListening, .wakeStopping: AnimaTheme.magenta
-        case .recording: .red
-        case .protected: .green
-        case .failed: .orange
-        case .wakeStarting, .captureStarting, .processing, .delivering: .secondary
+        case .ready, .protected: .success
+        case .wakeListening, .wakeStopping, .recording: .accent
+        case .failed: .destructive
+        case .wakeStarting, .captureStarting, .processing, .delivering: .neutral
         }
+    }
+
+    private var captureLevel: Double? {
+        guard case .recording(_, let level) = store.captureState else { return nil }
+        return Double(level)
     }
 
     private func showMainWindow() {

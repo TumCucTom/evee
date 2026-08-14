@@ -16,9 +16,35 @@ struct SettingsView: View {
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newLinkPhrase = ""
     @State private var newLinkDestination = ""
+    @State private var selectedCategory = EveeSettingsCategory.voice
 
     var body: some View {
-        Form {
+        HStack(spacing: 0) {
+            EveeSettingsCategoryRail(selection: $selectedCategory)
+                .frame(minWidth: 170, idealWidth: 184, maxWidth: 196)
+
+            Divider()
+
+            VStack(spacing: 0) {
+                HStack(spacing: EveeSpacing.small) {
+                    Image(systemName: selectedCategory.symbolName)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(EveeVisual.accent)
+                        .accessibilityHidden(true)
+                    Text(selectedCategory.title)
+                        .font(EveeTypography.pageTitle)
+                        .foregroundStyle(EveeVisual.primaryText)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, EveeSpacing.xLarge)
+                .padding(.vertical, EveeSpacing.large)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.isHeader)
+
+                Divider()
+
+                Form {
+            if selectedCategory == .voice {
             Section("Dictation") {
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
@@ -75,8 +101,20 @@ struct SettingsView: View {
                 Text("The selected input and latency mode take effect on the next capture.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
+                Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
+                    .disabled(store.settings.model != .parakeet)
+                if store.settings.hotMicEnabled {
+                    TextField("Wake phrase", text: $store.settings.wakePhrase)
+                    LabeledContent("Wake listener", value: store.hotMicActive ? "Active" : "Starts after Save")
+                }
+                Text("Audio cues mark recording start, processing, completion and errors. Wake-phrase listening is off by default, keeps audio in memory, uses the selected microphone and releases it before normal dictation begins.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             }
 
+            if selectedCategory == .writing {
             Section("Writing enhancements") {
                 Picker("Email formatting", selection: $store.settings.emailFormattingMode) {
                     ForEach(EmailFormattingMode.allCases, id: \.self) { mode in Text(mode.title).tag(mode) }
@@ -147,8 +185,10 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) { newAppStyleFields }
                 }
             }
+            }
 
-            Section("Privacy and storage") {
+            if selectedCategory == .meetings {
+            Section("Meeting capture") {
                 Toggle("Capture system audio in meetings", isOn: $store.settings.meetingCaptureEnabled)
                 Toggle("Show a live local transcript while recording", isOn: $store.settings.liveMeetingTranscriptionEnabled)
                     .disabled(store.settings.model != .parakeet)
@@ -174,6 +214,17 @@ struct SettingsView: View {
                         .accessibilityHint("Downloads and prepares the additional local meeting model.")
                     }
                 }
+                Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Anonymous speaker separation is off by default and uses an additional local model. Prepare it before a meeting to avoid a download while processing. If separation is unavailable, Evee still saves the transcript with honest channel labels; speaker names are never inferred.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            }
+
+            if selectedCategory == .privacyAndStorage {
+            Section("Privacy and storage") {
                 Toggle("Retain dictation audio", isOn: $store.settings.retainDictationAudio)
                 Toggle("Retain memo audio for playback", isOn: $store.settings.retainMemoAudio)
                 Toggle("Retain meeting audio", isOn: $store.settings.retainMeetingAudio)
@@ -187,12 +238,6 @@ struct SettingsView: View {
                 Toggle("Store original selected text for transforms", isOn: $store.settings.retainSelectedText)
                 Toggle("Capture and store visible accessibility text", isOn: $store.settings.captureVisibleContext)
                 Text("Context is captured only as needed for guarded delivery and optional formatting. Long-term metadata, selected text and visible accessibility text are off by default and controlled separately. Password and protected fields are never read.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("System-audio meeting capture is off by default, captures all Mac audio except Evee, and requires Screen & System Audio Recording permission. Pause unrelated media and notifications. Audio retention is controlled separately.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Anonymous speaker separation is off by default and uses an additional local model. Prepare it before a meeting to avoid a download while processing. If separation is unavailable, Evee still saves the transcript with honest channel labels; speaker names are never inferred.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Transcripts and preferences stay under Application Support/Evee. Dictation and meeting audio retention is off by default; memo audio is retained for playback. Failed transcriptions keep recoverable audio until you transcribe or discard it, while cancelled captures are removed.")
@@ -209,7 +254,9 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            }
 
+            if selectedCategory == .integrations {
             Section("Local API") {
                 Toggle("Enable loopback API", isOn: $store.settings.localAPIEnabled)
                 if store.settings.localAPIEnabled {
@@ -324,11 +371,15 @@ struct SettingsView: View {
                     Text(integrationMessage).font(.caption).foregroundStyle(.secondary)
                 }
             }
+            }
 
+            if selectedCategory == .privacyAndStorage {
             Section("Local activity context") {
                 WorkspaceIntelligencePrivacyView()
             }
+            }
 
+            if selectedCategory == .application {
             Section("Application") {
                 LaunchAtLogin.Toggle()
                 Toggle("Privacy mode for this session", isOn: $store.privacyModeEnabled)
@@ -336,16 +387,6 @@ struct SettingsView: View {
                         PrivacyPresentation(enabled: store.privacyModeEnabled).accessibilityLabel
                     )
                 Text(PrivacyPresentation(enabled: store.privacyModeEnabled).windowProtectionCopy)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Toggle("Play capture audio cues", isOn: $store.settings.audioCuesEnabled)
-                Toggle("Listen locally for a wake phrase", isOn: $store.settings.hotMicEnabled)
-                    .disabled(store.settings.model != .parakeet)
-                if store.settings.hotMicEnabled {
-                    TextField("Wake phrase", text: $store.settings.wakePhrase)
-                    LabeledContent("Wake listener", value: store.hotMicActive ? "Active" : "Starts after Save")
-                }
-                Text("Audio cues mark recording start, processing, completion and errors. Wake-phrase listening is off by default, keeps audio in memory, uses the selected microphone and releases it before normal dictation begins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -362,7 +403,9 @@ struct SettingsView: View {
                         .accessibilityHint("Creates a local diagnostic export without workspace content or secrets.")
                 }
             }
+            }
 
+            if selectedCategory == .meetings {
             Section("Meeting suggestions") {
                 Toggle("Suggest meeting recording", isOn: $store.settings.meetingSuggestionsEnabled)
                 Text("Off by default. Evee only suggests; it never starts recording automatically. Native apps are matched by bundle identifier. Browsers also require an allowed title term and Evee’s existing Accessibility permission. Page content is never read.")
@@ -372,6 +415,7 @@ struct SettingsView: View {
                 TextField("Browser bundle identifiers, comma-separated", text: browserMeetingApps)
                 TextField("Browser title terms, comma-separated", text: browserMeetingTitleTerms)
             }
+            }
 
             HStack {
                 Spacer()
@@ -380,10 +424,13 @@ struct SettingsView: View {
                     .keyboardShortcut("s", modifiers: .command)
                     .accessibilityLabel("Save Evee settings")
             }
+                }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                .background(EveeVisual.canvas)
+            }
         }
-        .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
-        .background(AnimaTheme.paper)
+        .background(EveeVisual.canvas)
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()

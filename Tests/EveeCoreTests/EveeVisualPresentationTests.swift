@@ -52,4 +52,19 @@ final class EveeVisualPresentationTests: XCTestCase {
             [.voice, .writing, .meetings, .privacyAndStorage, .integrations, .application]
         )
     }
+
+    func testSettingsCategoryMetadataIsExplicit() {
+        XCTAssertEqual(EveeSettingsCategory.voice.title, "Voice")
+        XCTAssertEqual(EveeSettingsCategory.voice.symbolName, "waveform")
+        XCTAssertEqual(EveeSettingsCategory.writing.title, "Writing")
+        XCTAssertEqual(EveeSettingsCategory.writing.symbolName, "textformat")
+        XCTAssertEqual(EveeSettingsCategory.meetings.title, "Meetings")
+        XCTAssertEqual(EveeSettingsCategory.meetings.symbolName, "person.2")
+        XCTAssertEqual(EveeSettingsCategory.privacyAndStorage.title, "Privacy & Storage")
+        XCTAssertEqual(EveeSettingsCategory.privacyAndStorage.symbolName, "lock.doc")
+        XCTAssertEqual(EveeSettingsCategory.integrations.title, "Integrations")
+        XCTAssertEqual(EveeSettingsCategory.integrations.symbolName, "point.3.connected.trianglepath.dotted")
+        XCTAssertEqual(EveeSettingsCategory.application.title, "Application")
+        XCTAssertEqual(EveeSettingsCategory.application.symbolName, "gearshape")
+    }
 }

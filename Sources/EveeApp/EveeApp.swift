@@ -129,30 +129,39 @@ private final class CaptureOverlayController {
     func install(store: AppStore) {
         guard self.store !== store else { return }
         self.store = store
-        observation = store.$systemVoiceStatus
-            .removeDuplicates()
+        observation = Publishers.CombineLatest(
+            store.$systemVoiceStatus.removeDuplicates(),
+            store.$captureState.removeDuplicates()
+        )
             .receive(on: RunLoop.main)
-            .sink { [weak self] status in self?.render(status) }
+            .sink { [weak self] status, captureState in
+                self?.render(status, captureState: captureState)
+            }
     }
 
-    private func render(_ status: SystemVoiceStatus) {
+    private func render(_ status: SystemVoiceStatus, captureState: CaptureState) {
         guard status.phase != .ready else {
             panel?.orderOut(nil)
             return
         }
 
-        let content = RecordingPill(status: status)
+        let content = RecordingPill(status: status, level: captureLevel(from: captureState))
 
         let panel = panel ?? makePanel()
         panel.contentView = NSHostingView(rootView: content)
-        panel.setContentSize(NSSize(width: 410, height: 54))
+        panel.setContentSize(NSSize(width: 376, height: 52))
         position(panel)
         panel.orderFrontRegardless()
     }
 
+    private func captureLevel(from state: CaptureState) -> Double? {
+        guard case .recording(_, let level) = state else { return nil }
+        return Double(level)
+    }
+
     private func makePanel() -> CaptureHUDPanel {
         let panel = CaptureHUDPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 410, height: 54),
+            contentRect: NSRect(x: 0, y: 0, width: 376, height: 52),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false

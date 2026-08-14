@@ -99,4 +99,26 @@ public enum EveeSettingsCategory: String, CaseIterable, Identifiable, Sendable {
     case voice, writing, meetings, privacyAndStorage, integrations, application
 
     public var id: Self { self }
+
+    public var title: String {
+        switch self {
+        case .voice: "Voice"
+        case .writing: "Writing"
+        case .meetings: "Meetings"
+        case .privacyAndStorage: "Privacy & Storage"
+        case .integrations: "Integrations"
+        case .application: "Application"
+        }
+    }
+
+    public var symbolName: String {
+        switch self {
+        case .voice: "waveform"
+        case .writing: "textformat"
+        case .meetings: "person.2"
+        case .privacyAndStorage: "lock.doc"
+        case .integrations: "point.3.connected.trianglepath.dotted"
+        case .application: "gearshape"
+        }
+    }
 }
