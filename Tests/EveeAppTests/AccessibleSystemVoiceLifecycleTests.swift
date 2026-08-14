@@ -202,9 +202,11 @@ private final class SuspendedVoidOperation {
     private var waiter: CheckedContinuation<Void, Never>?
 
     func run() async throws {
-        waiter?.resume()
-        waiter = nil
-        try await withCheckedThrowingContinuation { continuation = $0 }
+        try await withCheckedThrowingContinuation {
+            continuation = $0
+            waiter?.resume()
+            waiter = nil
+        }
     }
 
     func waitUntilCalled() async {
@@ -231,9 +233,11 @@ private final class SuspendedRecoveryPersistence {
         sourceURL: URL,
         startedAt: Date?
     ) async throws -> CaptureRecoveryManifest {
-        waiter?.resume()
-        waiter = nil
-        return try await withCheckedThrowingContinuation { continuation = $0 }
+        try await withCheckedThrowingContinuation {
+            continuation = $0
+            waiter?.resume()
+            waiter = nil
+        }
     }
 
     func waitUntilCalled() async {

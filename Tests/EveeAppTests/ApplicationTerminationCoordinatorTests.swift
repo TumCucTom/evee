@@ -425,10 +425,12 @@ private final class GenerationCaptureCheckpointer: CaptureCheckpointing {
 
     func checkpointForTermination() async throws {
         callCount += 1
-        let ready = waiters.filter { callCount >= $0.0 }
-        waiters.removeAll { callCount >= $0.0 }
-        ready.forEach { $0.1.resume() }
-        try await withCheckedThrowingContinuation { continuation = $0 }
+        try await withCheckedThrowingContinuation {
+            continuation = $0
+            let ready = waiters.filter { callCount >= $0.0 }
+            waiters.removeAll { callCount >= $0.0 }
+            ready.forEach { $0.1.resume() }
+        }
     }
 
     func beginNewWork() { terminationWorkGeneration &+= 1 }
@@ -475,8 +477,13 @@ private final class SuspendedRecoveryTranscriber: LocalTranscriber, @unchecked S
     func unload() {}
     func transcribe(fileURL: URL, languageCode: String?) async throws -> String { "" }
     func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
-        await MainActor.run { waiter?.resume(); waiter = nil }
-        return try await withCheckedThrowingContinuation { continuation = $0 }
+        try await withCheckedThrowingContinuation { continuation in
+            Task { @MainActor in
+                self.continuation = continuation
+                self.waiter?.resume()
+                self.waiter = nil
+            }
+        }
     }
     @MainActor func waitUntilCalled() async {
         if continuation != nil { return }

@@ -175,11 +175,11 @@ private actor DelayedModelDownloader: LocalModelDownloading {
     func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {
         startCount += 1
         progress(ModelProgress(fraction: 0.25, status: "Synthetic progress"))
-        let ready = startWaiters.filter { startCount >= $0.count }
-        startWaiters.removeAll { startCount >= $0.count }
-        ready.forEach { $0.continuation.resume() }
         try await withCheckedThrowingContinuation { continuation in
             downloadContinuation = continuation
+            let ready = startWaiters.filter { startCount >= $0.count }
+            startWaiters.removeAll { startCount >= $0.count }
+            ready.forEach { $0.continuation.resume() }
         }
     }
 

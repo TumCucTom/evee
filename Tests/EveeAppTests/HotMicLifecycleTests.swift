@@ -75,11 +75,11 @@ private actor DelayedWakeListener: WakePhraseListening {
 
     func start(deviceUID: String?, lowLatency: Bool) async throws {
         startCount += 1
-        let ready = startWaiters.filter { startCount >= $0.count }
-        startWaiters.removeAll { startCount >= $0.count }
-        ready.forEach { $0.continuation.resume() }
         try await withCheckedThrowingContinuation { continuation in
             startContinuation = continuation
+            let ready = startWaiters.filter { startCount >= $0.count }
+            startWaiters.removeAll { startCount >= $0.count }
+            ready.forEach { $0.continuation.resume() }
         }
     }
 
