@@ -11,7 +11,10 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         try await harness.store.checkpointForTermination()
 
         let captures = try await harness.library.recoverableCaptures()
-        XCTAssertEqual(captures.first?.tracks.map(\.role), [.system])
+        let capture = try XCTUnwrap(captures.first)
+        let assessments = try await harness.library.assessRecoveryTracks(captureID: capture.id)
+        XCTAssertEqual(assessments.filter(\.isValid).map(\.track.role), [.system])
+        XCTAssertEqual(assessments.filter { !$0.isValid }.map(\.track.role), [.microphone])
         XCTAssertTrue(harness.store.statusMessage?.localizedCaseInsensitiveContains("microphone") == true)
     }
 
@@ -22,7 +25,10 @@ final class ApplicationTerminationCoordinatorTests: XCTestCase {
         try await harness.store.checkpointForTermination()
 
         let captures = try await harness.library.recoverableCaptures()
-        XCTAssertEqual(captures.first?.tracks.map(\.role), [.microphone])
+        let capture = try XCTUnwrap(captures.first)
+        let assessments = try await harness.library.assessRecoveryTracks(captureID: capture.id)
+        XCTAssertEqual(assessments.filter(\.isValid).map(\.track.role), [.microphone])
+        XCTAssertEqual(assessments.filter { !$0.isValid }.map(\.track.role), [.system])
         XCTAssertTrue(harness.store.statusMessage?.localizedCaseInsensitiveContains("system") == true)
     }
 
@@ -352,20 +358,23 @@ private final class CaptureCheckpointHarness {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("evee-independent-checkpoint-\(UUID().uuidString)")
         library = LibraryStore(rootURL: root)
-        let microphoneURL = root.appendingPathComponent("microphone.wav")
-        let systemURL = root.appendingPathComponent("system.wav")
+        let microphoneEndpoint = CaptureAudioEndpoint()
         store = AppStore(
             modelDownloadDefaults: nil,
             library: library,
             microphoneStarter: { url, _, _ in
-                let data = microphoneValid ? syntheticSilentWAV() : Data()
-                try data.write(to: url)
-                try data.write(to: microphoneURL)
+                microphoneEndpoint.url = url
+                try (microphoneValid ? syntheticSilentWAV() : Data()).write(to: url)
             },
-            microphoneStopper: { microphoneURL },
+            microphoneStopper: {
+                guard let url = microphoneEndpoint.url else {
+                    throw SyntheticApplicationTerminationError.persistenceFailed
+                }
+                return url
+            },
             microphoneRecordingProbe: { true },
             systemAudioStarter: { url in
-                try (systemValid ? syntheticSilentWAV() : Data()).write(to: url)
+                try (systemValid ? syntheticSilentM4A() : Data()).write(to: url)
             },
             systemAudioStopper: {}
         )
@@ -380,10 +389,14 @@ private final class CaptureCheckpointHarness {
         while store.captureShutdownPlan == .cancelStartAndCheckpoint, ContinuousClock.now < deadline {
             await Task.yield()
         }
-        _ = systemURL
     }
 
     func cleanUp() { try? FileManager.default.removeItem(at: root) }
+}
+
+@MainActor
+private final class CaptureAudioEndpoint {
+    var url: URL?
 }
 
 private func XCTAssertThrowsErrorAsync(
@@ -473,6 +486,12 @@ private func syntheticSilentWAV() -> Data {
     append(sampleRate); append(sampleRate * 2); append(UInt16(2)); append(UInt16(16))
     append("data"); append(dataSize); data.append(Data(count: Int(dataSize)))
     return data
+}
+
+private func syntheticSilentM4A() -> Data {
+    Data(base64Encoded: """
+    AAAAHGZ0eXBNNEEgAAAAAE00QSBtcDQyaXNvbQAAAxhtb292AAAAbG12aGQAAAAA5qRgjeakYI0AAD6AAAAGQAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAABqnRyYWsAAABcdGtoZAAAAAfmpGCN5qRgjQAAAAEAAAAAAAAGQAAAAAAAAAAAAAAAAAEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAUZtZGlhAAAAIG1kaGQAAAAA5qRgjeakYI0AAD6AAAAGQAAAAAAAAAAiaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAAAAAAAA/G1pbmYAAAAQc21oZAAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAAwHN0YmwAAABYc3RzZAAAAAAAAAABAAAASGFsYWMAAAAAAAAAAQAAAAAAAAAAAAIAEAAAAACsRAAAAAAAJGFsYWMAAAAAAAAQAAAQKAoOAQD/AAAAFwAAAs4AAD6AAAAAGHN0dHMAAAAAAAAAAQAAAAEAAAZAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAABAAAAAQAAABhzdHN6AAAAAAAAAAAAAAABAAAAFwAAABRzdGNvAAAAAAAAAAEAAAM8AAAA+nVkdGEAAADybWV0YQAAAAAAAAAiaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAAxGlsc3QAAAC8LS0tLQAAABxtZWFuAAAAAGNvbS5hcHBsZS5pVHVuZXMAAAAUbmFtZQAAAABpVHVuU01QQgAAAIRkYXRhAAAAAQAAAAAgMDAwMDAwMDAgMDAwMDAwMDAgMDAwMDA5QzAgMDAwMDAwMDAwMDAwMDY0MCAwMDAwMDAwMCAwMDAwMDAwMCAwMDAwMDAwMCAwMDAwMDAwMCAwMDAwMDAwMCAwMDAwMDAwMCAwMDAwMDAwMAAAAB9tZGF0AAAQAAAMgAAAEwgJgfjB/4AAAP+DH/A=
+    """)!
 }
 
 private final class SuspendedRecoveryTranscriber: LocalTranscriber, @unchecked Sendable {
