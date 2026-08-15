@@ -50,6 +50,8 @@ struct SettingsView: View {
                 LazyVStack(alignment: .leading, spacing: EveeSpacing.large) {
             if selectedCategory == .voice {
             EveeSettingsSection("Dictation") {
+                accessibilityPermissionControls
+                Divider()
                 KeyboardShortcuts.Recorder("Push to talk:", name: .pushToTalk)
                 KeyboardShortcuts.Recorder("Hands-free toggle:", name: .toggleHandsFree)
                 KeyboardShortcuts.Recorder("Discard active capture:", name: .cancelCapture)
@@ -467,6 +469,12 @@ struct SettingsView: View {
             inputDevices = AudioInputDevices.available()
             await refreshMCPClients()
         }
+        .onAppear {
+            store.refreshPermissionState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            store.refreshPermissionState()
+        }
         .onChange(of: store.settings.model) { _, _ in refreshModelState() }
         .onChange(of: store.modelReady) { _, ready in selectedModelReady = ready }
     }
@@ -510,6 +518,40 @@ struct SettingsView: View {
         if isModelCancellationPending { return "Cancelling local model download" }
         if isModelDownloading { return "Cancel local model download" }
         return store.modelDownloadNeedsRetry ? "Retry local model download" : "Download local model"
+    }
+
+    @ViewBuilder private var accessibilityPermissionControls: some View {
+        let presentation = store.onboardingPresentation
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: EveeSpacing.medium) {
+                LabeledContent("Accessibility", value: presentation.accessibilityStatus)
+                Spacer(minLength: EveeSpacing.medium)
+                accessibilityPermissionButton(presentation)
+            }
+            VStack(alignment: .leading, spacing: EveeSpacing.small) {
+                LabeledContent("Accessibility", value: presentation.accessibilityStatus)
+                accessibilityPermissionButton(presentation)
+            }
+        }
+        Text("Verified paste needs Accessibility access. Without it, Evee still records and copies completed dictation for manual paste.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder private func accessibilityPermissionButton(
+        _ presentation: OnboardingPresentation
+    ) -> some View {
+        if store.accessibilityPermissionGranted {
+            Label("Ready", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(EveeVisual.success)
+                .accessibilityLabel(presentation.accessibilityAccessibilityLabel)
+        } else {
+            Button(presentation.accessibilityActionTitle) {
+                store.requestAccessibilityPermission()
+            }
+            .accessibilityLabel(presentation.accessibilityAccessibilityLabel)
+            .accessibilityHint(presentation.accessibilityAccessibilityHint)
+        }
     }
 
     private var isModelDownloading: Bool {

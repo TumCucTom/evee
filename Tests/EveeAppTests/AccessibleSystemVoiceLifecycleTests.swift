@@ -195,6 +195,74 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
         XCTAssertEqual(KeyboardShortcuts.Name.pushToTalk.defaultShortcut, expected)
         XCTAssertNotEqual(KeyboardShortcuts.Name.pushToTalk.defaultShortcut, finderSearch)
     }
+
+    func testLegacyFinderShortcutMigratesWithoutReplacingCustomShortcuts() {
+        let legacy = KeyboardShortcuts.Shortcut(
+            .space,
+            modifiers: [.command, .option]
+        )
+        let replacement = KeyboardShortcuts.Shortcut(
+            .space,
+            modifiers: [.command, .shift]
+        )
+        let custom = KeyboardShortcuts.Shortcut(
+            .d,
+            modifiers: [.control, .option]
+        )
+
+        XCTAssertEqual(GlobalShortcutMigration.replacement(for: legacy), replacement)
+        XCTAssertNil(GlobalShortcutMigration.replacement(for: replacement))
+        XCTAssertNil(GlobalShortcutMigration.replacement(for: custom))
+        XCTAssertNil(GlobalShortcutMigration.replacement(for: nil))
+    }
+
+    func testDictationWithoutAccessibilityCapturesAndUsesCopyOnlyFallback() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("evee-dictation-accessibility-fallback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(rootURL: root)
+        let transcriber = ImmediateAccessibleTranscriber(text: "Fallback dictation works")
+        var microphoneURL: URL?
+        var deliveredMode: TextDeliveryMode?
+        let store = AppStore(
+            microphonePermissionProvider: { true },
+            accessibilityPermissionProvider: { false },
+            frontmostApplicationProvider: { _, _ in
+                FrontmostApplication(
+                    bundleIdentifier: "com.example.Editor",
+                    name: "Editor",
+                    processIdentifier: 42
+                )
+            },
+            modelDownloadDefaults: nil,
+            library: library,
+            microphoneStarter: { url, _, _ in
+                microphoneURL = url
+                try accessibleSyntheticSilentWAV().write(to: url)
+            },
+            microphoneStopper: {
+                try XCTUnwrap(microphoneURL)
+            },
+            microphoneRecordingProbe: { microphoneURL != nil },
+            textDeliverer: { _, _, mode, _ in
+                deliveredMode = mode
+            },
+            recoveryTranscriberFactory: { _ in transcriber }
+        )
+        store.settings.textDeliveryMode = .paste
+
+        await store.beginDictation()
+
+        XCTAssertEqual(store.systemVoiceStatus.phase, .recording)
+        XCTAssertNil(store.statusMessage)
+
+        await store.finishCapture()
+
+        XCTAssertEqual(deliveredMode, .copyOnly)
+        XCTAssertEqual(store.records.first?.text, "Fallback dictation works")
+        XCTAssertTrue(store.statusMessage?.localizedCaseInsensitiveContains("accessibility") == true)
+        XCTAssertEqual(store.systemVoiceStatus.phase, .ready)
+    }
 }
 
 @MainActor
@@ -271,6 +339,28 @@ private enum AccessibleSyntheticError: LocalizedError {
         case .transcriptionFailed:
             "Synthetic transcription failure."
         }
+    }
+}
+
+private final class ImmediateAccessibleTranscriber: LocalTranscriber, @unchecked Sendable {
+    let model = SpeechModel.parakeet
+    let isDownloaded = true
+    private let text: String
+
+    init(text: String) {
+        self.text = text
+    }
+
+    func download(progress: @escaping @Sendable (ModelProgress) -> Void) async throws {}
+    func load() async throws {}
+    func unload() {}
+
+    func transcribe(fileURL: URL, languageCode: String?) async throws -> String {
+        text
+    }
+
+    func transcribeDetailed(fileURL: URL, languageCode: String?) async throws -> LocalTranscript {
+        LocalTranscript(text: text, duration: 1, segments: [])
     }
 }
 
