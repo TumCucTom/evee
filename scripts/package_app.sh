@@ -18,7 +18,8 @@ if [[ ! "$build_number" =~ ^[1-9][0-9]*$ ]]; then
   exit 64
 fi
 
-swift build -c "$configuration" --jobs "$build_jobs"
+swift build -c "$configuration" --product Evee --jobs "$build_jobs"
+swift build -c "$configuration" --product evee-mcp --jobs "$build_jobs"
 bin_dir="$(swift build -c "$configuration" --jobs "$build_jobs" --show-bin-path)"
 binary_path="$bin_dir/Evee"
 mcp_binary_path="$bin_dir/evee-mcp"

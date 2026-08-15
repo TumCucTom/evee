@@ -45,14 +45,17 @@ struct EveeApplication: App {
 
         Settings {
             EveeAppearanceBoundary(appearance: appearance) {
-                Group {
-                    if store.privacyModeEnabled {
-                        PrivacyModeView()
-                    } else {
-                        SettingsView()
+                ZStack {
+                    EveeCanvas().ignoresSafeArea()
+                    Group {
+                        if store.privacyModeEnabled {
+                            PrivacyModeView()
+                        } else {
+                            SettingsView()
+                        }
                     }
+                    .environmentObject(store)
                 }
-                .environmentObject(store)
                 .frame(minWidth: 720, minHeight: 580)
                 .background(WindowSharingProtectionInstaller())
             }

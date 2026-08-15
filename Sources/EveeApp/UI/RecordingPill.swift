@@ -5,6 +5,7 @@ struct RecordingPill: View {
     @ObservedObject var model: CaptureOverlayPresentationModel
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.eveeAppearanceMode) private var appearanceMode
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -16,7 +17,7 @@ struct RecordingPill: View {
         .frame(width: 376)
         .frame(minHeight: 52)
         .fixedSize(horizontal: false, vertical: true)
-        .background(.ultraThickMaterial)
+        .eveeMaterial(.hud)
         .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
@@ -109,6 +110,7 @@ struct RecordingPill: View {
 
     private var borderColor: Color {
         if presentation.phase == .failed || presentation.hasWarning { return statusTone.color }
+        if appearanceMode == .glass { return .clear }
         return EveeVisual.hairline
     }
 }
