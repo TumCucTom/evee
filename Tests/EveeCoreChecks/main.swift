@@ -713,6 +713,17 @@ private func checkFinalVisualReview() throws {
         "appearance did not cover every scene with independent persistence and transparency fallback"
     )
     try require(
+        menu.contains(".eveeMaterial(.panel)") &&
+            appearanceSource.contains("@Environment(\\.colorSchemeContrast)") &&
+            rootView.components(separatedBy: "EveeCanvas()").count - 1 == 1 &&
+            app.components(separatedBy: "EveeCanvas()").count - 1 == 1 &&
+            !library.contains("EveeCanvas()") &&
+            !meeting.contains("EveeCanvas()") &&
+            !onboarding.contains("EveeCanvas()") &&
+            !settings.contains("EveeCanvas()"),
+        "Glass scene coverage, reactive contrast, or single-canvas ownership regressed"
+    )
+    try require(
         onboarding.components(separatedBy: "ScrollView {").count - 1 >= 2 &&
             menu.contains(".frame(maxWidth: .infinity, alignment: .leading)") &&
             meeting.contains("meetingHealthNotice(horizontal: false)") &&

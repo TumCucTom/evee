@@ -120,6 +120,8 @@ struct MenuBarView: View {
         }
         .padding(14)
         .frame(width: 290)
+        .eveeMaterial(.panel)
+        .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
     }
 
     private var captureName: String {

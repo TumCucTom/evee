@@ -106,7 +106,10 @@ struct EveeSettingsSection<Content: View>: View {
         .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
-                .stroke(EveeVisual.hairline, lineWidth: 1)
+                .stroke(
+                    EveeVisual.hairline.opacity(appearanceMode == .glass ? 0 : 1),
+                    lineWidth: 1
+                )
         }
         .shadow(
             color: EveeVisual.primaryText.opacity(appearanceMode == .glass ? 0.12 : 0),
@@ -134,7 +137,10 @@ struct EveePanel<Content: View>: View {
             .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
-                    .stroke(EveeVisual.hairline, lineWidth: 1)
+                    .stroke(
+                        EveeVisual.hairline.opacity(appearanceMode == .glass ? 0 : 1),
+                        lineWidth: 1
+                    )
             }
             .shadow(
                 color: EveeVisual.primaryText.opacity(appearanceMode == .glass ? 0.14 : (isElevated ? 0.08 : 0)),

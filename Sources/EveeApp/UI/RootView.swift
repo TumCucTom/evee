@@ -135,7 +135,6 @@ struct RootView: View {
                 message: "Dictations, meetings and memos stay searchable on this Mac."
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(EveeCanvas())
         }
     }
 

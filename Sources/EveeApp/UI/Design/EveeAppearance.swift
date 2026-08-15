@@ -140,13 +140,14 @@ private struct EveeMaterialSurface: ViewModifier {
     let kind: EveeMaterialKind
     @Environment(\.eveeAppearanceMode) private var appearanceMode
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     func body(content: Content) -> some View {
         let presentation = EveeMaterialPresentation.make(
             mode: appearanceMode,
             layer: kind.coreLayer,
             reduceTransparency: reduceTransparency,
-            increaseContrast: NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            increaseContrast: colorSchemeContrast == .increased
         )
 
         content.background {

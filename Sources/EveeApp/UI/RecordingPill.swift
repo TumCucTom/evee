@@ -5,6 +5,7 @@ struct RecordingPill: View {
     @ObservedObject var model: CaptureOverlayPresentationModel
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.eveeAppearanceMode) private var appearanceMode
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -109,6 +110,7 @@ struct RecordingPill: View {
 
     private var borderColor: Color {
         if presentation.phase == .failed || presentation.hasWarning { return statusTone.color }
+        if appearanceMode == .glass { return .clear }
         return EveeVisual.hairline
     }
 }
