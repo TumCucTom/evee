@@ -259,7 +259,7 @@ final class AccessibleSystemVoiceLifecycleTests: XCTestCase {
         await store.finishCapture()
 
         XCTAssertEqual(deliveredMode, .copyOnly)
-        XCTAssertEqual(store.records.first?.text, "Fallback dictation works")
+        XCTAssertEqual(store.records.first?.text, "Fallback dictation works.")
         XCTAssertTrue(store.statusMessage?.localizedCaseInsensitiveContains("accessibility") == true)
         XCTAssertEqual(store.systemVoiceStatus.phase, .ready)
     }
