@@ -460,10 +460,10 @@ struct SettingsView: View {
                 .padding(.horizontal, EveeSpacing.xLarge)
                 .padding(.vertical, EveeSpacing.large)
                 }
-                .background(EveeVisual.canvas)
+                .background(EveeCanvas())
             }
         }
-        .background(EveeVisual.canvas)
+        .background(EveeCanvas())
         .task {
             refreshModelState()
             inputDevices = AudioInputDevices.available()

@@ -138,7 +138,7 @@ struct RecordDetailView: View {
                 .frame(maxWidth: .infinity)
             }
         }
-        .background(EveeVisual.canvas)
+        .background(EveeCanvas())
         .id(draft.id)
         .onAppear(perform: selectInitialAudioTrack)
         .onChange(of: focusedSpeakerLabelID) { previous, current in

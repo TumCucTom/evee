@@ -115,7 +115,7 @@ struct LibraryView: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
         }
-        .background(EveeVisual.canvas)
+        .background(EveeCanvas())
         .confirmationDialog(
             "Reset library metadata protection?",
             isPresented: $showingMetadataResetConfirmation,

@@ -34,7 +34,7 @@ struct MeetingWorkspaceView: View {
                 }
             }
         }
-        .background(EveeVisual.canvas)
+        .background(EveeCanvas())
     }
 
     private var header: some View {

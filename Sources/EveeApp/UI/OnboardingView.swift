@@ -10,7 +10,7 @@ struct OnboardingView: View {
 
     var body: some View {
         ZStack {
-            EveeVisual.canvas.ignoresSafeArea()
+            EveeCanvas().ignoresSafeArea()
 
             GeometryReader { proxy in
                 let sceneLayout = OnboardingSceneLayout.forViewport(

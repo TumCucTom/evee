@@ -25,7 +25,7 @@ struct RootView: View {
 
     private var workspaceContent: some View {
         ZStack {
-            EveeVisual.canvas.ignoresSafeArea()
+            EveeCanvas().ignoresSafeArea()
 
             if !store.modelReady {
                 OnboardingView()
@@ -135,7 +135,7 @@ struct RootView: View {
                 message: "Dictations, meetings and memos stay searchable on this Mac."
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(EveeVisual.canvas)
+            .background(EveeCanvas())
         }
     }
 

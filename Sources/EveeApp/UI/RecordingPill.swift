@@ -16,7 +16,7 @@ struct RecordingPill: View {
         .frame(width: 376)
         .frame(minHeight: 52)
         .fixedSize(horizontal: false, vertical: true)
-        .background(.ultraThickMaterial)
+        .eveeMaterial(.hud)
         .clipShape(RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)

@@ -83,6 +83,7 @@ struct EveeAdaptiveActionRow<Content: View>: View {
 struct EveeSettingsSection<Content: View>: View {
     let title: String
     private let content: Content
+    @Environment(\.eveeAppearanceMode) private var appearanceMode
 
     init(_ title: String, @ViewBuilder content: () -> Content) {
         self.title = title
@@ -107,6 +108,11 @@ struct EveeSettingsSection<Content: View>: View {
             RoundedRectangle(cornerRadius: EveeShape.panelCornerRadius, style: .continuous)
                 .stroke(EveeVisual.hairline, lineWidth: 1)
         }
+        .shadow(
+            color: EveeVisual.primaryText.opacity(appearanceMode == .glass ? 0.12 : 0),
+            radius: appearanceMode == .glass ? 18 : 0,
+            y: appearanceMode == .glass ? 7 : 0
+        )
         .accessibilityElement(children: .contain)
     }
 }
@@ -114,6 +120,7 @@ struct EveeSettingsSection<Content: View>: View {
 struct EveePanel<Content: View>: View {
     private let isElevated: Bool
     private let content: Content
+    @Environment(\.eveeAppearanceMode) private var appearanceMode
 
     init(isElevated: Bool = false, @ViewBuilder content: () -> Content) {
         self.isElevated = isElevated
@@ -130,9 +137,9 @@ struct EveePanel<Content: View>: View {
                     .stroke(EveeVisual.hairline, lineWidth: 1)
             }
             .shadow(
-                color: EveeVisual.primaryText.opacity(isElevated ? 0.08 : 0),
-                radius: isElevated ? 14 : 0,
-                y: isElevated ? 5 : 0
+                color: EveeVisual.primaryText.opacity(appearanceMode == .glass ? 0.14 : (isElevated ? 0.08 : 0)),
+                radius: appearanceMode == .glass ? 20 : (isElevated ? 14 : 0),
+                y: appearanceMode == .glass ? 8 : (isElevated ? 5 : 0)
             )
     }
 }
