@@ -189,6 +189,15 @@ public enum TextDelivery {
         )
     }
 
+    public static func frontmostApplicationMetadata() -> FrontmostApplication? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        return FrontmostApplication(
+            bundleIdentifier: app.bundleIdentifier ?? "unknown",
+            name: app.localizedName ?? "App",
+            processIdentifier: app.processIdentifier
+        )
+    }
+
     public static var isAccessibilityTrusted: Bool { AXIsProcessTrusted() }
 
     @discardableResult

@@ -92,7 +92,7 @@ struct LibraryView: View {
                 if rows.isEmpty {
                     EveeEmptyState(
                         store.search.isEmpty ? "Your voice workspace is ready" : "Nothing matched",
-                        message: store.search.isEmpty ? "Hold ⌥⌘Space in any app to create your first dictation." : "Try a person, project, phrase or app name."
+                        message: store.search.isEmpty ? "Hold ⇧⌘Space in any app to create your first dictation." : "Try a person, project, phrase or app name."
                     )
                     .frame(maxWidth: .infinity, minHeight: 300)
                     .listRowSeparator(.hidden)

@@ -86,7 +86,7 @@ struct OnboardingView: View {
             .frame(height: 24)
 
             VStack(alignment: .leading, spacing: EveeSpacing.small) {
-                feature("command", "Dictate anywhere", "Hold ⌥⌘Space, speak, release.")
+                feature("command", "Dictate anywhere", "Hold ⇧⌘Space, speak, release.")
                 feature("person.2.wave.2", "Capture meetings", "No bots join your call.")
                 feature("lock.shield", "Your voice stays yours", "No analytics or cloud processing.")
             }
@@ -128,6 +128,10 @@ struct OnboardingView: View {
                 ) {
                     store.requestAccessibilityPermission()
                 }
+                Text("Optional for verified insertion. Evee still records and copies dictation without it.")
+                    .font(EveeTypography.metadata)
+                    .foregroundStyle(EveeVisual.secondaryText)
+                    .padding(.leading, 24)
 
                 Divider()
 
@@ -190,7 +194,7 @@ struct OnboardingView: View {
             title: presentation.modelActionTitle ?? "Download",
             accessibilityLabel: presentation.modelAccessibilityLabel,
             accessibilityHelp: presentation.modelAccessibilityHint,
-            isEnabled: store.microphonePermissionGranted && store.accessibilityPermissionGranted,
+            isEnabled: store.microphonePermissionGranted,
             action: activateModelAction
         )
         .frame(minHeight: 36)

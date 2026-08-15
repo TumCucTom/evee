@@ -21,6 +21,30 @@ extension KeyboardShortcuts.Name {
     static let cancelCapture = Self("cancelCapture", default: GlobalShortcutDefaults.cancelCapture)
 }
 
+enum GlobalShortcutMigration {
+    private static let legacyPushToTalk = KeyboardShortcuts.Shortcut(
+        .space,
+        modifiers: [.command, .option]
+    )
+    private static let currentPushToTalk = KeyboardShortcuts.Shortcut(
+        .space,
+        modifiers: [.command, .shift]
+    )
+
+    static func replacement(
+        for shortcut: KeyboardShortcuts.Shortcut?
+    ) -> KeyboardShortcuts.Shortcut? {
+        shortcut == legacyPushToTalk ? currentPushToTalk : nil
+    }
+
+    static func migratePushToTalkIfNeeded() {
+        guard let replacement = replacement(
+            for: KeyboardShortcuts.getShortcut(for: .pushToTalk)
+        ) else { return }
+        KeyboardShortcuts.setShortcut(replacement, for: .pushToTalk)
+    }
+}
+
 private enum CaptureTerminationCheckpointError: LocalizedError {
     case invalidAudio(URL)
     case missingTrack(AudioTrackRole)
@@ -43,6 +67,11 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     typealias ModelDownloaderFactory = @Sendable (SpeechModel) throws -> any LocalModelDownloading
     typealias WakeListenerFactory = @Sendable () -> any WakePhraseListening
     typealias MicrophonePermissionProvider = @MainActor @Sendable () -> Bool
+    typealias AccessibilityPermissionProvider = @MainActor @Sendable () -> Bool
+    typealias FrontmostApplicationProvider = @MainActor @Sendable (
+        ContextCollectionPolicy,
+        Bool
+    ) -> FrontmostApplication?
     typealias MicrophoneStarter = @MainActor @Sendable (URL, String?, Bool) async throws -> Void
     typealias MicrophoneStopper = @MainActor @Sendable () async throws -> URL
     typealias MicrophoneRecordingProbe = @MainActor @Sendable () -> Bool
@@ -101,7 +130,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     @Published private(set) var isSystemAudioActive = false
     @Published private(set) var isPreparingMeetingDiarization = false
     @Published private(set) var meetingDiarizationReady = false
-    @Published private(set) var accessibilityPermissionState: PermissionState = TextDelivery.isAccessibilityTrusted ? .granted : .notDetermined
+    @Published private(set) var accessibilityPermissionState: PermissionState = .notDetermined
     @Published private(set) var microphonePermissionState: PermissionState = .notDetermined
     @Published private(set) var liveMeetingTranscript: [LiveMeetingTranscriptUpdate] = []
     @Published private(set) var liveMeetingStatus: String?
@@ -224,6 +253,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private let modelDownloaderFactory: ModelDownloaderFactory
     private let wakeListenerFactory: WakeListenerFactory
     private let microphonePermissionProvider: MicrophonePermissionProvider
+    private let accessibilityPermissionProvider: AccessibilityPermissionProvider
+    private let frontmostApplicationProvider: FrontmostApplicationProvider
     private let modelDownloadDefaults: UserDefaults?
     private let speechModelAvailability: SpeechModelAvailability
     private let microphoneStarter: MicrophoneStarter?
@@ -250,6 +281,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     private var activeKind: WorkspaceRecordKind = .dictation
     private var activeOperation: WorkspaceRecordOperation = .capture
     private var activeSelectedText: String?
+    private var activeTextDeliveryMode: TextDeliveryMode?
+    private var activeAccessibilityFallback = false
     private var captureStartedAt: Date?
     private var microphoneTrackStartedAt: Date?
     private var systemTrackStartedAt: Date?
@@ -365,6 +398,12 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         modelDownloaderFactory: @escaping ModelDownloaderFactory = { try TranscriberFactory.make($0) },
         wakeListenerFactory: @escaping WakeListenerFactory = { WakePhraseListener() },
         microphonePermissionProvider: @escaping MicrophonePermissionProvider = { MicrophoneRecorder.isPermissionGranted },
+        accessibilityPermissionProvider: @escaping AccessibilityPermissionProvider = { TextDelivery.isAccessibilityTrusted },
+        frontmostApplicationProvider: @escaping FrontmostApplicationProvider = { policy, accessibilityTrusted in
+            accessibilityTrusted
+                ? TextDelivery.frontmostApplication(policy: policy)
+                : TextDelivery.frontmostApplicationMetadata()
+        },
         modelDownloadDefaults: UserDefaults? = .standard,
         library: LibraryStore = .shared,
         microphoneStarter: MicrophoneStarter? = nil,
@@ -396,6 +435,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         self.modelDownloaderFactory = modelDownloaderFactory
         self.wakeListenerFactory = wakeListenerFactory
         self.microphonePermissionProvider = microphonePermissionProvider
+        self.accessibilityPermissionProvider = accessibilityPermissionProvider
+        self.frontmostApplicationProvider = frontmostApplicationProvider
         self.modelDownloadDefaults = modelDownloadDefaults
         self.speechModelAvailability = speechModelAvailability
         self.library = library
@@ -411,6 +452,9 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         self.microphonePermissionState = microphonePermissionProvider()
             ? .granted
             : MicrophoneRecorder.authorizationState
+        self.accessibilityPermissionState = accessibilityPermissionProvider()
+            ? .granted
+            : .notDetermined
         let webhookOutboxTransactions = WebhookOutboxTransactions()
         self.webhookOutboxTransactions = webhookOutboxTransactions
         self.webhookOutboxCoordinator = WebhookOutboxCoordinator(transactions: webhookOutboxTransactions)
@@ -447,6 +491,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
             }
             .store(in: &cancellables)
 
+        GlobalShortcutMigration.migratePushToTalkIfNeeded()
         KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
             self?.shortcutContinuation.yield(.dictationDown)
         }
@@ -988,7 +1033,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
     }
 
     func refreshPermissionState() {
-        accessibilityPermissionState = TextDelivery.isAccessibilityTrusted
+        accessibilityPermissionState = accessibilityPermissionProvider()
             ? .granted
             : (accessibilityPermissionRequested ? .denied : .notDetermined)
         microphonePermissionState = microphonePermissionProvider()
@@ -1024,20 +1069,23 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 return
             }
         }
-        guard accessibilityPermissionGranted else {
-            requestAccessibilityPermission()
-            statusMessage = "Enable Evee in System Settings → Privacy & Security → Accessibility, then hold the shortcut again."
-            return
-        }
-        activeApplication = TextDelivery.frontmostApplication(
-            policy: .ordinaryDictation(
-                retainMetadata: settings.retainContextMetadata,
-                captureVisibleText: settings.captureVisibleContext
-            )
+        let contextPolicy = ContextCollectionPolicy.ordinaryDictation(
+            retainMetadata: settings.retainContextMetadata,
+            captureVisibleText: settings.captureVisibleContext
+        )
+        activeApplication = frontmostApplicationProvider(
+            contextPolicy,
+            accessibilityPermissionGranted
         )
         guard activeApplication != nil else {
             statusMessage = "Evee could not identify the app that should receive this dictation."
             return
+        }
+        activeAccessibilityFallback = !accessibilityPermissionGranted && settings.textDeliveryMode != .copyOnly
+        if activeAccessibilityFallback {
+            activeTextDeliveryMode = .copyOnly
+        } else {
+            activeTextDeliveryMode = settings.textDeliveryMode
         }
         activeKind = .dictation
         activeOperation = .capture
@@ -1075,6 +1123,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         activeKind = .dictation
         activeOperation = .selectionTransform
         activeSelectedText = selectedText
+        activeTextDeliveryMode = settings.textDeliveryMode
+        activeAccessibilityFallback = false
         await beginCapture(prefix: "transform")
     }
 
@@ -1490,7 +1540,7 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         if recordKind == .dictation {
             captureState = .delivering
             let expectedSelection = activeOperation == .selectionTransform ? activeSelectedText : nil
-            let mode = settings.textDeliveryMode
+            let mode = activeTextDeliveryMode ?? settings.textDeliveryMode
             pendingDelivery = mode == .copyOnly ? nil : PendingTextDelivery(
                 text: polished,
                 target: activeApplication,
@@ -1506,9 +1556,13 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
                 )
                 pendingDelivery = nil
                 if mode == .copyOnly {
-                    statusMessage = activeOperation == .selectionTransform
-                        ? "Transformed text copied. The original selection was not changed."
-                        : "Dictation copied. Paste it wherever you choose."
+                    if activeAccessibilityFallback {
+                        statusMessage = "Dictation copied because Accessibility permission is not enabled for this Evee build. Paste it manually, then grant access to enable verified insertion."
+                    } else {
+                        statusMessage = activeOperation == .selectionTransform
+                            ? "Transformed text copied. The original selection was not changed."
+                            : "Dictation copied. Paste it wherever you choose."
+                    }
                 } else {
                     statusMessage = nil
                 }
@@ -1702,6 +1756,8 @@ final class AppStore: ObservableObject, ApplicationTerminationCheckpoint {
         activeApplication = nil
         activeOperation = .capture
         activeSelectedText = nil
+        activeTextDeliveryMode = nil
+        activeAccessibilityFallback = false
         captureStartedAt = nil
         microphoneTrackStartedAt = nil
         systemTrackStartedAt = nil
